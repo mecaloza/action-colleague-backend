@@ -15,6 +15,7 @@ from routers import (
     evaluations,
     module_progress,
     modules,
+    series_wizard,
     users,
 )
 
@@ -53,6 +54,7 @@ app.include_router(module_progress.router, prefix=API_PREFIX)
 app.include_router(certificates.router, prefix=API_PREFIX)
 app.include_router(documents.router, prefix=API_PREFIX)
 app.include_router(dashboards.router, prefix=API_PREFIX)
+app.include_router(series_wizard.router, prefix=API_PREFIX)
 
 
 @app.get("/")

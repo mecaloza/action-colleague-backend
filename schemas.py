@@ -321,3 +321,90 @@ class CollaboratorDashboard(BaseModel):
     completed_courses: int
     in_progress_courses: int
     certificates: int
+
+
+# ── Micro-Series (Sora Video Generation) ─────────────────────────────
+
+
+class SceneBase(BaseModel):
+    order: int = 0
+    sora_prompt: str = ""
+    narration_text: str = ""
+    duration_seconds: int = 8
+
+
+class SceneCreate(SceneBase):
+    episode_id: int
+
+
+class SceneResponse(SceneBase):
+    id: int
+    episode_id: int
+    video_url: str = ""
+    audio_url: str = ""
+    sora_video_id: str = ""
+    status: str = "draft"
+    created_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+class EpisodeBase(BaseModel):
+    title: str
+    synopsis: str = ""
+    order: int = 0
+
+
+class EpisodeCreate(EpisodeBase):
+    series_id: int
+
+
+class EpisodeResponse(EpisodeBase):
+    id: int
+    series_id: int
+    final_video_url: str = ""
+    duration_seconds: int = 0
+    status: str = "draft"
+    scenes: List[SceneResponse] = []
+    created_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+class SeriesBase(BaseModel):
+    title: str
+    description: str = ""
+    category: str = "custom"
+
+
+class SeriesCreate(SeriesBase):
+    created_by: Optional[int] = None
+
+
+class SeriesResponse(SeriesBase):
+    id: int
+    thumbnail_url: str = ""
+    status: str = "draft"
+    created_by: Optional[int] = None
+    episodes: List[EpisodeResponse] = []
+    created_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+class SeriesListItem(SeriesBase):
+    id: int
+    thumbnail_url: str = ""
+    status: str = "draft"
+    created_by: Optional[int] = None
+    created_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+class SeriesGenerateRequest(BaseModel):
+    title: str
+    description: str = ""
+    category: str = "custom"
+    case_description: str = ""
+    num_episodes: int = 3
