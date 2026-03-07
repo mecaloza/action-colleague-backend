@@ -45,7 +45,9 @@ def _get_elevenlabs_key() -> str:
 
 
 def _get_elevenlabs_voice_id() -> str:
-    return os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
+    # Default: "Daniel" - Steady Broadcaster, professional narration voice
+    # Works great in Spanish with eleven_multilingual_v2
+    return os.getenv("ELEVENLABS_VOICE_ID", "onwK4e9ZLuTAKqWnGpdt")
 
 
 def _supabase_url() -> str:
@@ -170,18 +172,24 @@ async def generate_script(
 
     system_prompt = (
         "You are an expert scriptwriter for corporate training micro-series. "
-        "You create short, cinematic narrative episodes for workplace training. "
-        "Each episode has 3-6 scenes. Each scene will be generated as a short video "
-        "using OpenAI Sora, so your visual descriptions must be detailed and cinematic.\n\n"
+        "You create cinematic narrative episodes for workplace training.\n\n"
+        "IMPORTANT RULES:\n"
+        "- Each episode MUST have 6-10 scenes to create substantial content (aim for 8).\n"
+        "- ALL narration_text MUST be written in SPANISH (Latin American Spanish).\n"
+        "- Episode titles and synopses MUST also be in SPANISH.\n"
+        "- sora_prompt MUST be in ENGLISH (Sora works best with English prompts).\n"
+        "- Prefer duration_seconds of 12 for most scenes (use 8 only for simple transitions).\n"
+        "- Each scene will be generated as a short video using OpenAI Sora, "
+        "so visual descriptions must be detailed and cinematic.\n\n"
         "For each scene provide:\n"
-        "- sora_prompt: A detailed cinematic prompt describing the shot type, subjects, "
+        "- sora_prompt: A detailed cinematic prompt IN ENGLISH describing shot type, subjects, "
         "action, setting, lighting, and mood. Be specific about camera angles and movements.\n"
-        "- narration_text: Voiceover narration for the scene (2-4 sentences).\n"
-        "- duration_seconds: 4, 8, or 12 seconds (choose based on scene complexity).\n\n"
+        "- narration_text: Voiceover narration IN SPANISH (3-5 sentences, engaging and educational).\n"
+        "- duration_seconds: 8 or 12 seconds (prefer 12 for most scenes).\n\n"
         "Return ONLY valid JSON with this structure:\n"
         '{"episodes": [{"title": "...", "synopsis": "...", "order": 1, '
         '"scenes": [{"order": 1, "sora_prompt": "...", "narration_text": "...", '
-        '"duration_seconds": 8}]}]}'
+        '"duration_seconds": 12}]}]}'
     )
 
     user_prompt = (
@@ -298,16 +306,123 @@ async def create_series(
     return series
 
 
-# ── 3. Generate Videos (Sora) ────────────────────────────────────────
+# ── 3. Generate All Content (Video + Audio + Merge) ─────────────────
 
 
-def _generate_videos_background(series_id: int):
-    """Background task: generate Sora videos for all scenes in a series."""
+def _merge_video_audio(video_bytes: bytes, audio_bytes: bytes, output_path: str) -> bytes:
+    """Merge Sora video (mute) + ElevenLabs audio into one MP4 using FFmpeg."""
+    import subprocess
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
+        vf.write(video_bytes)
+        video_path = vf.name
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as af:
+        af.write(audio_bytes)
+        audio_path = af.name
+
+    try:
+        # Merge: use video duration, loop/pad audio if shorter, cut if longer
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-i", audio_path,
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "128k",
+            "-shortest",
+            "-map", "0:v:0", "-map", "1:a:0",
+            output_path,
+        ], check=True, capture_output=True, timeout=60)
+
+        with open(output_path, "rb") as f:
+            return f.read()
+    finally:
+        import os
+        os.unlink(video_path)
+        os.unlink(audio_path)
+        if os.path.exists(output_path):
+            os.unlink(output_path)
+
+
+def _concatenate_scenes(scene_urls: list, output_path: str) -> bytes:
+    """Concatenate multiple scene videos into one episode video using FFmpeg."""
+    import subprocess
+    import tempfile
+
+    # Download all scene files
+    scene_files = []
+    for i, url in enumerate(scene_urls):
+        r = httpx.get(url, timeout=120)
+        r.raise_for_status()
+        tf = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        tf.write(r.content)
+        tf.close()
+        scene_files.append(tf.name)
+
+    try:
+        # Create concat file list
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as lf:
+            for sf in scene_files:
+                lf.write(f"file '{sf}'\n")
+            list_path = lf.name
+
+        # Re-encode all to same format then concat
+        normalized = []
+        for sf in scene_files:
+            norm_path = sf.replace(".mp4", "_norm.mp4")
+            subprocess.run([
+                "ffmpeg", "-y", "-i", sf,
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                "-r", "24",
+                "-s", "1280x720",
+                "-ar", "44100", "-ac", "2",
+                norm_path,
+            ], check=True, capture_output=True, timeout=120)
+            normalized.append(norm_path)
+
+        # Update concat list with normalized files
+        with open(list_path, "w") as lf:
+            for nf in normalized:
+                lf.write(f"file '{nf}'\n")
+
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", list_path,
+            "-c", "copy",
+            output_path,
+        ], check=True, capture_output=True, timeout=180)
+
+        with open(output_path, "rb") as f:
+            return f.read()
+    finally:
+        import os
+        for sf in scene_files:
+            if os.path.exists(sf):
+                os.unlink(sf)
+            norm = sf.replace(".mp4", "_norm.mp4")
+            if os.path.exists(norm):
+                os.unlink(norm)
+        if os.path.exists(list_path):
+            os.unlink(list_path)
+        if os.path.exists(output_path):
+            os.unlink(output_path)
+
+
+def _generate_all_background(series_id: int):
+    """
+    Full pipeline per scene: Sora video → ElevenLabs audio → FFmpeg merge.
+    Then concatenate all scenes into episode final video.
+    """
+    import time
+    import tempfile
+
     db = SessionLocal()
     try:
         openai_key = _get_openai_key()
-        if not openai_key:
-            return
+        el_key = _get_elevenlabs_key()
+        voice_id = _get_elevenlabs_voice_id()
 
         series = db.get(Series, series_id)
         if not series:
@@ -319,15 +434,18 @@ def _generate_videos_background(series_id: int):
         for episode in series.episodes:
             episode.status = "generating"
             db.commit()
+            scene_final_urls = []
 
-            for scene in episode.scenes:
-                if scene.status == "completed" and scene.video_url:
+            for scene in sorted(episode.scenes, key=lambda s: s.order):
+                if scene.status == "completed" and scene.video_url and scene.audio_url:
+                    scene_final_urls.append(scene.video_url)
                     continue
+
                 try:
+                    # ── Step 1: Generate Sora video ──
                     scene.status = "generating_video"
                     db.commit()
 
-                    # Create Sora video
                     r = httpx.post(
                         "https://api.openai.com/v1/videos",
                         headers={
@@ -345,10 +463,10 @@ def _generate_videos_background(series_id: int):
                     r.raise_for_status()
                     video_id = r.json().get("id", "")
                     scene.sora_video_id = video_id
+                    db.commit()
 
                     # Poll until completed
-                    for _ in range(120):  # max ~10 minutes
-                        import time
+                    for _ in range(120):
                         time.sleep(5)
                         status_r = httpx.get(
                             f"https://api.openai.com/v1/videos/{video_id}",
@@ -360,44 +478,110 @@ def _generate_videos_background(series_id: int):
                         if status_data.get("status") == "completed":
                             break
                         if status_data.get("status") == "failed":
-                            raise Exception(f"Sora generation failed: {status_data.get('error', 'unknown')}")
+                            raise Exception(f"Sora failed: {status_data.get('error')}")
                     else:
                         raise Exception("Sora generation timed out")
 
-                    # Download video content
+                    # Download video
                     dl_r = httpx.get(
                         f"https://api.openai.com/v1/videos/{video_id}/content",
                         headers={"Authorization": f"Bearer {openai_key}"},
                         timeout=120,
                     )
                     dl_r.raise_for_status()
+                    raw_video_bytes = dl_r.content
 
-                    # Upload to Supabase
-                    filename = f"series_{series_id}_ep_{episode.id}_scene_{scene.id}.mp4"
-                    public_url = _upload_to_supabase(dl_r.content, filename, "series-videos", "video/mp4")
+                    # ── Step 2: Generate ElevenLabs audio ──
+                    scene.status = "generating_audio"
+                    db.commit()
 
-                    if public_url:
-                        scene.video_url = public_url
+                    audio_bytes = None
+                    if el_key and scene.narration_text and scene.narration_text.strip():
+                        ar = httpx.post(
+                            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+                            headers={
+                                "xi-api-key": el_key,
+                                "Content-Type": "application/json",
+                            },
+                            json={
+                                "text": scene.narration_text[:5000],
+                                "model_id": "eleven_multilingual_v2",
+                                "voice_settings": {
+                                    "stability": 0.5,
+                                    "similarity_boost": 0.75,
+                                },
+                            },
+                            timeout=120,
+                        )
+                        ar.raise_for_status()
+                        audio_bytes = ar.content
+
+                    # ── Step 3: Merge video + audio with FFmpeg ──
+                    scene.status = "merging"
+                    db.commit()
+
+                    if audio_bytes:
+                        merge_out = tempfile.mktemp(suffix=".mp4")
+                        final_bytes = _merge_video_audio(raw_video_bytes, audio_bytes, merge_out)
                     else:
-                        scene.video_url = f"sora://completed/{video_id}"
+                        final_bytes = raw_video_bytes
 
+                    # Upload merged video to Supabase
+                    filename = f"series_{series_id}_ep_{episode.id}_scene_{scene.id}.mp4"
+                    public_url = _upload_to_supabase(final_bytes, filename, "series-videos", "video/mp4")
+
+                    # Also upload raw audio separately (for subtitle/reference)
+                    if audio_bytes:
+                        audio_filename = f"series_{series_id}_ep_{episode.id}_scene_{scene.id}.mp3"
+                        audio_url = _upload_to_supabase(audio_bytes, audio_filename, "series-audio", "audio/mpeg")
+                        scene.audio_url = audio_url or ""
+
+                    scene.video_url = public_url or ""
                     scene.status = "completed"
                     db.commit()
+
+                    if public_url:
+                        scene_final_urls.append(public_url)
+
+                    print(f"[pipeline] Scene {scene.id} completed ✅")
 
                 except Exception as e:
                     scene.status = "failed"
                     db.commit()
-                    print(f"[sora] Error scene {scene.id}: {e}")
+                    print(f"[pipeline] Error scene {scene.id}: {e}")
 
-            # Check if all scenes completed
-            all_done = all(s.status == "completed" for s in episode.scenes)
-            episode.status = "completed" if all_done else "failed"
-            db.commit()
+            # ── Step 4: Concatenate all scenes into episode video ──
+            if scene_final_urls and len(scene_final_urls) == len(episode.scenes):
+                try:
+                    print(f"[pipeline] Concatenating episode {episode.id} ({len(scene_final_urls)} scenes)...")
+                    concat_out = tempfile.mktemp(suffix=".mp4")
+                    episode_bytes = _concatenate_scenes(scene_final_urls, concat_out)
+
+                    ep_filename = f"series_{series_id}_ep_{episode.id}_full.mp4"
+                    ep_url = _upload_to_supabase(episode_bytes, ep_filename, "series-videos", "video/mp4")
+
+                    if ep_url:
+                        episode.final_video_url = ep_url
+                    episode.status = "completed"
+                    total_dur = sum(s.duration_seconds for s in episode.scenes)
+                    episode.duration_seconds = total_dur
+                    db.commit()
+                    print(f"[pipeline] Episode {episode.id} assembled ✅ ({total_dur}s)")
+
+                except Exception as e:
+                    episode.status = "completed"  # scenes are done, just concat failed
+                    db.commit()
+                    print(f"[pipeline] Episode concat error (non-fatal): {e}")
+            else:
+                all_done = all(s.status == "completed" for s in episode.scenes)
+                episode.status = "completed" if all_done else "failed"
+                db.commit()
 
         # Update series status
         all_episodes_done = all(ep.status == "completed" for ep in series.episodes)
         series.status = "published" if all_episodes_done else "draft"
         db.commit()
+        print(f"[pipeline] Series {series_id} {'published' if all_episodes_done else 'draft'} ✅")
 
     finally:
         db.close()
@@ -410,7 +594,7 @@ async def generate_videos(
     db: Session = Depends(get_db),
     _admin: User = Depends(require_admin),
 ):
-    """Kick off Sora video generation for all scenes in a series."""
+    """Kick off FULL pipeline: Sora video → ElevenLabs audio → FFmpeg merge → episode concat."""
     series = db.get(Series, series_id)
     if not series:
         raise HTTPException(status_code=404, detail="Series not found")
@@ -418,7 +602,6 @@ async def generate_videos(
     if not _get_openai_key():
         raise HTTPException(status_code=500, detail="OpenAI API key not configured")
 
-    # Count scenes to queue
     scenes_queued = 0
     for episode in series.episodes:
         for scene in episode.scenes:
@@ -427,20 +610,20 @@ async def generate_videos(
                 scenes_queued += 1
     db.commit()
 
-    background_tasks.add_task(_generate_videos_background, series_id)
+    background_tasks.add_task(_generate_all_background, series_id)
 
     return GenerateVideosResponse(
         series_id=series_id,
         scenes_queued=scenes_queued,
-        message=f"Video generation queued for {scenes_queued} scenes.",
+        message=f"Full pipeline (video+audio+merge) queued for {scenes_queued} scenes.",
     )
 
 
-# ── 4. Generate Audio (ElevenLabs) ───────────────────────────────────
+# ── 4. Generate Audio (kept for standalone re-generation) ────────────
 
 
 def _generate_audio_background(series_id: int):
-    """Background task: generate ElevenLabs audio for all scenes in a series."""
+    """Background task: generate ElevenLabs audio for scenes missing audio only."""
     db = SessionLocal()
     try:
         el_key = _get_elevenlabs_key()
@@ -459,9 +642,6 @@ def _generate_audio_background(series_id: int):
                 if not scene.narration_text or not scene.narration_text.strip():
                     continue
                 try:
-                    scene.status = "generating_audio"
-                    db.commit()
-
                     r = httpx.post(
                         f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
                         headers={
@@ -479,26 +659,12 @@ def _generate_audio_background(series_id: int):
                         timeout=120,
                     )
                     r.raise_for_status()
-
-                    # Upload to Supabase
                     filename = f"series_{series_id}_ep_{episode.id}_scene_{scene.id}.mp3"
                     public_url = _upload_to_supabase(r.content, filename, "series-audio", "audio/mpeg")
-
                     if public_url:
                         scene.audio_url = public_url
-                    else:
-                        scene.audio_url = ""
-
-                    # Only mark completed if video is also done
-                    if scene.video_url:
-                        scene.status = "completed"
-                    else:
-                        scene.status = "draft"
                     db.commit()
-
                 except Exception as e:
-                    scene.status = "failed"
-                    db.commit()
                     print(f"[audio] Error scene {scene.id}: {e}")
 
     finally:
@@ -512,7 +678,7 @@ async def generate_audio(
     db: Session = Depends(get_db),
     _admin: User = Depends(require_admin),
 ):
-    """Kick off ElevenLabs audio generation for all scenes in a series."""
+    """Kick off ElevenLabs audio generation for scenes missing audio."""
     series = db.get(Series, series_id)
     if not series:
         raise HTTPException(status_code=404, detail="Series not found")
@@ -525,7 +691,6 @@ async def generate_audio(
         for scene in episode.scenes:
             if scene.narration_text and scene.narration_text.strip() and not scene.audio_url:
                 scenes_queued += 1
-    db.commit()
 
     background_tasks.add_task(_generate_audio_background, series_id)
 
