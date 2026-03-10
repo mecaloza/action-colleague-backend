@@ -215,3 +215,19 @@ class Scene(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     episode = relationship("Episode", back_populates="scenes")
+
+
+# ── Refresh Tokens ────────────────────────────────────────────────────
+
+
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    token = Column(String(300), unique=True, nullable=False, index=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    revoked = Column(Boolean, default=False)
+    created_at = Column(DateTime, server_default=func.now())
+
+    user = relationship("User")
