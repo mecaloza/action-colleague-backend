@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func
@@ -19,8 +19,19 @@ router = APIRouter(prefix="/courses", tags=["courses"])
 
 
 @router.get("/", response_model=List[CourseOut])
-def list_courses(skip: int = 0, limit: int = 100, db: Session = Depends(get_db), _user: User = Depends(get_current_user)):
-    return db.query(Course).offset(skip).limit(limit).all()
+def list_courses(
+    skip: int = 0,
+    limit: int = 100,
+    language: Optional[str] = None,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    query = db.query(Course)
+    if language is not None:
+        if language not in {"es", "en", "pt"}:
+            raise HTTPException(400, "language must be one of: es, en, pt")
+        query = query.filter(Course.language == language)
+    return query.offset(skip).limit(limit).all()
 
 
 @router.get("/{course_id}", response_model=CourseOut)

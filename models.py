@@ -28,6 +28,7 @@ class User(Base):
     role = Column(String(20), nullable=False, default="collaborator")  # admin | collaborator
     position = Column(String(200), default="")
     department = Column(String(200), default="")
+    preferred_language = Column(String(5), default="es")
     reports_to = Column(Integer, ForeignKey("users.id"), nullable=True)
     permissions_json = Column(Text, default="[]")
     is_active = Column(Boolean, default=True)
@@ -53,6 +54,7 @@ class Course(Base):
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String(300), nullable=False)
     description = Column(Text, default="")
+    language = Column(String(5), default="es")
     status = Column(String(20), nullable=False, default="draft")  # draft | published
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
@@ -86,9 +88,11 @@ class Evaluation(Base):
     id = Column(Integer, primary_key=True, index=True)
     module_id = Column(Integer, ForeignKey("modules.id"), nullable=False, unique=True)
     questions_json = Column(Text, default="[]")
+    max_attempts = Column(Integer, default=3)
     created_at = Column(DateTime, server_default=func.now())
 
     module = relationship("Module", back_populates="evaluation")
+    attempts = relationship("EvaluationAttempt", back_populates="evaluation")
 
     @property
     def questions(self) -> list:
@@ -97,6 +101,26 @@ class Evaluation(Base):
     @questions.setter
     def questions(self, value: list):
         self.questions_json = json.dumps(value)
+
+
+class EvaluationAttempt(Base):
+    __tablename__ = "evaluation_attempts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    evaluation_id = Column(Integer, ForeignKey("evaluations.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    enrollment_id = Column(Integer, ForeignKey("enrollments.id"), nullable=False)
+    module_id = Column(Integer, ForeignKey("modules.id"), nullable=False)
+    answers_json = Column(Text, default="[]")
+    score = Column(Float, nullable=True)
+    passed = Column(Boolean, default=False)
+    attempt_number = Column(Integer, default=1)
+    created_at = Column(DateTime, server_default=func.now())
+
+    evaluation = relationship("Evaluation", back_populates="attempts")
+    user = relationship("User")
+    enrollment = relationship("Enrollment")
+    module = relationship("Module")
 
 
 class Enrollment(Base):
@@ -215,6 +239,25 @@ class Scene(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     episode = relationship("Episode", back_populates="scenes")
+
+
+# ── Communications ────────────────────────────────────────────────────
+
+
+class Communication(Base):
+    __tablename__ = "communications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(300), nullable=False)
+    message = Column(Text, default="")
+    image_url = Column(String(500), default="")
+    generated = Column(Boolean, default=False)
+    prompt_used = Column(Text, default="")
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    creator = relationship("User")
 
 
 # ── Refresh Tokens ────────────────────────────────────────────────────

@@ -3,10 +3,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from database import Base, engine
+from database import create_tables
 from routers import (
     auth,
     certificates,
+    communications,
     course_wizard,
     courses,
     dashboards,
@@ -22,7 +23,7 @@ from routers import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    Base.metadata.create_all(bind=engine)
+    create_tables()
     yield
 
 
@@ -31,6 +32,7 @@ app = FastAPI(
     description="LMS & HR document platform for Action Colleague",
     version="1.0.0",
     lifespan=lifespan,
+
 )
 
 app.add_middleware(
@@ -55,6 +57,7 @@ app.include_router(certificates.router, prefix=API_PREFIX)
 app.include_router(documents.router, prefix=API_PREFIX)
 app.include_router(dashboards.router, prefix=API_PREFIX)
 app.include_router(series_wizard.router, prefix=API_PREFIX)
+app.include_router(communications.router, prefix=API_PREFIX)
 
 
 @app.get("/")

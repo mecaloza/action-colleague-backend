@@ -26,7 +26,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
     )
 
 
-@router.get("/collaborator/{user_id}", response_model=CollaboratorDashboard)
+@router.get("/collaborator/{user_id}")
 def collaborator_dashboard(user_id: int, db: Session = Depends(get_db)):
     user = db.get(User, user_id)
     if not user:
@@ -37,10 +37,37 @@ def collaborator_dashboard(user_id: int, db: Session = Depends(get_db)):
     in_progress = sum(1 for e in enrollments if e.status == "in_progress")
     certs = db.query(Certificate).join(Enrollment).filter(Enrollment.user_id == user_id).count()
 
-    return CollaboratorDashboard(
-        user_id=user_id,
-        enrollments=[EnrollmentOut.model_validate(e) for e in enrollments],
-        completed_courses=completed,
-        in_progress_courses=in_progress,
-        certificates=certs,
-    )
+    # Build enriched enrollments with course info
+    enriched = []
+    total_hours = 0
+    for e in enrollments:
+        course = db.get(Course, e.course_id)
+        course_data = None
+        if course:
+            duration = getattr(course, "duration_hours", 0) or 0
+            total_hours += duration
+            course_data = {
+                "title": course.title,
+                "description": getattr(course, "description", ""),
+                "category": getattr(course, "category", "General"),
+                "duration_hours": duration,
+            }
+        enriched.append({
+            "id": e.id,
+            "user_id": e.user_id,
+            "course_id": e.course_id,
+            "status": e.status,
+            "progress": int(e.progress_pct) if e.progress_pct else 0,
+            "enrolled_at": str(e.enrolled_at) if e.enrolled_at else None,
+            "course": course_data,
+        })
+
+    return {
+        "user_id": user_id,
+        "enrollments": enriched,
+        "completed_courses": completed,
+        "in_progress_courses": in_progress,
+        "certificates": certs,
+        "total_hours": total_hours,
+        "recent_activity": [],
+    }

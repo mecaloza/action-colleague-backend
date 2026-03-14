@@ -1,7 +1,9 @@
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+VALID_LANGUAGES = {"es", "en", "pt"}
 
 
 # ── Auth ──────────────────────────────────────────────────────────────
@@ -16,6 +18,14 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
     user_id: int
     role: str
+    preferred_language: str = "es"
+
+    @field_validator("preferred_language")
+    @classmethod
+    def validate_preferred_language(cls, value: str) -> str:
+        if value not in VALID_LANGUAGES:
+            raise ValueError("preferred_language must be one of: es, en, pt")
+        return value
 
 
 class RefreshRequest(BaseModel):
@@ -29,7 +39,15 @@ class RegisterRequest(BaseModel):
     role: str = "collaborator"
     position: str = ""
     department: str = ""
+    preferred_language: str = "es"
     reports_to: Optional[int] = None
+
+    @field_validator("preferred_language")
+    @classmethod
+    def validate_preferred_language(cls, value: str) -> str:
+        if value not in VALID_LANGUAGES:
+            raise ValueError("preferred_language must be one of: es, en, pt")
+        return value
 
 
 # ── User ──────────────────────────────────────────────────────────────
@@ -39,7 +57,15 @@ class UserBase(BaseModel):
     role: str = "collaborator"
     position: str = ""
     department: str = ""
+    preferred_language: str = "es"
     hire_date: Optional[date] = None
+
+    @field_validator("preferred_language")
+    @classmethod
+    def validate_preferred_language(cls, value: str) -> str:
+        if value not in VALID_LANGUAGES:
+            raise ValueError("preferred_language must be one of: es, en, pt")
+        return value
 
 
 class UserCreate(UserBase):
@@ -54,11 +80,19 @@ class UserUpdate(BaseModel):
     role: Optional[str] = None
     position: Optional[str] = None
     department: Optional[str] = None
+    preferred_language: str = "es"
     hire_date: Optional[date] = None
     reports_to: Optional[int] = None
     permissions: Optional[List[str]] = None
     is_active: Optional[bool] = None
     password: Optional[str] = None
+
+    @field_validator("preferred_language")
+    @classmethod
+    def validate_preferred_language(cls, value: str) -> str:
+        if value not in VALID_LANGUAGES:
+            raise ValueError("preferred_language must be one of: es, en, pt")
+        return value
 
 
 class UserOut(UserBase):
@@ -86,6 +120,7 @@ class UserProfile(BaseModel):
     role: str
     position: str = ""
     department: str = ""
+    preferred_language: str = "es"
     hire_date: Optional[date] = None
     reports_to: Optional[int] = None
     permissions: List[str] = []
@@ -95,6 +130,13 @@ class UserProfile(BaseModel):
     direct_reports: List[UserOut] = []
 
     model_config = {"from_attributes": True}
+
+    @field_validator("preferred_language")
+    @classmethod
+    def validate_preferred_language(cls, value: str) -> str:
+        if value not in VALID_LANGUAGES:
+            raise ValueError("preferred_language must be one of: es, en, pt")
+        return value
 
 
 class OrgChartNode(BaseModel):
@@ -113,8 +155,16 @@ class OrgChartNode(BaseModel):
 class CourseBase(BaseModel):
     title: str
     description: str = ""
+    language: str = "es"
     status: str = "draft"
     created_by: Optional[int] = None
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str) -> str:
+        if value not in VALID_LANGUAGES:
+            raise ValueError("language must be one of: es, en, pt")
+        return value
 
 
 class CourseCreate(CourseBase):
@@ -124,7 +174,15 @@ class CourseCreate(CourseBase):
 class CourseUpdate(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
+    language: str = "es"
     status: Optional[str] = None
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str) -> str:
+        if value not in VALID_LANGUAGES:
+            raise ValueError("language must be one of: es, en, pt")
+        return value
 
 
 class CourseOut(CourseBase):
@@ -167,6 +225,7 @@ class ModuleOut(ModuleBase):
 class EvaluationBase(BaseModel):
     module_id: int
     questions: List[Any] = []
+    max_attempts: int = 3
 
 
 class EvaluationCreate(EvaluationBase):
@@ -175,12 +234,14 @@ class EvaluationCreate(EvaluationBase):
 
 class EvaluationUpdate(BaseModel):
     questions: Optional[List[Any]] = None
+    max_attempts: Optional[int] = None
 
 
 class EvaluationOut(BaseModel):
     id: int
     module_id: int
     questions: List[Any] = []
+    max_attempts: int = 3
     created_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
@@ -253,7 +314,67 @@ class EvaluationResult(BaseModel):
     correct: int
     total: int
     attempts: int
+    attempts_remaining: int
     next_module_unlocked: bool
+
+
+# ── Evaluation Attempts ──────────────────────────────────────────────
+class EvaluationAttemptOut(BaseModel):
+    id: int
+    evaluation_id: int
+    user_id: int
+    enrollment_id: int
+    module_id: int
+    answers: List[Any] = []
+    score: Optional[float] = None
+    passed: bool = False
+    attempt_number: int = 1
+    created_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+# ── Evaluation Analytics ─────────────────────────────────────────────
+class QuestionAnalytics(BaseModel):
+    question_index: int
+    question_text: str
+    question_type: str
+    total_responses: int
+    correct_count: int
+    incorrect_count: int
+    accuracy_pct: float
+    most_common_wrong_answer: Optional[str] = None
+
+
+class ModuleAnalytics(BaseModel):
+    module_id: int
+    module_title: str
+    questions: List[QuestionAnalytics] = []
+
+
+class CourseAnalyticsResponse(BaseModel):
+    course_id: int
+    modules: List[ModuleAnalytics] = []
+
+
+class AttemptSummary(BaseModel):
+    score: Optional[float] = None
+    passed: bool = False
+    answers: List[Any] = []
+    created_at: Optional[datetime] = None
+
+
+class UserResponseSummary(BaseModel):
+    user_id: int
+    user_name: str
+    module_id: int
+    module_title: str
+    attempts: List[AttemptSummary] = []
+
+
+class CourseResponsesResponse(BaseModel):
+    course_id: int
+    responses: List[UserResponseSummary] = []
 
 
 # ── Certificate ───────────────────────────────────────────────────────
@@ -413,3 +534,38 @@ class SeriesGenerateRequest(BaseModel):
     category: str = "custom"
     case_description: str = ""
     num_episodes: int = 3
+
+
+# ── Communications ───────────────────────────────────────────────────
+
+
+class CommunicationCreate(BaseModel):
+    title: str
+    message: str = ""
+    image_url: str = ""
+    generated: bool = False
+    prompt_used: str = ""
+    created_by: Optional[int] = None
+
+
+class CommunicationResponse(BaseModel):
+    id: int
+    title: str
+    message: str = ""
+    image_url: str = ""
+    generated: bool = False
+    prompt_used: str = ""
+    created_by: Optional[int] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+class ImageGenerateRequest(BaseModel):
+    prompt: str
+
+
+class ImageGenerateResponse(BaseModel):
+    image_url: str
+    prompt_used: str

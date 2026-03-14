@@ -33,6 +33,7 @@ def register(
         role=payload.role,
         position=payload.position,
         department=payload.department,
+        preferred_language=payload.preferred_language,
         reports_to=payload.reports_to,
         permissions_json="[]",
     )
@@ -62,6 +63,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
         refresh_token=refresh,
         user_id=user.id,
         role=user.role,
+        preferred_language=user.preferred_language,
     )
 
 
@@ -94,6 +96,7 @@ def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
         refresh_token=new_refresh,
         user_id=user.id,
         role=user.role,
+        preferred_language=user.preferred_language,
     )
 
 

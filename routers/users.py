@@ -57,6 +57,7 @@ def get_user_profile(
         role=user.role,
         position=user.position,
         department=user.department,
+        preferred_language=user.preferred_language,
         hire_date=user.hire_date,
         reports_to=user.reports_to,
         permissions=user.permissions,
@@ -160,7 +161,7 @@ def update_user(
     if current_user.role != "admin":
         if user_id != current_user.id:
             raise HTTPException(403, "Cannot update other users")
-        allowed = {"name", "password"}
+        allowed = {"name", "password", "preferred_language"}
         disallowed = set(updates.keys()) - allowed
         if disallowed:
             raise HTTPException(403, f"Cannot update fields: {', '.join(disallowed)}")

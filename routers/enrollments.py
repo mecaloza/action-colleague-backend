@@ -7,6 +7,7 @@ from auth import get_current_user, require_admin
 from database import get_db
 from models import Enrollment, User, Course, Module, ModuleProgress
 from schemas import EnrollmentCreate, EnrollmentOut, EnrollmentUpdate
+from routers.course_wizard import get_fresh_heygen_url
 
 router = APIRouter(prefix="/enrollments", tags=["enrollments"])
 
@@ -185,12 +186,19 @@ def my_course_detail(
                 ).first()
                 can_access = prev_progress is not None
 
+        # Regenerar URL de HeyGen si está en formato heygen://video/{id}
+        video_url = mod.video_url if can_access else None
+        if video_url and video_url.startswith("heygen://video/"):
+            video_id = video_url.replace("heygen://video/", "")
+            fresh_url = get_fresh_heygen_url(video_id)
+            video_url = fresh_url if fresh_url else video_url
+        
         module_details.append({
             "id": mod.id,
             "title": mod.title,
             "order": mod.order,
             "content_text": mod.content_text if can_access else None,
-            "video_url": mod.video_url if can_access else None,
+            "video_url": video_url,
             "audio_url": mod.audio_url if can_access else None,
             "can_access": can_access,
             "passed": progress.passed if progress else False,

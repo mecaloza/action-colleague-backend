@@ -10,6 +10,8 @@ Flow:
 6. Generate final content (video + audio via HeyGen + ElevenLabs)
 """
 
+from __future__ import annotations
+
 import json
 import os
 import uuid
@@ -35,6 +37,32 @@ def _get_elevenlabs_key() -> str:
 
 def _get_heygen_key() -> str:
     return os.getenv("HEYGEN_API_KEY", "")
+
+def get_fresh_heygen_url(video_id: str) -> Optional[str]:
+    """
+    Obtiene una URL fresca de HeyGen para un video_id.
+    Llama al API de HeyGen y devuelve la URL actualizada.
+    Retorna None si falla o si el video no está completo.
+    """
+    if not video_id or not _get_heygen_key():
+        return None
+    
+    try:
+        import httpx
+        r = httpx.get(
+            f"https://api.heygen.com/v1/video_status.get?video_id={video_id}",
+            headers={"X-Api-Key": _get_heygen_key()},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json().get("data", {})
+        
+        if data.get("status") == "completed":
+            return data.get("video_url", "")
+        return None
+    except Exception:
+        return None
+
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/tmp/colleague-uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -835,14 +863,17 @@ async def check_video_status(
         status = data.get("status", "unknown")
 
         if status == "completed":
-            video_url = data.get("video_url", "")
-            mod.video_url = video_url
+            # Guardamos referencia interna en lugar de URL firmada que expira
+            mod.video_url = f"heygen://video/{video_id}"
             mod.generation_status = "completed"
             db.commit()
+            
+            # Para la respuesta devolvemos la URL fresca
+            fresh_url = data.get("video_url", "")
             return {
                 "module_id": mod.id,
                 "status": "completed",
-                "video_url": video_url,
+                "video_url": fresh_url,
             }
         elif status == "failed":
             error_msg = data.get("error", {}).get("message", "Unknown error")
@@ -898,10 +929,13 @@ async def check_all_videos(
             status = data.get("status", "unknown")
 
             if status == "completed":
-                video_url = data.get("video_url", "")
-                mod.video_url = video_url
+                # Guardamos referencia interna en lugar de URL firmada que expira
+                mod.video_url = f"heygen://video/{video_id}"
                 mod.generation_status = "completed"
-                results.append({"module_id": mod.id, "status": "completed", "video_url": video_url})
+                
+                # Para la respuesta devolvemos la URL fresca
+                fresh_url = data.get("video_url", "")
+                results.append({"module_id": mod.id, "status": "completed", "video_url": fresh_url})
             elif status == "failed":
                 mod.generation_status = "failed"
                 mod.video_url = ""
