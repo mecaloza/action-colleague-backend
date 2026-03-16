@@ -3,21 +3,26 @@ User Videos Router — Manual course creation video uploads
 
 Endpoints:
 - POST /api/v1/videos/upload → Upload recorded video to Supabase Storage
+- POST /api/v1/videos/compose → Compose video with slides (Picture-in-Picture)
 - GET  /api/v1/videos/{video_id} → Get video metadata
 - GET  /api/v1/videos → List videos by user or module
 """
 
 import os
+import subprocess
+import tempfile
 import uuid
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from auth import get_current_user
 from database import get_db
-from models import User, UserVideo
+from models import Module, User, UserVideo
 from schemas import UserVideoOut, VideoUploadResponse
 
 router = APIRouter(prefix="/videos", tags=["videos"])
@@ -187,3 +192,173 @@ def list_videos(
 
     videos = query.order_by(UserVideo.created_at.desc()).all()
     return videos
+
+
+# ── Video Composition (Task #126) ───────────────────────────────────
+
+
+class ComposeVideoRequest(BaseModel):
+    video_id: str
+    slide_images: List[str]  # URLs de slides (PNGs)
+    layout: str = "pip-medium"  # Solo Picture-in-Picture por ahora
+
+
+class ComposeVideoResponse(BaseModel):
+    status: str
+    video_url: str
+    video_id: str
+
+
+def _download_file(url: str, dest_path: Path) -> None:
+    """Download a file from URL to local path."""
+    try:
+        response = httpx.get(url, timeout=60, follow_redirects=True)
+        response.raise_for_status()
+        dest_path.write_bytes(response.content)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to download file from {url}: {str(e)}")
+
+
+def _get_video_duration(video_path: Path) -> float:
+    """Get video duration in seconds using ffprobe."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return float(result.stdout.strip())
+    except Exception as e:
+        raise HTTPException(500, f"Failed to get video duration: {str(e)}")
+
+
+@router.post("/compose", response_model=ComposeVideoResponse)
+async def compose_video(
+    request: ComposeVideoRequest = Body(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Compose video with slides using Picture-in-Picture layout.
+
+    **MVP SIMPLE:**
+    - Layout: Picture-in-Picture básico (video pequeño sobre slide)
+    - Slides: Usa PRIMER slide como fondo fijo (no timeline)
+    - Processing: Sync (sin background jobs por ahora)
+
+    **Parameters:**
+    - `video_id`: ID del video subido
+    - `slide_images`: Lista de URLs de slides (PNGs) - solo se usa el primero
+    - `layout`: Layout ("pip-medium" por defecto)
+
+    **Returns:** Video combinado y URL final
+    """
+    # 1. Validar que el video existe y pertenece al usuario
+    video = db.query(UserVideo).filter(UserVideo.id == request.video_id).first()
+    if not video:
+        raise HTTPException(404, "Video not found")
+    if video.user_id != current_user.id and current_user.role != "admin":
+        raise HTTPException(403, "Access denied")
+
+    # 2. Validar que hay al menos un slide
+    if not request.slide_images:
+        raise HTTPException(400, "At least one slide image is required")
+
+    # 3. Update status del video
+    video.status = "processing"
+    db.commit()
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+
+            # 4. Download video from Supabase
+            video_path = tmp_path / f"input_video.{video.format}"
+            _download_file(video.storage_url, video_path)
+
+            # 5. Download PRIMER slide (MVP: solo un slide fijo)
+            slide_path = tmp_path / "slide.png"
+            _download_file(request.slide_images[0], slide_path)
+
+            # 6. Get video duration
+            duration = _get_video_duration(video_path)
+
+            # 7. FFmpeg processing - Picture-in-Picture
+            output_path = tmp_path / "composed.mp4"
+
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-y",  # Overwrite output
+                "-loop",
+                "1",  # Loop slide
+                "-t",
+                str(duration),  # Match video duration
+                "-i",
+                str(slide_path),  # Slide background
+                "-i",
+                str(video_path),  # User video
+                "-filter_complex",
+                # Scale user video to 480x270 (small PiP) and overlay bottom-right
+                "[1:v]scale=480:270[pip];[0:v][pip]overlay=W-w-20:H-h-20",
+                "-c:v",
+                "libx264",  # H.264 codec
+                "-preset",
+                "medium",  # Balance between speed and quality
+                "-crf",
+                "23",  # Quality (lower = better, 23 is good default)
+                "-c:a",
+                "copy",  # Copy audio without re-encoding
+                "-shortest",  # Finish when shortest input ends
+                str(output_path),
+            ]
+
+            # Execute FFmpeg
+            result = subprocess.run(
+                ffmpeg_cmd,
+                capture_output=True,
+                text=True,
+                timeout=300,  # 5 min timeout
+            )
+
+            if result.returncode != 0:
+                raise HTTPException(500, f"FFmpeg failed: {result.stderr}")
+
+            # 8. Upload composed video to Supabase
+            composed_bytes = output_path.read_bytes()
+            composed_filename = f"composed/{request.video_id}.mp4"
+            composed_url = _upload_to_supabase(composed_bytes, composed_filename, "user-videos", "video/mp4")
+
+            # 9. Update video record
+            video.storage_url = composed_url
+            video.status = "ready"
+            video.format = "mp4"
+            db.commit()
+
+            # 10. Update module video_url if associated with a module
+            if video.module_id:
+                module = db.query(Module).filter(Module.id == video.module_id).first()
+                if module:
+                    module.video_url = composed_url
+                    module.generation_status = "completed"
+                    db.commit()
+
+            return ComposeVideoResponse(status="completed", video_url=composed_url, video_id=video.id)
+
+    except subprocess.TimeoutExpired:
+        video.status = "failed"
+        db.commit()
+        raise HTTPException(500, "Video processing timeout (>5 minutes)")
+    except Exception as e:
+        video.status = "failed"
+        db.commit()
+        raise HTTPException(500, f"Failed to compose video: {str(e)}")
