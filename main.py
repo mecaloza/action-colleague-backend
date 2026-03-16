@@ -18,6 +18,7 @@ from routers import (
     modules,
     series_wizard,
     users,
+    videos,
 )
 
 
@@ -58,6 +59,7 @@ app.include_router(documents.router, prefix=API_PREFIX)
 app.include_router(dashboards.router, prefix=API_PREFIX)
 app.include_router(series_wizard.router, prefix=API_PREFIX)
 app.include_router(communications.router, prefix=API_PREFIX)
+app.include_router(videos.router, prefix=API_PREFIX)
 
 
 @app.get("/")

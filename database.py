@@ -57,10 +57,64 @@ def ensure_evaluation_columns():
                 conn.execute(text("ALTER TABLE evaluations ADD COLUMN max_attempts INTEGER DEFAULT 3"))
 
 
+def ensure_user_videos_table():
+    """Ensure user_videos table exists for manual course creation."""
+    with engine.begin() as conn:
+        if engine.dialect.name == "sqlite":
+            # Check if table exists
+            tables = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='user_videos'")).fetchall()
+            if not tables:
+                conn.execute(
+                    text(
+                        """
+                        CREATE TABLE user_videos (
+                            id VARCHAR(36) PRIMARY KEY,
+                            module_id INTEGER,
+                            user_id INTEGER NOT NULL,
+                            storage_url VARCHAR(500) NOT NULL,
+                            duration INTEGER,
+                            file_size INTEGER,
+                            format VARCHAR(20) DEFAULT 'webm',
+                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            status VARCHAR(20) DEFAULT 'uploaded',
+                            FOREIGN KEY (module_id) REFERENCES modules (id),
+                            FOREIGN KEY (user_id) REFERENCES users (id)
+                        )
+                        """
+                    )
+                )
+        else:
+            # PostgreSQL - check if table exists
+            result = conn.execute(
+                text("SELECT 1 FROM information_schema.tables WHERE table_name = 'user_videos'")
+            ).fetchone()
+            if not result:
+                conn.execute(
+                    text(
+                        """
+                        CREATE TABLE user_videos (
+                            id VARCHAR(36) PRIMARY KEY,
+                            module_id INTEGER,
+                            user_id INTEGER NOT NULL,
+                            storage_url VARCHAR(500) NOT NULL,
+                            duration INTEGER,
+                            file_size INTEGER,
+                            format VARCHAR(20) DEFAULT 'webm',
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            status VARCHAR(20) DEFAULT 'uploaded',
+                            FOREIGN KEY (module_id) REFERENCES modules (id),
+                            FOREIGN KEY (user_id) REFERENCES users (id)
+                        )
+                        """
+                    )
+                )
+
+
 def create_tables():
     Base.metadata.create_all(bind=engine)
     ensure_i18n_columns()
     ensure_evaluation_columns()
+    ensure_user_videos_table()
 
 
 def get_db():

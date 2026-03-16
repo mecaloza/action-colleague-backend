@@ -569,3 +569,31 @@ class ImageGenerateRequest(BaseModel):
 class ImageGenerateResponse(BaseModel):
     image_url: str
     prompt_used: str
+
+
+# ── User Videos (Manual Course Creation) ──────────────────────────────
+
+
+class VideoUploadResponse(BaseModel):
+    video_id: str
+    storage_url: str
+    status: str
+    duration: Optional[int] = None
+    file_size: Optional[int] = None
+    format: str = "webm"
+
+    model_config = {"from_attributes": True}
+
+
+class UserVideoOut(BaseModel):
+    id: str
+    module_id: Optional[int] = None
+    user_id: int
+    storage_url: str
+    duration: Optional[int] = None
+    file_size: Optional[int] = None
+    format: str
+    status: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
