@@ -383,12 +383,12 @@ async def compose_video(
             if result.returncode != 0:
                 raise HTTPException(500, f"FFmpeg failed: {result.stderr}")
 
-            # 8. Upload composed video to Supabase
+            # 8. Upload composed video to Supabase Storage (PERMANENTE)
             composed_bytes = output_path.read_bytes()
-            composed_filename = f"composed/{request.video_id}.mp4"
+            composed_filename = f"composed/{video_id}.mp4"
             composed_url = _upload_to_supabase(composed_bytes, composed_filename, "user-videos", "video/mp4")
 
-            # 9. Update video record
+            # 9. Update video record with PERMANENT storage URL
             video.storage_url = composed_url
             video.status = "ready"
             video.format = "mp4"
@@ -401,6 +401,9 @@ async def compose_video(
                     module.video_url = composed_url
                     module.generation_status = "completed"
                     db.commit()
+
+            # 11. Cleanup temp file
+            output_path.unlink(missing_ok=True)
 
             return ComposeVideoResponse(status="completed", video_url=composed_url, video_id=video.id)
 
