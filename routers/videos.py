@@ -247,7 +247,9 @@ def _get_video_duration(video_path: Path) -> float:
 
 @router.post("/compose", response_model=ComposeVideoResponse)
 async def compose_video(
-    request: ComposeVideoRequest = Body(...),
+    video_id: str = Form(...),
+    slides: List[UploadFile] = File(...),
+    layout: str = Form("pip-medium"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -260,21 +262,21 @@ async def compose_video(
     - Processing: Sync (sin background jobs por ahora)
 
     **Parameters:**
-    - `video_id`: ID del video subido
-    - `slide_images`: Lista de URLs de slides (PNGs) - solo se usa el primero
+    - `video_id`: ID del video subido (Form)
+    - `slides`: Archivos de slides (PNGs) - solo se usa el primero (multipart/form-data)
     - `layout`: Layout ("pip-medium" por defecto)
 
     **Returns:** Video combinado y URL final
     """
     # 1. Validar que el video existe y pertenece al usuario
-    video = db.query(UserVideo).filter(UserVideo.id == request.video_id).first()
+    video = db.query(UserVideo).filter(UserVideo.id == video_id).first()
     if not video:
         raise HTTPException(404, "Video not found")
     if video.user_id != current_user.id and current_user.role != "admin":
         raise HTTPException(403, "Access denied")
 
     # 2. Validar que hay al menos un slide
-    if not request.slide_images:
+    if not slides:
         raise HTTPException(400, "At least one slide image is required")
 
     # 3. Update status del video
@@ -289,9 +291,10 @@ async def compose_video(
             video_path = tmp_path / f"input_video.{video.format}"
             _download_file(video.storage_url, video_path)
 
-            # 5. Download PRIMER slide (MVP: solo un slide fijo)
+            # 5. Save PRIMER slide (MVP: solo un slide fijo)
             slide_path = tmp_path / "slide.png"
-            _download_file(request.slide_images[0], slide_path)
+            slide_bytes = await slides[0].read()
+            slide_path.write_bytes(slide_bytes)
 
             # 6. Get video duration
             duration = _get_video_duration(video_path)
