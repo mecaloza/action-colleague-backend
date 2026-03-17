@@ -223,8 +223,13 @@ def _download_file(url: str, dest_path: Path) -> None:
 
 
 def _get_video_duration(video_path: Path) -> float:
-    """Get video duration in seconds using ffprobe."""
+    """Get video duration in seconds using ffprobe with multiple fallbacks."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+
     try:
+        # Attempt 1: Try format duration
         result = subprocess.run(
             [
                 "ffprobe",
@@ -240,9 +245,45 @@ def _get_video_duration(video_path: Path) -> float:
             text=True,
             check=True,
         )
-        return float(result.stdout.strip())
+        duration_str = result.stdout.strip()
+
+        if duration_str and duration_str != "N/A":
+            return float(duration_str)
+
+        # Attempt 2: Try video stream duration
+        logger.warning(f"Format duration is N/A, trying stream duration for {video_path}")
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        duration_str = result.stdout.strip()
+
+        if duration_str and duration_str != "N/A":
+            return float(duration_str)
+
+        # Fallback: Use default duration
+        logger.warning(f"Could not get duration for {video_path}, using default 60s")
+        return 60.0
+
+    except ValueError as e:
+        logger.error(f"Failed to parse duration for {video_path}: {e}")
+        return 60.0
     except Exception as e:
-        raise HTTPException(500, f"Failed to get video duration: {str(e)}")
+        logger.error(f"Error getting video duration for {video_path}: {e}")
+        return 60.0
 
 
 @router.post("/compose", response_model=ComposeVideoResponse)
@@ -296,8 +337,11 @@ async def compose_video(
             slide_bytes = await slides[0].read()
             slide_path.write_bytes(slide_bytes)
 
-            # 6. Get video duration
-            duration = _get_video_duration(video_path)
+            # 6. Get video duration (prefer DB metadata, fallback to FFprobe)
+            if video.duration:
+                duration = video.duration
+            else:
+                duration = _get_video_duration(video_path)
 
             # 7. FFmpeg processing - Picture-in-Picture
             output_path = tmp_path / "composed.mp4"
