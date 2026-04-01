@@ -284,7 +284,7 @@ class UserVideo(Base):
 
     id = Column(String(36), primary_key=True, index=True)  # UUID
     module_id = Column(Integer, ForeignKey("modules.id"), nullable=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # TEMP: Nullable for testing without auth
     storage_url = Column(String(500), nullable=False)
     duration = Column(Integer, nullable=True)  # seconds
     file_size = Column(Integer, nullable=True)  # bytes
