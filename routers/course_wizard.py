@@ -1140,17 +1140,34 @@ Content:
                         video_inputs.append({"character": base_char, "voice": base_voice, "background": {"type": "color", "value": "#1a1a2e"}})
 
                 # Step 3: Send to HeyGen
+                request_payload = {
+                    "video_inputs": video_inputs,
+                    "dimension": {"width": 1920, "height": 1080},
+                }
                 r = httpx.post(
                     "https://api.heygen.com/v2/video/generate",
                     headers={"X-Api-Key": heygen_key, "Content-Type": "application/json"},
-                    json={"video_inputs": video_inputs, "dimension": {"width": 1920, "height": 1080}},
+                    json=request_payload,
                     timeout=30,
                 )
-                r.raise_for_status()
-                video_id = r.json().get("data", {}).get("video_id", "")
+                if r.is_error:
+                    logger.error(
+                        "[video-v2] HeyGen rejected module %s, status=%s, body=%s, payload_preview=%s",
+                        mod.id,
+                        r.status_code,
+                        r.text[:1200],
+                        json.dumps(request_payload)[:1500],
+                    )
+                    r.raise_for_status()
+                response_data = r.json()
+                video_id = response_data.get("data", {}).get("video_id", "")
                 logger.info(f"[video-v2] Module {mod.id}: HeyGen queued with {len(video_inputs)} scenes, video_id={video_id}")
                 if video_id:
                     mod.video_url = f"heygen://pending/{video_id}"
+                    db.commit()
+                else:
+                    logger.error("[video-v2] Module %s: HeyGen response missing video_id, body=%s", mod.id, json.dumps(response_data)[:1200])
+                    mod.generation_status = "failed"
                     db.commit()
             except Exception as e:
                 mod.generation_status = "failed"
@@ -1172,13 +1189,16 @@ async def generate_video_v2(
     if not modules:
         raise HTTPException(status_code=404, detail="No modules found")
 
+    queued_modules = [m for m in modules if m.content_text and m.content_text.strip()]
+    if not queued_modules:
+        raise HTTPException(status_code=400, detail="No modules with content available for AI video generation")
+
     if not _get_heygen_key() or not _get_openai_key():
         raise HTTPException(status_code=500, detail="HeyGen or OpenAI API key not configured")
 
     # Mark all as generating
-    for mod in modules:
-        if mod.content_text and mod.content_text.strip():
-            mod.generation_status = "queued"
+    for mod in queued_modules:
+        mod.generation_status = "queued"
     db.commit()
 
     # Run in background
@@ -1186,7 +1206,7 @@ async def generate_video_v2(
 
     return {
         "course_id": payload.course_id,
-        "modules_queued": sum(1 for m in modules if m.content_text and m.content_text.strip()),
+        "modules_queued": len(queued_modules),
         "status": "queued",
         "message": "Video generation started in background. Use check-all-videos to monitor progress.",
     }
