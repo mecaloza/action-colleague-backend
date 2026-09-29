@@ -19,10 +19,19 @@ from app.core.config import get_settings
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
+TRANSIENT = (408, 409, 429)  # 4xx the SDK itself retries (with 5xx and connection errors): a later try may pass
 
 
 class LLMError(RuntimeError):
-    """The model could not produce a usable answer (refusal, truncation, provider error)."""
+    """The model could not produce a usable answer (refusal, truncation, provider error).
+
+    `permanent`: sending the same request again can't help (refusal, truncation, rejected request or key);
+    transient errors (timeouts, rate limits, 5xx) were already retried by the SDK and may pass later.
+    """
+
+    def __init__(self, message: str, permanent: bool = False):
+        super().__init__(message)
+        self.permanent = permanent
 
 
 class LLM(Protocol):
@@ -43,15 +52,26 @@ class OpenAILLM:
                 max_completion_tokens=max_tokens,
             )
         except openai.LengthFinishReasonError as exc:
-            raise LLMError("La respuesta del modelo quedó incompleta; intenta con menos contenido.") from exc
+            raise LLMError("La respuesta del modelo quedó incompleta; intenta con menos contenido.", permanent=True) from exc
         except openai.ContentFilterFinishReasonError as exc:
-            raise LLMError("El filtro de contenido del modelo bloqueó la respuesta.") from exc
+            raise LLMError("El filtro de contenido del modelo bloqueó la respuesta.", permanent=True) from exc
         except openai.APIError as exc:
-            logger.error("llm_provider_error", extra={"error": str(exc)[:300], "model": self.model})
+            status_code = getattr(exc, "status_code", None)
+            logger.error(
+                "llm_provider_error",
+                extra={"error": str(exc)[:300], "model": self.model, "status": status_code,
+                       "request_id": getattr(exc, "request_id", None)},
+            )
+            if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError, openai.NotFoundError)):
+                raise LLMError("La IA no está bien configurada en el servidor (llave o modelo).", permanent=True) from exc
+            if getattr(exc, "code", None) == "context_length_exceeded":
+                raise LLMError("Los materiales son demasiado largos para la IA; quita alguno.", permanent=True) from exc
+            if isinstance(exc, openai.APIStatusError) and 400 <= exc.status_code < 500 and exc.status_code not in TRANSIENT:
+                raise LLMError("El servicio de IA rechazó la solicitud.", permanent=True) from exc
             raise LLMError("El servicio de IA no respondió. Intenta de nuevo en unos minutos.") from exc
         message = completion.choices[0].message
         if message.refusal or message.parsed is None:
-            raise LLMError("El modelo no pudo generar este contenido.")
+            raise LLMError("El modelo no pudo generar este contenido.", permanent=True)
         usage = completion.usage
         logger.info(
             "llm_completion",

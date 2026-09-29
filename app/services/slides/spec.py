@@ -1,9 +1,9 @@
 """Slide content and rendering context (shared by the AI designer, the editor preview and the video)."""
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 Layout = Literal["cover", "bullets", "statement", "stat", "steps", "comparison", "closing"]
 
@@ -11,21 +11,30 @@ Layout = Literal["cover", "bullets", "statement", "stat", "steps", "comparison",
 MAX_POINTS = 5  # bullets / steps / takeaways
 MAX_COLUMN_POINTS = 4  # per side of a comparison
 
+# Input limits, well above what a slide can show (the renderer shrinks and ellipsizes long text). They
+# bound the renderer's work: every request to /slides/preview and every stored scene is laid out.
+MAX_TEXT_CHARS = 300  # title, subtitle, a point, the stat label
+MAX_LABEL_CHARS = 100  # stat value, author, column heading, eyebrow
+MAX_LIST_ITEMS = 10  # points kept per list (only the first MAX_POINTS / MAX_COLUMN_POINTS are shown)
+
+SlideText = Annotated[str, StringConstraints(max_length=MAX_TEXT_CHARS)]
+SlideLabel = Annotated[str, StringConstraints(max_length=MAX_LABEL_CHARS)]
+
 
 class ComparisonColumn(BaseModel):
-    heading: str = ""
-    points: list[str] = Field(default_factory=list)
+    heading: SlideLabel = ""
+    points: list[SlideText] = Field(default_factory=list, max_length=MAX_LIST_ITEMS)
 
 
 class Slide(BaseModel):
     layout: Layout
-    eyebrow: str = ""
-    title: str = ""
-    subtitle: str = ""
-    points: list[str] = Field(default_factory=list)  # bullets / steps / takeaways
-    stat_value: str = ""
-    stat_label: str = ""
-    quote_author: str = ""
+    eyebrow: SlideLabel = ""
+    title: SlideText = ""
+    subtitle: SlideText = ""
+    points: list[SlideText] = Field(default_factory=list, max_length=MAX_LIST_ITEMS)  # bullets / steps / takeaways
+    stat_value: SlideLabel = ""
+    stat_label: SlideText = ""
+    quote_author: SlideLabel = ""
     left: ComparisonColumn = Field(default_factory=ComparisonColumn)
     right: ComparisonColumn = Field(default_factory=ComparisonColumn)
 

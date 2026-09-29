@@ -13,10 +13,12 @@ from contextlib import contextmanager
 from sqlalchemy.orm import Session
 
 from app.db.models import Course, Evaluation, Job, Module
+from app.schemas.courses import MAX_AUDIENCE_CHARS
 from app.schemas.studio import OutlineGenerate, QuizGenerate
 from app.services import studio
 from app.services.ai import designer
 from app.services.ai.llm import LLMError, get_llm
+from app.services.course_views import ACTIVE_GENERATION
 from app.services.progress import ordered_modules
 from app.worker.runner import JobContext, JobError, handler, open_session
 
@@ -31,7 +33,7 @@ def _llm_errors() -> Iterator[None]:
     try:
         yield
     except LLMError as exc:
-        raise JobError(str(exc)) from exc
+        raise JobError(str(exc), permanent=exc.permanent) from exc
 
 
 # ── Outline ───────────────────────────────────────────────────────────
@@ -46,6 +48,7 @@ def generate_outline(ctx: JobContext) -> dict:
             return {"skipped": "course deleted"}
         language = course.language or "es"
         materials = studio.materials_text(db, course.id)
+        previous = studio.stored_outline(course) if request.feedback.strip() else None  # what the feedback is about
     ctx.progress(15, "Leyendo tus materiales")
     with _llm_errors():
         outline = designer.generate_outline(
@@ -58,7 +61,10 @@ def generate_outline(ctx: JobContext) -> dict:
             minutes=request.minutes,
             materials=materials,
             feedback=request.feedback,
+            previous=previous,
         )
+    if not outline.modules:
+        raise JobError("La IA no propuso módulos. Intenta de nuevo con más detalle en el brief.")
     ctx.progress(90, "Guardando la propuesta")
     with open_session() as db:
         course = db.get(Course, ctx.course_id)
@@ -68,7 +74,8 @@ def generate_outline(ctx: JobContext) -> dict:
             **(course.settings or {}),
             "outline": outline.model_dump(),
             "brief": request.brief,
-            "audience": request.audience or outline.audience,
+            # The model's audience has no length limit; the course settings do.
+            "audience": (request.audience or outline.audience).strip()[:MAX_AUDIENCE_CHARS],
             "tone": request.tone,
             "minutes": request.minutes,
         }
@@ -91,6 +98,11 @@ def draft_module(ctx: JobContext) -> dict:
         module = db.get(Module, ctx.module_id)
         if module is None:
             return {"skipped": "module deleted"}
+        if module.source != "ai":  # it got its own video or document meanwhile: never overwrite that content
+            if module.generation_status in ACTIVE_GENERATION:
+                module.generation_status = "pending"
+                db.commit()
+            return {"skipped": "not an AI module"}
         course = module.course
         module.generation_status, module.generation_error = "generating", None
         outline = studio.course_outline(course)
@@ -98,13 +110,15 @@ def draft_module(ctx: JobContext) -> dict:
         number = [m.id for m in ordered_modules(course)].index(module.id) + 1
         language, tone = course.language or "es", (course.settings or {}).get("tone", "")
         materials = studio.materials_text(db, course.id)
+        feedback = ctx.payload.get("feedback", "")
+        previous_scenes = studio.scenes_of(module) if feedback.strip() else []  # what the feedback is about
         db.commit()
 
     ctx.progress(10, "Escribiendo el guion")
     with _llm_errors():
         draft = designer.generate_module(
             get_llm(), outline, entry, number,
-            language=language, tone=tone, materials=materials, feedback=ctx.payload.get("feedback", ""),
+            language=language, tone=tone, materials=materials, feedback=feedback, previous_scenes=previous_scenes,
         )
     scenes = designer.to_scenes(draft.scenes)
     if not scenes:
@@ -116,8 +130,10 @@ def draft_module(ctx: JobContext) -> dict:
         module = db.get(Module, ctx.module_id)
         if module is None:
             return {"skipped": "module deleted"}
+        if module.source != "ai":  # a video or document was attached while the model wrote
+            return {"skipped": "not an AI module"}
         module.storyboard = {"outline": entry.model_dump(), "scenes": scenes}
-        module.content_text = draft.reading_summary.strip()
+        module.content_text = designer.plain_markdown(draft.reading_summary)
         # Ready to produce the video; the storyboard can be reviewed and edited first.
         module.generation_status, module.generation_error = "pending", None
         if questions and module.evaluation is None:  # a quiz the admin already has is never overwritten
@@ -138,8 +154,10 @@ def suggest_quiz(ctx: JobContext) -> dict:
             return {"skipped": "module deleted"}
         title, language = module.title, module.course.language or "es"
         content = studio.module_content_for_quiz(db, module)
-    if len(content.strip()) < MIN_QUIZ_CONTENT_CHARS:
-        raise JobError("El módulo aún no tiene suficiente contenido (texto, guion o documento) para crear preguntas.")
+    if len(content.strip()) < MIN_QUIZ_CONTENT_CHARS:  # a retry would find the same content
+        raise JobError(
+            "El módulo aún no tiene suficiente contenido (texto, guion o documento) para crear preguntas.", permanent=True
+        )
     ctx.progress(20, "Creando preguntas")
     count = QuizGenerate.model_validate(ctx.payload).count
     with _llm_errors():

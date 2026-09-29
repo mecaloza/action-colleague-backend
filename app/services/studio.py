@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Course, MediaAsset, Module
 from app.services.ai.designer import CourseOutline, OutlineModule
+from app.services.course_views import ACTIVE_GENERATION
 from app.services.progress import ordered_modules
 
 MATERIAL_KINDS = ("document", "deck")
@@ -32,10 +33,12 @@ def stored_outline(course: Course) -> CourseOutline | None:
 
 
 def module_outline(module: Module) -> OutlineModule:
-    """The outline entry a module was created from, or one derived from its title and description."""
+    """The outline entry a module was created from (with its current title and description), or one derived from them."""
     raw = (module.storyboard or {}).get("outline")
     if raw:
-        return OutlineModule.model_validate(raw)
+        entry = OutlineModule.model_validate(raw)
+        # The admin may have renamed the module in the editor since the outline was approved.
+        return entry.model_copy(update={"title": module.title, "summary": module.description or entry.summary})
     return OutlineModule(
         title=module.title,
         summary=module.description or "",
@@ -63,9 +66,10 @@ def scenes_of(module: Module) -> list[dict]:
 
 
 def is_untouched_ai_module(module: Module) -> bool:
-    """Created from an outline and not drafted, produced or edited yet: safe to replace."""
+    """Created from an outline and not drafted (nor being drafted), produced or edited yet: safe to replace."""
     return (
         module.source == "ai"
+        and module.generation_status not in ACTIVE_GENERATION
         and not scenes_of(module)
         and not module.video_asset_id
         and not module.video_url

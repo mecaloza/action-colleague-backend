@@ -1,5 +1,7 @@
 """AI course studio: outline, per-module storyboards, quiz suggestions and slide previews."""
 
+import threading
+
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
@@ -11,8 +13,10 @@ from app.schemas.courses import CourseDetail
 from app.schemas.media import JobOut
 from app.schemas.studio import (
     MAX_MODULES,
+    MAX_TITLE_CHARS,
     Capabilities,
     CourseOutline,
+    CourseOutlineIn,
     DraftRequest,
     OutlineGenerate,
     QuizGenerate,
@@ -21,7 +25,7 @@ from app.schemas.studio import (
     StoryboardRegenerate,
 )
 from app.services import studio
-from app.services.course_views import course_detail
+from app.services.course_views import ACTIVE_GENERATION, course_detail
 from app.services.media_views import job_out
 from app.services.progress import ordered_modules, refresh_course_enrollments
 from app.services.slides.render import render_png
@@ -31,8 +35,8 @@ from app.worker import queue
 
 router = APIRouter(tags=["studio"], dependencies=[Depends(require_admin)])
 
-MAX_TITLE_CHARS = 300  # size of the course and module title columns
 AI_JOB_ATTEMPTS = 2  # a second try covers a transient provider error
+BUSY_WITH_OTHER_REQUEST = "Ya se está generando con otras indicaciones; espera a que termine para pedir cambios."
 
 
 def _ai_available() -> bool:
@@ -43,6 +47,13 @@ def _ai_available() -> bool:
 def _require_ai() -> None:
     if not _ai_available():
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "La IA no está configurada en el servidor (OPENAI_API_KEY)")
+
+
+def _same_request(job: Job, payload: dict) -> Job:
+    """The job (maybe an active one returned by the dedupe key), or 409 if it was asked with other instructions."""
+    if job.payload != payload:
+        raise HTTPException(status.HTTP_409_CONFLICT, BUSY_WITH_OTHER_REQUEST)
+    return job
 
 
 def _storage_available() -> bool:
@@ -68,11 +79,12 @@ def generate_outline(
 ):
     _require_ai()
     course = course_or_404(db, course_id)
+    request = payload.model_dump()
     job = queue.enqueue(
-        db, "ai.outline", payload.model_dump(), course_id=course.id, created_by=admin.id,
+        db, "ai.outline", request, course_id=course.id, created_by=admin.id,
         dedupe_key=f"outline:{course.id}", max_attempts=AI_JOB_ATTEMPTS,
     )
-    return job_out(job)
+    return job_out(_same_request(job, request))
 
 
 @router.get("/courses/{course_id}/outline", response_model=CourseOutline)
@@ -83,7 +95,7 @@ def get_outline(course_id: int, db: Session = Depends(get_db)):
     return outline
 
 
-def _check_outline(outline: CourseOutline) -> None:
+def _check_outline(outline: CourseOutlineIn) -> None:
     """422 unless the outline has 1 to MAX_MODULES modules and a title on the course and on each module."""
     if not 1 <= len(outline.modules) <= MAX_MODULES:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"El curso debe tener entre 1 y {MAX_MODULES} módulos")
@@ -92,13 +104,16 @@ def _check_outline(outline: CourseOutline) -> None:
 
 
 @router.put("/courses/{course_id}/outline", response_model=CourseDetail)
-def apply_outline(course_id: int, outline: CourseOutline, db: Session = Depends(get_db)):
+def apply_outline(course_id: int, outline: CourseOutlineIn, db: Session = Depends(get_db)):
     """Approve the outline: sets the course's title and description and creates its modules."""
     course = course_or_404(db, course_id)
     _check_outline(outline)
+    # Locked: a double submit must not create the modules twice (both requests would see none).
+    db.refresh(course, with_for_update=True)
     if any(not studio.is_untouched_ai_module(module) for module in course.modules):
         raise HTTPException(
-            status.HTTP_409_CONFLICT, "El curso ya tiene contenido; edita sus módulos uno por uno desde el editor"
+            status.HTTP_409_CONFLICT,
+            "El curso ya tiene contenido (o se está generando); edita sus módulos uno por uno desde el editor",
         )
     for module in list(course.modules):
         db.delete(module)
@@ -130,13 +145,24 @@ def apply_outline(course_id: int, outline: CourseOutline, db: Session = Depends(
 # ── Storyboards ───────────────────────────────────────────────────────
 
 
-def _enqueue_draft(db: Session, module: Module, admin: User, **extra) -> Job:
+def _require_ai_module(module: Module) -> None:
+    """Only AI modules have a storyboard: drafting rewrites the module's reading text, never the admin's own content."""
+    if module.source != "ai":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"«{module.title}» tiene su propio contenido; el guion con IA es para módulos creados con IA"
+        )
+
+
+def _enqueue_draft(db: Session, module: Module, admin: User, feedback: str = "") -> Job:
     """Queue the module's storyboard job; the caller commits (several modules can be queued at once)."""
-    module.generation_status, module.generation_error = "queued", None
-    return queue.enqueue(
-        db, "ai.module_draft", {"module_id": module.id, **extra}, course_id=module.course_id, module_id=module.id,
-        created_by=admin.id, dedupe_key=f"draft:{module.id}", max_attempts=AI_JOB_ATTEMPTS, commit=False,
+    job = queue.enqueue(
+        db, "ai.module_draft", {"module_id": module.id, "feedback": feedback}, course_id=module.course_id,
+        module_id=module.id, created_by=admin.id, dedupe_key=f"draft:{module.id}", max_attempts=AI_JOB_ATTEMPTS,
+        commit=False,
     )
+    if job.status == "queued":  # one already running keeps showing "generating"
+        module.generation_status, module.generation_error = "queued", None
+    return job
 
 
 def _modules_to_draft(course: Course, module_ids: list[int] | None) -> list[Module]:
@@ -148,6 +174,8 @@ def _modules_to_draft(course: Course, module_ids: list[int] | None) -> list[Modu
     selected = [module for module in modules if module.id in wanted]
     if len(selected) != len(wanted):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Algún módulo no pertenece a este curso")
+    for module in selected:
+        _require_ai_module(module)
     return selected
 
 
@@ -171,6 +199,8 @@ def get_storyboard(module_id: int, db: Session = Depends(get_db)):
 @router.put("/modules/{module_id}/storyboard", response_model=Storyboard)
 def save_storyboard(module_id: int, payload: Storyboard, db: Session = Depends(get_db)):
     module = module_or_404(db, module_id)
+    if module.generation_status in ACTIVE_GENERATION:  # the job would overwrite these edits when it finishes
+        raise HTTPException(status.HTTP_409_CONFLICT, "El guion se está generando; edítalo cuando termine")
     if not payload.scenes:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "El guion necesita al menos una escena")
     ids = [scene.id for scene in payload.scenes]
@@ -187,7 +217,9 @@ def regenerate_storyboard(
 ):
     _require_ai()
     module = module_or_404(db, module_id)
+    _require_ai_module(module)
     job = _enqueue_draft(db, module, admin, feedback=payload.feedback)
+    _same_request(job, {"module_id": module.id, "feedback": payload.feedback})
     db.commit()
     return job_out(job)
 
@@ -212,8 +244,20 @@ def suggest_quiz(
 # ── Slides ────────────────────────────────────────────────────────────
 
 
+# Rendering is CPU work in the API process: a few at a time, the rest wait their turn (an editor opening a
+# long script asks for every scene at once) instead of piling up on the server's threads.
+_PREVIEW_SLOTS = threading.BoundedSemaphore(2)
+PREVIEW_WAIT_SECONDS = 15
+
+
 @router.post("/slides/preview", response_class=Response)
 def preview_slide(payload: SlidePreview):
     """The slide exactly as the video will show it (960x540 PNG)."""
     context = SlideContext(**payload.context.model_dump())
-    return Response(render_png(payload.slide, context, scale=0.5), media_type="image/png", headers={"Cache-Control": "no-store"})
+    if not _PREVIEW_SLOTS.acquire(timeout=PREVIEW_WAIT_SECONDS):
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Hay muchas vistas previas en curso; intenta de nuevo.")
+    try:
+        png = render_png(payload.slide, context, scale=0.5)
+    finally:
+        _PREVIEW_SLOTS.release()
+    return Response(png, media_type="image/png", headers={"Cache-Control": "no-store"})

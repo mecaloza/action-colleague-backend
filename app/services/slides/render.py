@@ -67,20 +67,63 @@ def text_width(draw: ImageDraw.ImageDraw, text: str, fnt: ImageFont.FreeTypeFont
     return draw.textlength(text, font=fnt)
 
 
-def wrap(draw: ImageDraw.ImageDraw, text: str, fnt: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
-    """Greedy word wrap; a word wider than the box keeps a line of its own."""
+def _fitting_prefix(draw: ImageDraw.ImageDraw, word: str, fnt: ImageFont.FreeTypeFont, max_width: int) -> int:
+    """Length of the longest start of `word` that fits the box (at least one character).
+
+    Doubling then bisecting only ever measures strings about as long as one line, whatever the word's length.
+    """
+    fits, too_long = 1, 2
+    while too_long <= len(word) and text_width(draw, word[:too_long], fnt) <= max_width:
+        fits, too_long = too_long, too_long * 2
+    too_long = min(too_long, len(word) + 1)
+    while too_long - fits > 1:
+        middle = (fits + too_long) // 2
+        if text_width(draw, word[:middle], fnt) <= max_width:
+            fits = middle
+        else:
+            too_long = middle
+    return fits
+
+
+def _break_word(
+    draw: ImageDraw.ImageDraw, word: str, fnt: ImageFont.FreeTypeFont, max_width: int, max_pieces: int
+) -> list[str]:
+    """A word wider than the box (a URL, a figure without spaces) cut into pieces that fit; at most `max_pieces`."""
+    pieces: list[str] = []
+    while word and len(pieces) < max_pieces:
+        cut = _fitting_prefix(draw, word, fnt, max_width)
+        pieces.append(word[:cut])
+        word = word[cut:]
+    return pieces
+
+
+def wrap(
+    draw: ImageDraw.ImageDraw, text: str, fnt: ImageFont.FreeTypeFont, max_width: int, max_lines: int | None = None
+) -> list[str]:
+    """Greedy word wrap where no line is wider than the box (long words are cut).
+
+    With `max_lines`, it stops as soon as the text needs more lines than that: callers only need to know
+    it doesn't fit, and long texts would otherwise be laid out in full for every font size tried.
+    """
     lines: list[str] = []
     for paragraph in text.split("\n"):
         current = ""
         for word in paragraph.split():
-            candidate = f"{current} {word}".strip()
-            if text_width(draw, candidate, fnt) <= max_width or not current:
+            candidate = f"{current} {word}" if current else word
+            if text_width(draw, candidate, fnt) <= max_width:
                 current = candidate
-            else:
+                continue
+            if current:
                 lines.append(current)
-                current = word
-        lines.append(current)
-    return [line for line in lines if line] or [""]
+            # Past max_lines + 1 pieces the text can't fit anyway: the rest of the word is not measured.
+            max_pieces = len(word) if max_lines is None else max_lines + 1
+            *full_pieces, current = _break_word(draw, word, fnt, max_width, max_pieces)
+            lines.extend(full_pieces)
+            if max_lines is not None and len(lines) > max_lines:
+                return lines
+        if current:
+            lines.append(current)
+    return lines or [""]
 
 
 @dataclass
@@ -96,7 +139,7 @@ class FittedText:
 
 def _ellipsize(draw: ImageDraw.ImageDraw, lines: list[str], fnt: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
     """Close the last line with an ellipsis, dropping words (then letters) until it fits."""
-    while lines and text_width(draw, lines[-1] + "…", fnt) > max_width:
+    while lines and lines[-1] and text_width(draw, lines[-1] + "…", fnt) > max_width:
         lines[-1] = lines[-1].rsplit(" ", 1)[0] if " " in lines[-1] else lines[-1][:-1]
     if lines:
         lines[-1] = lines[-1].rstrip(" ,.;:") + "…"
@@ -118,15 +161,19 @@ def fit(
     """Largest font size (stepping down) whose wrapped text fits the box; truncates as a last resort."""
     for size in range(max_size, min_size - 1, -2):
         fnt = font(path, size, weight)
-        lines = wrap(draw, text, fnt, max_width)
         line_height = round(size * leading)
-        if len(lines) <= max_lines and line_height * len(lines) <= max_height:
+        lines_that_fit = min(max_lines, max_height // line_height)
+        lines = wrap(draw, text, fnt, max_width, max_lines=lines_that_fit)
+        if len(lines) <= lines_that_fit:
             return FittedText(fnt, lines, line_height)
 
     fnt = font(path, min_size, weight)
     line_height = round(min_size * leading)
     limit = max(1, min(max_lines, max_height // line_height))
-    return FittedText(fnt, _ellipsize(draw, wrap(draw, text, fnt, max_width)[:limit], fnt, max_width), line_height)
+    lines = wrap(draw, text, fnt, max_width, max_lines=limit)
+    if len(lines) > limit:
+        lines = _ellipsize(draw, lines[:limit], fnt, max_width)
+    return FittedText(fnt, lines, line_height)
 
 
 def fit_all(
@@ -315,7 +362,8 @@ def _stat(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageDr
     left, top, right, bottom = _content_box(230)
     value = fit(draw, slide.stat_value, DISPLAY_FONT, 700, min(right, 1500) - left, 330, 300, 120, leading=1.0, max_lines=1)
     y = draw_lines(draw, value, left - 6, top, theme.accent) + 10
-    label = fit(draw, slide.stat_label or slide.title, DISPLAY_FONT, 600, right - left, 170, 72, 44, max_lines=2)
+    label_right = _text_right_limit(ctx, y + 170, right)  # a two-line label can reach the presenter bubble
+    label = fit(draw, slide.stat_label or slide.title, DISPLAY_FONT, 600, label_right - left, 170, 72, 44, max_lines=2)
     y = draw_lines(draw, label, left, y, theme.text) + 20
     if slide.subtitle:
         sub_right = _text_right_limit(ctx, bottom, right)
