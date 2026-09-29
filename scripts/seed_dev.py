@@ -11,7 +11,7 @@ import sys
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.core.security import hash_password
-from app.db.init_db import create_tables
+from app.db.migrate import run_migrations
 from app.db.models import User
 from app.db.session import SessionLocal
 
@@ -34,7 +34,7 @@ def main() -> int:
         logger.error("seed_refused", extra={"reason": "set SEED_PASSWORD (min 8 chars)"})
         return 1
 
-    create_tables()
+    run_migrations()
     with SessionLocal() as db:
         for name, email, role in USERS:
             if not db.query(User).filter(User.email == email).first():

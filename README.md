@@ -10,8 +10,9 @@ app/
   core/            config (variables de entorno), logging JSON, seguridad (JWT + bcrypt)
   api/deps.py      sesión de BD y usuario autenticado
   api/routes/      endpoints bajo /api/v1
-  db/              modelos, sesión y arranque del esquema
+  db/              modelos, sesión y migraciones (migrate.py)
   services/        integraciones (almacenamiento, IA, video)
+alembic/           migraciones del esquema (Alembic)
 scripts/           utilidades de desarrollo (seed local)
 tests/             pytest
 ```
@@ -31,6 +32,33 @@ Tests:
 ```bash
 .venv/bin/python -m pytest -q
 ```
+
+## Migraciones
+
+La app aplica las migraciones al arrancar (`app.db.migrate`), dentro de una transacción con un lock para que dos contenedores no migren a la vez. También se pueden correr a mano:
+
+```bash
+.venv/bin/python -m app.db.migrate
+```
+
+- `0001_baseline` describe el esquema que producción ya tenía (creado con `create_all`). Si la base tiene tablas pero no `alembic_version`, se marca (`stamp`) en esa revisión y se sigue desde ahí.
+- Las migraciones son **solo aditivas**: la versión anterior de la app debe seguir funcionando con el esquema nuevo.
+- La base de datos es compartida con otra aplicación (tablas `wendy_*`): Alembic solo gestiona lo que declaran los modelos y nunca propone borrar tablas o columnas ajenas.
+
+Nueva migración (revisa siempre el archivo generado):
+
+```bash
+DATABASE_URL=postgresql://…local… .venv/bin/python -m app.db.migrate   # la base al día primero
+DATABASE_URL=postgresql://…local… .venv/bin/alembic revision --autogenerate --rev-id 0003_slug -m "descripcion"
+.venv/bin/alembic check   # en CI: falla si los modelos y las migraciones no coinciden
+```
+
+- Autogenera contra PostgreSQL (con SQLite salen diferencias falsas).
+- La tabla de versiones se llama `action_colleague_alembic_version` (la base es compartida).
+- Cada migración corre con `lock_timeout` (5 s) y se reintenta: nunca queda en cola detrás de la versión anterior, que sigue atendiendo durante el deploy.
+- No uses `CREATE INDEX CONCURRENTLY` ni `autocommit_block` (confirman a mitad de camino y sueltan el lock), y no metas migraciones de datos pesadas: el arranque tiene 120 s para pasar el healthcheck.
+
+Los tests de migraciones corren contra SQLite y contra un PostgreSQL 16 embebido (`pgserver`).
 
 ## Variables de entorno
 

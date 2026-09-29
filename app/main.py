@@ -19,7 +19,7 @@ from app.api.routes import (
 )
 from app.core.config import get_settings
 from app.core.logging import RequestLogMiddleware, configure_logging
-from app.db.init_db import create_tables
+from app.db.migrate import run_migrations
 from app.services.heygen_persist import start_background_sweeps
 
 API_PREFIX = "/api/v1"
@@ -40,7 +40,7 @@ ROUTERS = (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    create_tables()
+    run_migrations()
     # HeyGen retires its v1/v2 API on 2026-10-31: copy finished videos to Storage now.
     start_background_sweeps()
     yield
