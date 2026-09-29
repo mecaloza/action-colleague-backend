@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db, require_admin
+from app.api.deps import get_current_user, get_db
 from app.core.config import get_settings
 from app.core.security import (
     create_access_token,
@@ -16,7 +16,7 @@ from app.core.security import (
     verify_password,
 )
 from app.db.models import RefreshToken, User
-from app.schemas import LoginRequest, RefreshRequest, RegisterRequest, TokenResponse, UserOut
+from app.schemas import LoginRequest, RefreshRequest, TokenResponse, UserOut
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -57,27 +57,6 @@ def _is_expired(expires_at: datetime) -> bool:
     if expires_at.tzinfo is None:  # SQLite drops the timezone
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     return expires_at < datetime.now(timezone.utc)
-
-
-@router.post("/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
-def register(payload: RegisterRequest, db: Session = Depends(get_db), _admin: User = Depends(require_admin)):
-    if _find_user_by_email(db, payload.email):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Email already registered")
-    user = User(
-        name=payload.name,
-        email=payload.email,
-        password_hash=hash_password(payload.password),
-        role=payload.role,
-        position=payload.position,
-        department=payload.department,
-        preferred_language=payload.preferred_language,
-        reports_to=payload.reports_to,
-        permissions_json="[]",
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return user
 
 
 @router.post("/login", response_model=TokenResponse)

@@ -7,13 +7,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, require_admin
 from app.db.session import get_db
 from app.db.models import Course, Enrollment, Evaluation, Module, User
-from app.schemas import (
-    CourseCreate,
-    CourseGenerateRequest,
-    CourseGenerateResponse,
-    CourseOut,
-    CourseUpdate,
-)
+from app.schemas import CourseCreate, CourseOut, CourseUpdate
 
 router = APIRouter(prefix="/courses", tags=["courses"])
 
@@ -103,43 +97,3 @@ def delete_course(course_id: int, db: Session = Depends(get_db), _admin: User = 
         raise HTTPException(404, "Course not found")
     db.delete(course)
     db.commit()
-
-
-@router.post("/{course_id}/generate", response_model=CourseGenerateResponse)
-def generate_course_content(
-    course_id: int, payload: CourseGenerateRequest, db: Session = Depends(get_db), _admin: User = Depends(require_admin)
-):
-    """AI stub: generates modules for a course."""
-    course = db.get(Course, course_id)
-    if not course:
-        raise HTTPException(404, "Course not found")
-
-    topic = payload.topic or course.title
-    created = 0
-    for i in range(1, payload.num_modules + 1):
-        module = Module(
-            course_id=course_id,
-            title=f"{topic} - Module {i}",
-            order=i,
-            content_text=f"[AI-generated content placeholder for '{topic}' module {i}]",
-        )
-        db.add(module)
-        created += 1
-
-        evaluation = Evaluation(module=module)
-        evaluation.questions = [
-            {
-                "question": f"Sample question {q} for {topic} module {i}",
-                "options": ["A", "B", "C", "D"],
-                "correct": 0,
-            }
-            for q in range(1, 4)
-        ]
-        db.add(evaluation)
-
-    db.commit()
-    return CourseGenerateResponse(
-        message=f"Generated {created} modules for '{topic}' (AI stub)",
-        course_id=course_id,
-        modules_created=created,
-    )

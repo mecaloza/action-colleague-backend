@@ -17,7 +17,6 @@ class Enrollment(Base):
     user = relationship("User", back_populates="enrollments")
     course = relationship("Course", back_populates="enrollments")
     module_progress = relationship("ModuleProgress", back_populates="enrollment")
-    certificate = relationship("Certificate", back_populates="enrollment", uselist=False)
 
 
 class ModuleProgress(Base):
@@ -34,14 +33,3 @@ class ModuleProgress(Base):
 
     enrollment = relationship("Enrollment", back_populates="module_progress")
     module = relationship("Module", back_populates="progress_records")
-
-
-class Certificate(Base):
-    __tablename__ = "certificates"
-
-    id = Column(Integer, primary_key=True, index=True)
-    enrollment_id = Column(Integer, ForeignKey("enrollments.id"), nullable=False, unique=True)
-    issued_at = Column(DateTime, server_default=func.now())
-    pdf_url = Column(String(500), default="")
-
-    enrollment = relationship("Enrollment", back_populates="certificate")
