@@ -33,6 +33,22 @@ Tests:
 .venv/bin/python -m pytest -q
 ```
 
+## API (`/api/v1`)
+
+| Área | Rutas | Quién |
+|---|---|---|
+| Sesión | `/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/me` (GET y PATCH) | todos |
+| Biblioteca y editor | `/courses`, `/courses/{id}` (+ `publish`, `unpublish`, `archive`, `preview`), `/courses/{id}/modules`, `/modules/{id}`, `/modules/{id}/evaluation` | admin |
+| Participantes y resultados | `/courses/{id}/participants`, `/courses/{id}/participants/{user_id}/attempts`, `/courses/{id}/analytics` | admin |
+| Equipo y panel | `/users`, `/users/{id}/courses`, `/dashboard` | admin |
+| Aprender | `/learn/courses`, `/learn/courses/{id}`, `/learn/modules/{id}/quiz`, `/quiz/attempts`, `/complete`, `/position` | colaborador inscrito |
+
+Reglas clave:
+- Los módulos se desbloquean en orden. Un módulo con evaluación se completa aprobándola y uno sin evaluación, al marcarlo como visto.
+- Si el admin edita una evaluación mientras alguien la responde, ese intento no se califica ni se cuenta (409) y el quiz se recarga.
+- Cambiar la contraseña propia cierra todas las sesiones (el frontend vuelve a iniciar sesión con la nueva).
+- El colaborador nunca recibe las respuestas correctas. Las opciones llevan IDs opacos (HMAC) y la calificación ocurre en el servidor (`app/services/quiz.py`, la única implementación). La solución se muestra solo al aprobar: mostrada al agotar los intentos, bastaría con que el admin diera más intentos para aprobar sin saber. Antes de aprobar, cada intento dice qué preguntas estuvieron bien.
+
 ## Migraciones
 
 La app aplica las migraciones al arrancar (`app.db.migrate`), dentro de una transacción con un lock para que dos contenedores no migren a la vez. También se pueden correr a mano:

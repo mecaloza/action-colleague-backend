@@ -27,8 +27,8 @@ class Course(Base):
     updated_at: Mapped[datetime] = updated_at_column()
 
     creator = relationship("User")
-    modules = relationship("Module", back_populates="course", order_by="Module.order")
-    enrollments = relationship("Enrollment", back_populates="course")
+    modules = relationship("Module", back_populates="course", order_by="Module.order", cascade="all, delete-orphan")
+    enrollments = relationship("Enrollment", back_populates="course", cascade="all, delete-orphan")
 
 
 def _asset_fk(column: str) -> ForeignKey:
@@ -62,5 +62,5 @@ class Module(Base):
     updated_at: Mapped[datetime] = updated_at_column()
 
     course = relationship("Course", back_populates="modules")
-    evaluation = relationship("Evaluation", back_populates="module", uselist=False)
-    progress_records = relationship("ModuleProgress", back_populates="module")
+    evaluation = relationship("Evaluation", back_populates="module", uselist=False, cascade="all, delete-orphan")
+    progress_records = relationship("ModuleProgress", back_populates="module", cascade="all, delete-orphan")

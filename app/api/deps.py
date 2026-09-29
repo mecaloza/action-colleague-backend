@@ -17,7 +17,7 @@ __all__ = ["get_db", "get_current_user", "require_admin"]
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
     credentials_error = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid or expired token",
+        detail="Tu sesión expiró. Vuelve a iniciar sesión.",
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
@@ -33,5 +33,5 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 
 def require_admin(current_user: User = Depends(get_current_user)) -> User:
     if current_user.role != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Solo un administrador puede hacer esto")
     return current_user

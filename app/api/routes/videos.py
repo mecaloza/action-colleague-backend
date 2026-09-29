@@ -20,12 +20,12 @@ from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadF
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, require_admin
 from app.db.session import get_db
 from app.db.models import Module, User, UserVideo
-from app.schemas import UserVideoOut, VideoUploadResponse
+from app.schemas.legacy import UserVideoOut, VideoUploadResponse
 
-router = APIRouter(prefix="/videos", tags=["videos"])
+router = APIRouter(prefix="/videos", tags=["videos"], dependencies=[Depends(require_admin)])
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
