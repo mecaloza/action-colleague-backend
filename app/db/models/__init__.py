@@ -3,7 +3,8 @@
 from app.db.models.course import Course, Module
 from app.db.models.enrollment import Enrollment, ModuleProgress
 from app.db.models.evaluation import Evaluation, EvaluationAttempt
-from app.db.models.media import UserVideo
+from app.db.models.job import Job
+from app.db.models.media import MediaAsset, UserVideo
 from app.db.models.user import RefreshToken, User
 
 __all__ = [
@@ -11,6 +12,8 @@ __all__ = [
     "Enrollment",
     "Evaluation",
     "EvaluationAttempt",
+    "Job",
+    "MediaAsset",
     "Module",
     "ModuleProgress",
     "RefreshToken",

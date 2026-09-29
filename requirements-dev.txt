@@ -1,2 +1,4 @@
 -r requirements.txt
 pytest==9.1.1
+# Embedded PostgreSQL 16 for migration tests
+pgserver==0.1.4
