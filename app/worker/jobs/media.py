@@ -13,13 +13,15 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import Course, Job, MediaAsset, Module
 from app.schemas.media import PURPOSES_NEEDING_MODULE, VIDEO_PURPOSES
 from app.services import media_processing as mp
-from app.services.storage import get_storage
-from app.worker.runner import JobContext, JobError, handler, open_session
+from app.services.media import discard_assets
+from app.services.storage import StorageError, get_storage
+from app.worker.runner import JobCancelled, JobContext, JobError, handler, open_session
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +53,7 @@ class AssetSnapshot:
     @property
     def folder(self) -> str:
         """Processed files are stored next to the upload."""
-        return str(PurePosixPath(self.path).parent)
+        return str(PurePosixPath(self.path).parent / "derived")
 
 
 def _save_poster(asset: AssetSnapshot, video: Path, work: Path, at_seconds: float) -> str:
@@ -75,13 +77,14 @@ def _save_poster(asset: AssetSnapshot, video: Path, work: Path, at_seconds: floa
 
 
 def _process_video(ctx: JobContext, asset: AssetSnapshot, source: Path, work: Path) -> dict:
-    info = mp.probe(source)
+    served_as_is = asset.mime_type == "video/mp4"  # only then does the upload's own duration matter
+    info = mp.probe(source, need_duration=served_as_is)
     ctx.progress(20, "Revisando el video")
     video, path, mime = source, asset.path, asset.mime_type
-    if not info.is_web_ready or asset.mime_type != "video/mp4":
+    if not (served_as_is and info.is_web_ready):
         ctx.progress(30, "Optimizando el video para la web")
         video = work / "video.mp4"
-        mp.to_web_mp4(source, video)
+        mp.to_web_mp4(source, video, info)
         info = mp.probe(video)
         path, mime = f"{asset.folder}/video.mp4", "video/mp4"
         get_storage().upload_file(path, video, mime)
@@ -141,7 +144,8 @@ PROCESSORS = {
 }
 
 
-def _attach_video(module: Module, asset: MediaAsset, source: str) -> None:
+def _attach_video(module: Module, asset: MediaAsset, source: str) -> list[str | None]:
+    replaced = [module.video_asset_id, module.poster_asset_id, module.captions_asset_id]
     module.video_asset_id = asset.id
     module.poster_asset_id = (asset.meta or {}).get("poster_asset_id")
     module.captions_asset_id = None
@@ -150,28 +154,38 @@ def _attach_video(module: Module, asset: MediaAsset, source: str) -> None:
     module.source = source
     module.generation_status = "completed"
     module.generation_error = None
+    return replaced
 
 
-def _attach_document(module: Module, asset: MediaAsset) -> None:
+def _attach_document(module: Module, asset: MediaAsset) -> list[str | None]:
+    replaced = [module.document_asset_id]
     module.document_asset_id = asset.id
     if not module.video_asset_id and not module.video_url:
         module.source = "document"
+    return replaced
 
 
-def _attach(db: Session, asset: MediaAsset, purpose: str | None, module_id: int | None) -> None:
-    """Make the processed asset a module's video or document, or a course's cover."""
+def _attach(db: Session, asset: MediaAsset, purpose: str | None, module_id: int | None) -> list[str | None] | None:
+    """
+    Make the processed asset a module's video or document, or a course's cover. Returns what it
+    replaced, or None when that module or course was deleted meanwhile. The row is locked: two uploads
+    for one module finishing together must each see what the other attached.
+    """
     if purpose in PURPOSES_NEEDING_MODULE:
-        module = db.get(Module, module_id) if module_id else None
+        module = db.get(Module, module_id, with_for_update=True) if module_id else None
         if module is None:
-            return
+            return None
         if purpose == "module_document":
-            _attach_document(module, asset)
-        else:
-            _attach_video(module, asset, VIDEO_PURPOSES[purpose])
-    elif purpose == "course_cover" and asset.course_id:
-        course = db.get(Course, asset.course_id)
-        if course:
-            course.cover_asset_id = asset.id
+            return _attach_document(module, asset)
+        return _attach_video(module, asset, VIDEO_PURPOSES[purpose])
+    if purpose == "course_cover" and asset.course_id:
+        course = db.get(Course, asset.course_id, with_for_update=True)
+        if course is None:
+            return None
+        replaced = [course.cover_asset_id]
+        course.cover_asset_id = asset.id
+        return replaced
+    return []
 
 
 def _media_failed(db: Session, job: Job, error: str) -> None:
@@ -191,7 +205,7 @@ def _start_processing(asset_id: str) -> AssetSnapshot | None:
     """Mark the asset as processing; None if it was deleted after the upload."""
     with open_session() as db:
         asset = db.get(MediaAsset, asset_id)
-        if asset is None:
+        if asset is None or asset.status == "ready":  # deleted, or a retry after the result was saved
             return None
         asset.status = "processing"
         snapshot = AssetSnapshot.of(asset)
@@ -203,7 +217,7 @@ def _process_file(ctx: JobContext, asset: AssetSnapshot) -> dict:
     """Download the upload to a scratch folder and run the processor for its kind. Returns what changed."""
     processor = PROCESSORS.get(asset.kind)
     if processor is None:
-        raise JobError(f"No se procesan archivos de tipo {asset.kind}")
+        raise JobError(f"No se procesan archivos de tipo {asset.kind}", permanent=True)
     with tempfile.TemporaryDirectory(prefix="media-") as tmp:
         work = Path(tmp)
         source = work / "source"
@@ -215,20 +229,55 @@ def _process_file(ctx: JobContext, asset: AssetSnapshot) -> dict:
             raise JobError(str(exc), permanent=True) from exc
 
 
-def _finish_processing(asset_id: str, changes: dict, payload: dict) -> bool:
-    """Store the outcome, mark the asset ready and attach it. False if the asset was deleted meanwhile."""
+def _holds_job(db: Session, ctx: JobContext) -> bool:
+    """Lock the job row until this transaction ends: a shutdown hand-back or the reaper waits for it."""
+    return db.execute(
+        select(Job.id)
+        .where(Job.id == ctx.job_id, Job.locked_by == ctx.worker_id, Job.status == "running")
+        .with_for_update()
+    ).first() is not None
+
+
+def _delete_files(paths: list[str], asset_id: str) -> None:
+    try:
+        get_storage().delete(paths)
+    except StorageError as exc:  # an orphaned file costs little; the job did its work
+        logger.warning("media_cleanup_failed", extra={"asset_id": asset_id, "error": str(exc)[:300]})
+
+
+def _finish_processing(ctx: JobContext, snapshot: AssetSnapshot, changes: dict) -> dict:
+    """
+    Store the outcome, mark the asset ready and attach it, only while this worker still holds the job
+    (after a shutdown hand-back another worker owns the result). Then discard what it replaced, or
+    everything it made when the asset, or the module or course it was for, was deleted meanwhile.
+    """
+    asset_id, purpose = ctx.payload["asset_id"], ctx.payload.get("purpose")
+    new_meta = changes.get("meta", {})
     with open_session() as db:
+        if not _holds_job(db, ctx):
+            raise JobCancelled(ctx.job_id)
         asset = db.get(MediaAsset, asset_id)
         if asset is None:
-            return False
-        meta = {**(asset.meta or {}), **changes.pop("meta", {})}
+            db.rollback()
+            derived = [changes["path"]] if changes.get("path", snapshot.path) != snapshot.path else []
+            _delete_files([*derived, *new_meta.get("pages", [])], asset_id)
+            discard_assets(db, [new_meta.get("poster_asset_id")])
+            return {"skipped": "asset deleted"}
         for column, value in changes.items():
-            setattr(asset, column, value)
-        asset.meta, asset.status, asset.error = meta, "ready", None
-        _attach(db, asset, payload.get("purpose"), payload.get("module_id"))
+            if column != "meta":
+                setattr(asset, column, value)
+        asset.meta, asset.status, asset.error = {**(asset.meta or {}), **new_meta}, "ready", None
+        replaced = _attach(db, asset, purpose, ctx.payload.get("module_id"))
         db.commit()
-        logger.info("media_processed", extra={"asset_id": asset_id, "kind": asset.kind, "purpose": payload.get("purpose")})
-        return True
+        logger.info("media_processed", extra={"asset_id": asset_id, "kind": asset.kind, "purpose": purpose})
+        orphaned = replaced is None
+        leftovers = [asset_id, new_meta.get("poster_asset_id")] if orphaned else [i for i in replaced if i != asset_id]
+        try:
+            discard_assets(db, leftovers)
+        except Exception:  # the new media is in place; leftovers only cost storage
+            db.rollback()
+            logger.exception("media_replaced_cleanup_failed", extra={"asset_id": asset_id})
+        return {"skipped": "module or course deleted"} if orphaned else {"asset_id": asset_id}
 
 
 @handler("media.process", on_failure=_media_failed)
@@ -236,11 +285,10 @@ def process_media(ctx: JobContext) -> dict:
     asset_id = ctx.payload["asset_id"]
     snapshot = _start_processing(asset_id)
     if snapshot is None:
-        return {"skipped": "asset deleted"}
+        return {"skipped": "asset deleted or already processed"}
     changes = _process_file(ctx, snapshot)
-    if not _finish_processing(asset_id, changes, ctx.payload):
-        return {"skipped": "asset deleted"}
+    result = _finish_processing(ctx, snapshot, changes)
     if changes.get("path", snapshot.path) != snapshot.path:
         # Only now that the database points at the processed copy: a retry before this still finds the upload.
-        get_storage().delete([snapshot.path])
-    return {"asset_id": asset_id}
+        _delete_files([snapshot.path], asset_id)
+    return result

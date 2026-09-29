@@ -7,11 +7,16 @@ from app.schemas.media import JobOut, MediaAssetOut
 from app.services.media import SIGNED_URL_SECONDS, sign_paths
 
 
-def asset_out(db: Session, asset: MediaAsset) -> MediaAssetOut:
+def _paths(asset: MediaAsset) -> list[str]:
+    """What an API response links to; only processed files have something to show."""
+    return [asset.path, *(asset.meta or {}).get("pages", [])] if asset.status == "ready" else []
+
+
+def asset_out(db: Session, asset: MediaAsset, signed: dict[str, str] | None = None) -> MediaAssetOut:
     meta = asset.meta or {}
     page_paths = meta.get("pages", [])
-    ready = asset.status == "ready"  # only processed files have something to play
-    signed = sign_paths([asset.path, *page_paths], SIGNED_URL_SECONDS, asset_id=asset.id) if ready else {}
+    if signed is None:
+        signed = sign_paths(_paths(asset), SIGNED_URL_SECONDS, asset_id=asset.id)
     return MediaAssetOut(
         id=asset.id,
         kind=asset.kind,
@@ -29,6 +34,12 @@ def asset_out(db: Session, asset: MediaAsset) -> MediaAssetOut:
         text_chars=meta.get("text_chars"),
         created_at=asset.created_at,
     )
+
+
+def assets_out(db: Session, assets: list[MediaAsset]) -> list[MediaAssetOut]:
+    """Many assets with their links signed in one storage call."""
+    signed = sign_paths([path for asset in assets for path in _paths(asset)], SIGNED_URL_SECONDS, assets=len(assets))
+    return [asset_out(db, asset, signed) for asset in assets]
 
 
 def job_out(job: Job) -> JobOut:

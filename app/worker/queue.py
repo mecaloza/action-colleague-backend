@@ -78,11 +78,15 @@ def _active_with_key(db: Session, dedupe_key: str) -> Job | None:
     return db.query(Job).filter(Job.dedupe_key == dedupe_key, Job.status.in_(ACTIVE)).first()
 
 
-def claim(db: Session, worker_id: str, lease_seconds: int) -> Job | None:
+def claim(db: Session, worker_id: str, lease_seconds: int, job_types: tuple[str, ...] | None = None) -> Job | None:
+    """Take the next due job; with `job_types`, only those this process can run (overlapping deploys)."""
     now = utcnow()
+    conditions = [Job.status == "queued", Job.run_after <= now]
+    if job_types is not None:
+        conditions.append(Job.type.in_(job_types))
     candidate = (
         select(Job.id)
-        .where(Job.status == "queued", Job.run_after <= now)
+        .where(*conditions)
         .order_by(Job.run_after, Job.created_at)
         .limit(1)
         .with_for_update(skip_locked=True)
@@ -130,10 +134,10 @@ def extend_lease(db: Session, job_id: str, worker_id: str, lease_seconds: int, *
     )
 
 
-def _release(db: Session, job_id: str, worker_id: str | None, **fields) -> bool:
+def _release(db: Session, job_id: str, worker_id: str | None, *conditions, **fields) -> bool:
     """Give up the lease and store the job's new `fields`. False if `worker_id` no longer holds the job."""
     return _update_job(
-        db, Job.id == job_id, Job.locked_by == worker_id, locked_by=None, locked_until=None, **fields
+        db, Job.id == job_id, Job.locked_by == worker_id, *conditions, locked_by=None, locked_until=None, **fields
     )
 
 
@@ -148,23 +152,33 @@ def reschedule(db: Session, job_id: str, worker_id: str, delay_seconds: float, s
     return _release(db, job_id, worker_id, status="queued", state=state, run_after=_from_now(delay_seconds))
 
 
+def requeue(db: Session, job_id: str, worker_id: str) -> bool:
+    """Hand a running job back at once without counting an attempt (the process is shutting down)."""
+    return _release(db, job_id, worker_id, status="queued", run_after=utcnow())
+
+
 def _backoff_seconds(attempts: int) -> int:
     """Wait before retrying after `attempts` failures: 30 s, 60 s, 120 s... up to 10 minutes."""
     return min(BACKOFF_BASE_SECONDS * 2 ** (attempts - 1), BACKOFF_MAX_SECONDS)
 
 
-def fail(db: Session, job: Job, worker_id: str | None, error: str, state: dict | None, permanent: bool = False) -> bool:
+def fail(
+    db: Session, job: Job, worker_id: str | None, error: str, state: dict | None,
+    permanent: bool = False, lease_expired: bool = False,
+) -> bool:
     """Count a failed attempt: retry with exponential backoff until `max_attempts`, then fail.
 
     `permanent` failures skip the remaining attempts.
     """
     attempts = max(job.max_attempts or 1, (job.attempts or 0) + 1) if permanent else (job.attempts or 0) + 1
     outcome = {"attempts": attempts, "error": error, "state": state or {}}
+    # The reaper only takes jobs whose lease is still expired: a late heartbeat wins over it.
+    guard = (Job.status == "running", Job.locked_until < utcnow()) if lease_expired else ()
     if attempts < (job.max_attempts or 1):
         return _release(
-            db, job.id, worker_id, status="queued", run_after=_from_now(_backoff_seconds(attempts)), **outcome
+            db, job.id, worker_id, *guard, status="queued", run_after=_from_now(_backoff_seconds(attempts)), **outcome
         )
-    return _release(db, job.id, worker_id, status="failed", finished_at=utcnow(), **outcome)
+    return _release(db, job.id, worker_id, *guard, status="failed", finished_at=utcnow(), **outcome)
 
 
 def expired_jobs(db: Session) -> list[Job]:

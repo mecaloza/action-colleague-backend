@@ -193,11 +193,11 @@ def _extract_text_from_pdf(file_path: str) -> str:
     """Extract text from PDF (same extractor as uploaded course materials). Falls back to empty string."""
     from pathlib import Path
 
-    from app.services.media_processing import MediaError, extract_text
+    from app.services.media_processing import MediaError, extract_text_safely
 
     try:
-        return extract_text(Path(file_path), "application/pdf", file_path)[:15000]
-    except (MediaError, OSError, ValueError) as exc:
+        return extract_text_safely(Path(file_path), "application/pdf", file_path)[:15000]
+    except (MediaError, OSError) as exc:
         logger.warning("pdf_text_extraction_failed", extra={"error": str(exc)[:300]})
         return ""
 

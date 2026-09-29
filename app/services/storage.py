@@ -23,7 +23,7 @@ from app.core.security import ALGORITHM
 
 SMALL_UPLOAD_MAX_BYTES = 6 * 1024 * 1024  # Supabase recommends resumable uploads above 6 MB
 TUS_CHUNK_BYTES = 6 * 1024 * 1024  # and requires exactly 6 MB chunks for them
-REQUEST_TIMEOUT_SECONDS = 60
+REQUEST_TIMEOUT_SECONDS = 15  # API calls made while a request waits (transfers have their own)
 TRANSFER_TIMEOUT_SECONDS = 900  # the worker moving a whole file (a video can be gigabytes)
 DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 LOCAL_UPLOAD_LINK_SECONDS = 2 * 3600
@@ -79,6 +79,13 @@ class SupabaseStorage:
             raise StorageError(f"Storage no pudo {action} ({response.status_code})")
         return response
 
+    def _send(self, method: str, url: str, action: str, **kwargs) -> httpx.Response:
+        """One request whose network failures surface as StorageError, like its HTTP errors."""
+        try:
+            return self._check(self.client.request(method, url, **kwargs), action)
+        except httpx.HTTPError as exc:
+            raise StorageError(f"Storage no pudo {action} (sin conexión)") from exc
+
     def ensure_bucket(self) -> None:
         """Create the private bucket on first use (an existing bucket is left as it is)."""
         if self._bucket_ready:
@@ -92,29 +99,34 @@ class SupabaseStorage:
         self._bucket_ready = True
 
     def _sign_upload(self, path: str) -> tuple[str, str]:
-        """(relative upload URL, upload token) that let the browser write exactly this object."""
+        """(relative upload URL, upload token) that let the browser create exactly this object, once.
+
+        No upsert: once the object exists (and `complete` checked it) the token can't replace it.
+        """
         signed = self._check(
-            self.client.post(f"{self.base}/object/upload/sign/{self._object(path)}", headers={**self.headers, "x-upsert": "true"}),
+            self.client.post(f"{self.base}/object/upload/sign/{self._object(path)}", headers=self.headers),
             "firmar la subida",
         ).json()
         relative_url = signed["url"]  # "/object/upload/sign/{bucket}/{path}?token=..."
         token = signed.get("token") or parse_qs(urlparse(relative_url).query)["token"][0]
         return relative_url, token
 
+    def _tus_endpoint(self) -> str:
+        """Signed resumable uploads live under /upload/resumable/sign (plain /upload/resumable wants a user JWT)."""
+        host = urlparse(self.url).hostname or ""
+        if host.endswith(".supabase.co"):  # the direct storage hostname is faster for big files
+            return f"https://{host.split('.')[0]}.storage.supabase.co/storage/v1/upload/resumable/sign"
+        return f"{self.base}/upload/resumable/sign"  # local Supabase CLI, self-hosted or a custom domain
+
     def upload_target(self, path: str, content_type: str, size_bytes: int) -> UploadTarget:
         self.ensure_bucket()
         relative_url, token = self._sign_upload(path)
         if size_bytes <= SMALL_UPLOAD_MAX_BYTES:
-            return UploadTarget(
-                method="PUT",
-                url=f"{self.base}{relative_url}",
-                headers={"content-type": content_type, "x-upsert": "true"},
-            )
-        project_ref = (urlparse(self.url).hostname or "").split(".")[0]
+            return UploadTarget(method="PUT", url=f"{self.base}{relative_url}", headers={"content-type": content_type})
         return UploadTarget(
             method="TUS",
-            url=f"https://{project_ref}.storage.supabase.co/storage/v1/upload/resumable",
-            headers={"x-signature": token, "x-upsert": "true"},
+            url=self._tus_endpoint(),
+            headers={"x-signature": token},
             metadata={"bucketName": self.bucket, "objectName": path, "contentType": content_type, "cacheControl": "3600"},
             chunk_size=TUS_CHUNK_BYTES,
         )
@@ -148,11 +160,9 @@ class SupabaseStorage:
     def signed_urls(self, paths: list[str], expires_in: int) -> dict[str, str]:
         if not paths:
             return {}
-        response = self._check(
-            self.client.post(
-                f"{self.base}/object/sign/{self.bucket}", headers=self.headers, json={"expiresIn": expires_in, "paths": paths}
-            ),
-            "firmar los enlaces",
+        response = self._send(
+            "POST", f"{self.base}/object/sign/{self.bucket}", "firmar los enlaces",
+            headers=self.headers, json={"expiresIn": expires_in, "paths": paths},
         )
         return {
             item["path"]: f"{self.base}{item['signedURL']}"
@@ -161,10 +171,10 @@ class SupabaseStorage:
         }
 
     def delete(self, paths: list[str]) -> None:
-        if paths:
-            self._check(
-                self.client.request("DELETE", f"{self.base}/object/{self.bucket}", headers=self.headers, json={"prefixes": paths}),
-                "borrar archivos",
+        if paths:  # a timeout must reach callers as StorageError too: they log it after committing
+            self._send(
+                "DELETE", f"{self.base}/object/{self.bucket}", "borrar archivos",
+                headers=self.headers, json={"prefixes": paths},
             )
 
 

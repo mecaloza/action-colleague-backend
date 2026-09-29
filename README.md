@@ -51,9 +51,9 @@ Reglas clave:
 
 ## Medios y trabajos en segundo plano
 
-- **Subidas directas**: el navegador pide `POST /media/uploads` y sube el archivo directo a Storage (PUT firmado hasta 6 MB, TUS reanudable por encima), sin pasar por el API. Luego `POST /media/{id}/complete` lo manda a procesar.
-- **Procesamiento** (`media.process`): video a MP4 H.264/AAC de máximo 1080p, sin deformar (4:3 y vertical se mantienen) y con portada; texto de documentos (PDF, DOCX, PPTX, TXT); una imagen por página de presentaciones PDF; imágenes a JPEG.
-- **Cola** en Postgres (`jobs`) con *leases*: un trabajo solo se reintenta si su proceso dejó de renovarlo (deploys solapados seguros); los errores reintentan con espera creciente y un proceso caído cuenta como intento. Por defecto corre dentro del API; para separarlo: `WORKER_ENABLED=false` en el API y un servicio con `python -m app.worker`.
+- **Subidas directas**: el navegador pide `POST /media/uploads` y sube el archivo directo a Storage (PUT firmado hasta 6 MB, TUS reanudable por encima), sin pasar por el API. Luego `POST /media/{id}/complete` lo manda a procesar. La firma dura 2 h: una subida más larga pide otra con `POST /media/{id}/upload-target`. Un archivo ya recibido no se puede reemplazar con la misma firma.
+- **Procesamiento** (`media.process`): video a MP4 H.264/AAC 8 bits de máximo 1080p y 30 fps, sin deformar (4:3 y vertical se mantienen), HDR del celular convertido a SDR, y con portada; al reemplazar un video, documento o portada se borra el anterior; texto de documentos (PDF, DOCX, PPTX, TXT); una imagen por página de presentaciones PDF; imágenes a JPEG.
+- **Cola** en Postgres (`jobs`) con *leases*: un trabajo solo se reintenta si su proceso dejó de renovarlo (deploys solapados seguros); los errores reintentan con espera creciente y un proceso caído cuenta como intento. Por defecto corre dentro del API; para separarlo: `WORKER_ENABLED=false` en el API y un servicio con `python -m app.worker` (sin healthcheck HTTP). Al apagarse (deploy), el proceso devuelve sus trabajos en curso a la cola sin gastarles un intento, y cada versión solo toma los tipos de trabajo que conoce.
 - Los medios nuevos se sirven con **URLs firmadas** de corta duración (bucket privado). Supabase limita el tamaño por archivo: súbelo en *Storage → Settings* (p. ej. 2 GB) para videos largos.
 
 ## Migraciones

@@ -63,7 +63,7 @@ async def lifespan(app: FastAPI):
     worker = start_worker()
     yield
     if worker:
-        worker.stop()  # running jobs finish or their lease expires and another worker retries them
+        worker.stop()  # running jobs go back to the queue, without counting an attempt
 
 
 def create_app() -> FastAPI:

@@ -34,8 +34,8 @@ from app.schemas.media import (
     UploadCreated,
 )
 from app.services.course_views import course_detail, module_admin
-from app.services.media import MediaResolver
-from app.services.media_views import asset_out, job_out
+from app.services.media import MediaResolver, discard_assets
+from app.services.media_views import asset_out, assets_out, job_out
 from app.services.storage import LocalStorage, StorageError, get_storage, read_local_token
 from app.worker import queue
 
@@ -79,10 +79,18 @@ PURPOSE_KINDS = {
 }
 
 
+def _ascii_slug(text: str) -> str:
+    ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", ascii_text).strip("-")
+
+
 def _safe_filename(filename: str) -> str:
-    ascii_name = unicodedata.normalize("NFKD", filename).encode("ascii", "ignore").decode()
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", ascii_name).strip("-.")
-    return cleaned[-120:] or "archivo"
+    """ASCII storage name that keeps the extension ("图片.png" -> "archivo.png")."""
+    stem, dot, extension = filename.rpartition(".")
+    if not dot:
+        stem, extension = filename, ""
+    stem, extension = _ascii_slug(stem)[-100:] or "archivo", _ascii_slug(extension)[:10]
+    return f"{stem}.{extension}" if extension else stem
 
 
 def _asset_or_404(db: Session, asset_id: str) -> MediaAsset:
@@ -134,13 +142,28 @@ def create_upload(payload: UploadCreate, db: Session = Depends(get_db), admin: U
         owner_id=admin.id,
         course_id=payload.course_id,
     )
-    try:
-        target = storage.upload_target(asset.path, mime, payload.size_bytes)
-    except StorageError as exc:
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    target = _upload_target(storage, asset)
     db.add(asset)
     db.commit()
     return UploadCreated(asset=asset_out(db, asset), upload=asdict(target))
+
+
+def _upload_target(storage, asset: MediaAsset):
+    try:
+        return storage.upload_target(asset.path, asset.mime_type, asset.size_bytes or 0)
+    except StorageError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+
+
+@router.post("/media/{asset_id}/upload-target", response_model=UploadCreated)
+def renew_upload_target(asset_id: str, db: Session = Depends(get_db)):
+    """A fresh signature for an upload still in progress (Supabase's expire after 2 hours)."""
+    asset = _asset_or_404(db, asset_id)
+    storage = _storage()
+    # Arrived but not confirmed yet: a new signature can't replace it (no upsert); `complete` is what's missing.
+    if asset.status != "pending" or storage.size(asset.path):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Este archivo ya se recibió; confirma la subida")
+    return UploadCreated(asset=asset_out(db, asset), upload=asdict(_upload_target(storage, asset)))
 
 
 def _target_module(db: Session, asset: MediaAsset, payload: UploadComplete) -> Module | None:
@@ -198,27 +221,6 @@ def get_asset(asset_id: str, db: Session = Depends(get_db)):
     return asset_out(db, _asset_or_404(db, asset_id))
 
 
-def _existing_assets(db: Session, asset_ids: tuple[str | None, ...]) -> list[MediaAsset]:
-    assets = (db.get(MediaAsset, asset_id) for asset_id in asset_ids if asset_id)
-    return [asset for asset in assets if asset]
-
-
-def _delete_objects(assets: list[MediaAsset]) -> None:
-    paths = [path for asset in assets for path in (asset.path, *(asset.meta or {}).get("pages", []))]
-    try:
-        get_storage().delete(paths)
-    except StorageError:
-        pass  # orphaned files cost little; the module change must not fail because of storage
-
-
-def _drop_assets(db: Session, assets: list[MediaAsset]) -> None:
-    """Delete the rows (and commit whatever the caller changed), then their files."""
-    for asset in assets:
-        db.delete(asset)
-    db.commit()
-    _delete_objects(assets)
-
-
 def _module_out(db: Session, module: Module) -> ModuleAdmin:
     return module_admin(module, MediaResolver(db).prepare(modules=[module]), module.evaluation)
 
@@ -226,21 +228,23 @@ def _module_out(db: Session, module: Module) -> ModuleAdmin:
 @router.delete("/modules/{module_id}/video", response_model=ModuleAdmin)
 def remove_module_video(module_id: int, db: Session = Depends(get_db)):
     module = module_or_404(db, module_id)
-    assets = _existing_assets(db, (module.video_asset_id, module.poster_asset_id, module.captions_asset_id))
+    removed = [module.video_asset_id, module.poster_asset_id, module.captions_asset_id]
     module.video_asset_id = module.poster_asset_id = module.captions_asset_id = None
     module.video_url, module.duration_seconds = "", None
     if module.generation_status in ("completed", "failed"):
         module.generation_status, module.generation_error = "pending", None
-    _drop_assets(db, assets)
+    db.flush()
+    discard_assets(db, removed)
     return _module_out(db, module)
 
 
 @router.delete("/modules/{module_id}/document", response_model=ModuleAdmin)
 def remove_module_document(module_id: int, db: Session = Depends(get_db)):
     module = module_or_404(db, module_id)
-    assets = _existing_assets(db, (module.document_asset_id,))
+    removed = [module.document_asset_id]
     module.document_asset_id = None
-    _drop_assets(db, assets)
+    db.flush()
+    discard_assets(db, removed)
     return _module_out(db, module)
 
 
@@ -250,7 +254,13 @@ def set_cover(course_id: int, payload: CoverUpdate, db: Session = Depends(get_db
     asset = _asset_or_404(db, payload.asset_id)
     if asset.kind != "image" or asset.status != "ready":
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Elige una imagen ya procesada")
+    if asset.course_id not in (None, course.id):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "La imagen pertenece a otro curso")
+    replaced = course.cover_asset_id
     course.cover_asset_id = asset.id
+    db.flush()
+    if replaced != asset.id:
+        discard_assets(db, [replaced])
     db.commit()
     return course_detail(db, course)
 
@@ -265,7 +275,7 @@ def course_materials(course_id: int, db: Session = Depends(get_db)):
         .order_by(MediaAsset.created_at, MediaAsset.id)
         .all()
     )
-    return [asset_out(db, asset) for asset in assets]
+    return assets_out(db, assets)
 
 
 # ── Jobs ──────────────────────────────────────────────────────────────
@@ -321,17 +331,21 @@ def _local_path(token: str, purpose: str) -> Path:
 @local_router.put("/upload/{token}", status_code=status.HTTP_200_OK)
 async def local_upload(token: str, request: Request):
     target = _local_path(token, "upload")
+    if target.exists():  # like Supabase without upsert: a checked upload can't be replaced
+        raise HTTPException(status.HTTP_409_CONFLICT, "El archivo ya se subió")
     target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_name(f"{target.name}.part")  # never expose half an upload to `complete`
     written = 0
-    with target.open("wb") as fh:
+    with partial.open("wb") as fh:
         async for chunk in request.stream():
             written += len(chunk)
             if written > MAX_UPLOAD_BYTES:
                 break
             fh.write(chunk)
     if written > MAX_UPLOAD_BYTES:
-        target.unlink(missing_ok=True)
+        partial.unlink(missing_ok=True)
         raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "Archivo demasiado grande")
+    partial.replace(target)
     return Response(status_code=status.HTTP_200_OK)
 
 

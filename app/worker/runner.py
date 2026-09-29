@@ -142,10 +142,12 @@ def _run_failure_hook(db: Session, job: Job, error: str, log_ctx: dict) -> None:
 
 
 def _fail_job(
-    db: Session, job: Job, worker_id: str | None, error: str, state: dict | None, log_ctx: dict, permanent: bool = False
+    db: Session, job: Job, worker_id: str | None, error: str, state: dict | None, log_ctx: dict,
+    permanent: bool = False, lease_expired: bool = False,
 ) -> None:
     """Count a failed attempt; when it was the last one, the job type's `on_failure` hook runs."""
-    queue.fail(db, job, worker_id, error, state, permanent=permanent)
+    if not queue.fail(db, job, worker_id, error, state, permanent=permanent, lease_expired=lease_expired):
+        return  # someone else owns (or already finished) the job: its hooks are not ours to run
     db.refresh(job)  # `fail` writes with plain SQL: reload to know whether the job failed for good
     _run_failure_hook(db, job, error, log_ctx)
 
@@ -179,11 +181,15 @@ def run_job(job: Job, worker_id: str) -> None:
         outcome = _call_handler(job, ctx)
         with open_session() as db:
             if isinstance(outcome, Reschedule):
-                queue.reschedule(db, job.id, worker_id, outcome.seconds, ctx.state)
-                logger.info("job_rescheduled", extra={**log_ctx, "delay_s": outcome.seconds})
+                saved = queue.reschedule(db, job.id, worker_id, outcome.seconds, ctx.state)
+                event, details = "job_rescheduled", {"delay_s": outcome.seconds}
             else:
-                queue.succeed(db, job.id, worker_id, outcome or {})
-                logger.info("job_succeeded", extra={**log_ctx, "duration_s": round(time.monotonic() - started, 1)})
+                saved = queue.succeed(db, job.id, worker_id, outcome or {})
+                event, details = "job_succeeded", {"duration_s": round(time.monotonic() - started, 1)}
+            if saved:
+                logger.info(event, extra={**log_ctx, **details})
+            else:  # the lease was lost meanwhile (reaped, or handed back at shutdown)
+                logger.warning("job_outcome_discarded", extra=log_ctx)
     except JobCancelled:
         logger.warning("job_lease_lost", extra=log_ctx)
     except Exception as exc:
@@ -199,13 +205,14 @@ def reap_expired_jobs() -> int:
         for job in expired:
             log_ctx = _log_context(job)
             logger.warning("job_lease_expired", extra=log_ctx)
-            _fail_job(db, job, job.locked_by, queue.LOST_WORKER_ERROR, job.state, log_ctx)
+            _fail_job(db, job, job.locked_by, queue.LOST_WORKER_ERROR, job.state, log_ctx, lease_expired=True)
         return len(expired)
 
 
 def _claim_next(worker_id: str) -> Job | None:
     with open_session() as db:
-        return queue.claim(db, worker_id, LEASE_SECONDS)
+        # Only known types: during a deploy overlap the old release must not burn the new release's jobs.
+        return queue.claim(db, worker_id, LEASE_SECONDS, tuple(_handlers))
 
 
 def run_pending(max_jobs: int = 100, worker_id: str = "inline") -> int:
@@ -226,6 +233,8 @@ class WorkerPool:
         self.stop_event = threading.Event()
         self.threads: list[threading.Thread] = []
         self.worker_prefix = f"{socket.gethostname()}:{os.getpid()}"
+        self._running: dict[str, str] = {}  # job id -> worker id, for the shutdown hand-back
+        self._running_lock = threading.Lock()
 
     def _loop(self, index: int) -> None:
         worker_id = f"{self.worker_prefix}:{index}"
@@ -240,7 +249,17 @@ class WorkerPool:
                 if job is None:
                     self.stop_event.wait(POLL_SECONDS)
                     continue
-                run_job(job, worker_id)
+                with self._running_lock:
+                    self._running[job.id] = worker_id
+                try:
+                    if self.stop_event.is_set():  # claimed while stopping, maybe after stop() looked
+                        with open_session() as db:
+                            queue.requeue(db, job.id, worker_id)
+                        break
+                    run_job(job, worker_id)
+                finally:
+                    with self._running_lock:
+                        self._running.pop(job.id, None)
             except Exception as exc:
                 logger.error(
                     "worker_loop_error", extra={"worker_id": worker_id, "error": str(exc)[:MAX_LOG_ERROR_CHARS]}
@@ -258,4 +277,20 @@ class WorkerPool:
         logger.info("worker_started", extra={"concurrency": self.concurrency, "worker": self.worker_prefix})
 
     def stop(self) -> None:
+        """
+        Stop claiming, and hand the jobs still running back to the queue without counting an attempt:
+        a deploy is not their fault. Their threads die with the process; until then a handler must not
+        save a result it no longer holds (`media.process` checks the lease in the same transaction).
+        """
         self.stop_event.set()
+        with self._running_lock:
+            running = dict(self._running)
+        if not running:
+            return
+        try:
+            with open_session() as db:
+                for job_id, worker_id in running.items():
+                    if queue.requeue(db, job_id, worker_id):
+                        logger.info("job_handed_back", extra={"job_id": job_id, "worker_id": worker_id})
+        except Exception:  # database unreachable while shutting down: their leases expire and the reaper retries
+            logger.exception("job_hand_back_failed", extra={"jobs": len(running)})

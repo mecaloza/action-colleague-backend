@@ -13,9 +13,10 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from app.db.models import MediaAsset, Module
+from app.db.models import Course, MediaAsset, Module
 from app.schemas.courses import MediaRef
 from app.services import legacy_heygen
 from app.services.storage import StorageError, get_storage
@@ -82,6 +83,43 @@ def sign_assets(assets: list[MediaAsset], expires_in: int) -> dict[str, str]:
     """Signed download URLs by asset id."""
     by_path = sign_paths([asset.path for asset in assets], expires_in, assets=len(assets))
     return {asset.id: by_path[asset.path] for asset in assets if asset.path in by_path}
+
+
+def _referenced(db: Session, asset_ids: set[str]) -> set[str]:
+    """Which of these assets a module or a course still points at."""
+    columns = (Module.video_asset_id, Module.poster_asset_id, Module.captions_asset_id, Module.document_asset_id)
+    rows = db.query(*columns).filter(or_(*(column.in_(asset_ids) for column in columns))).all()
+    used = {value for row in rows for value in row if value in asset_ids}
+    used.update(cover for (cover,) in db.query(Course.cover_asset_id).filter(Course.cover_asset_id.in_(asset_ids)))
+    return used
+
+
+def discard_assets(db: Session, asset_ids: Iterable[str | None]) -> None:
+    """
+    Delete assets nothing points at any more: rows now (committing the caller's changes too), files
+    after. Storage failures are logged, not raised: an orphaned file costs little, a failed edit more.
+    """
+    wanted = {asset_id for asset_id in asset_ids if asset_id}
+    # Rows locked before the check (in id order: two cleanups can't deadlock), so nothing can start
+    # pointing at them in between; ON DELETE SET NULL would silently undo that new link.
+    assets = (
+        db.query(MediaAsset).filter(MediaAsset.id.in_(wanted)).order_by(MediaAsset.id).with_for_update().all()
+        if wanted else []
+    )
+    used = _referenced(db, {asset.id for asset in assets}) if assets else set()
+    assets = [asset for asset in assets if asset.id not in used]
+    for asset in assets:
+        db.delete(asset)
+    db.flush()
+    paths = {path for asset in assets for path in (asset.path, *(asset.meta or {}).get("pages", []))}
+    if paths:  # two rows can share a file (a retried or handed-back job): it goes with the last one
+        paths -= {path for (path,) in db.query(MediaAsset.path).filter(MediaAsset.path.in_(paths))}
+    db.commit()
+    if paths:
+        try:
+            get_storage().delete(sorted(paths))
+        except StorageError as exc:
+            logger.warning("media_files_left_behind", extra={"files": len(paths), "error": str(exc)[:300]})
 
 
 def _asset_ids(module: Module) -> tuple[str | None, ...]:
