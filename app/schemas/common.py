@@ -11,3 +11,10 @@ def _as_utc_iso(value: datetime) -> str:
 
 
 UtcDatetime = Annotated[datetime, PlainSerializer(_as_utc_iso, return_type=str)]
+
+
+def required_text(value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise ValueError("No puede quedar vacío")
+    return value

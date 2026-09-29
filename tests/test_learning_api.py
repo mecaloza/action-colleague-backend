@@ -124,7 +124,7 @@ def test_quiz_never_exposes_answer_keys(client, enrolled, course, collaborator):
     for key in ("correct_index", "\"correct\"", "answers", "pairs", "explanation"):
         assert key not in text
     ordering = next(q for q in body["questions"] if q["type"] == "ordering")
-    assert [item["text"] for item in ordering["items"]] != ["Revisar", "Ajustar", "Trabajar"]
+    assert sorted(item["text"] for item in ordering["items"]) == ["Ajustar", "Revisar", "Trabajar"]
 
 
 def test_passing_the_quiz_completes_the_module_and_unlocks_next(client, db, enrolled, course, collaborator):
@@ -144,7 +144,9 @@ def test_passing_the_quiz_completes_the_module_and_unlocks_next(client, db, enro
     assert again.status_code == 409
 
 
-def test_failed_attempts_are_limited_and_answers_revealed_only_at_the_end(client, db, enrolled, course, collaborator):
+def test_failed_attempts_are_limited_and_solutions_never_revealed_without_passing(
+    client, db, enrolled, course, collaborator
+):
     headers = auth_headers(client, collaborator.email)
     intro, epp, _ = _modules(course)
     client.post(f"/api/v1/learn/modules/{intro.id}/complete", headers=headers)
@@ -153,9 +155,10 @@ def test_failed_attempts_are_limited_and_answers_revealed_only_at_the_end(client
     assert first["passed"] is False and first["attempts_remaining"] == 1
     assert all(r["expected"] is None for r in first["results"])
 
+    # Out of attempts: still no solution (more attempts later would make it a free pass).
     second = client.post(f"/api/v1/learn/modules/{epp.id}/quiz/attempts", headers=headers, json={"answers": []}).json()
     assert second["attempts_remaining"] == 0
-    assert any(r["expected"] is not None for r in second["results"])
+    assert all(r["expected"] is None for r in second["results"])
 
     third = client.post(f"/api/v1/learn/modules/{epp.id}/quiz/attempts", headers=headers, json={"answers": []})
     assert third.status_code == 403
@@ -220,3 +223,86 @@ def test_locked_progress_row_is_reread_not_taken_from_the_session(db, session_fa
     locked = progress.get_or_create_progress(db, enrolled, epp, lock=True)
 
     assert locked.attempts == 1
+
+
+def test_a_quiz_edited_while_answering_is_not_graded(client, enrolled, course, collaborator, admin):
+    headers = auth_headers(client, collaborator.email)
+    intro, epp, _ = _modules(course)
+    client.post(f"/api/v1/learn/modules/{intro.id}/complete", headers=headers)
+    version = client.get(f"/api/v1/learn/modules/{epp.id}/quiz", headers=headers).json()["version"]
+    edited = [*QUESTIONS[:4], {**QUESTIONS[4], "answers": ["precaución"]}]
+    saved = client.put(
+        f"/api/v1/modules/{epp.id}/evaluation", headers=auth_headers(client, admin.email),
+        json={"questions": edited, "max_attempts": 2, "passing_score": 80},
+    )
+    assert saved.status_code == 200
+
+    stale = client.post(f"/api/v1/learn/modules/{epp.id}/quiz/attempts", headers=headers, json={"answers": [], "version": version})
+
+    assert stale.status_code == 409
+    fresh = client.get(f"/api/v1/learn/modules/{epp.id}/quiz", headers=headers).json()
+    assert fresh["attempts_used"] == 0 and fresh["version"] != version
+
+
+def test_completed_modules_stay_open_after_a_reorder(client, enrolled, course, collaborator, admin):
+    headers = auth_headers(client, collaborator.email)
+    intro, epp, closing = _modules(course)
+    client.post(f"/api/v1/learn/modules/{intro.id}/complete", headers=headers)
+    client.put(
+        f"/api/v1/courses/{course.id}/modules/order", headers=auth_headers(client, admin.email),
+        json={"module_ids": [epp.id, closing.id, intro.id]},
+    )
+
+    modules = {m["id"]: m for m in client.get(f"/api/v1/learn/courses/{course.id}", headers=headers).json()["modules"]}
+
+    assert modules[intro.id]["unlocked"] and modules[intro.id]["content_text"] == "Bienvenida"
+    assert modules[epp.id]["unlocked"] and not modules[closing.id]["unlocked"]
+
+
+def test_answers_have_a_bounded_shape(client, enrolled, course, collaborator):
+    headers = auth_headers(client, collaborator.email)
+    intro, epp, _ = _modules(course)
+    client.post(f"/api/v1/learn/modules/{intro.id}/complete", headers=headers)
+    url = f"/api/v1/learn/modules/{epp.id}/quiz/attempts"
+
+    assert client.post(url, headers=headers, json={"answers": [{"question_id": "q5", "response": {"text": "x" * 301}}]}).status_code == 422
+    assert client.post(url, headers=headers, json={"answers": [{"question_id": "q1", "response": {"essay": "x"}}]}).status_code == 422
+    assert client.get(f"/api/v1/learn/modules/{epp.id}/quiz", headers=headers).json()["attempts_used"] == 0
+
+
+def test_missing_and_foreign_modules_look_the_same(client, course, collaborator):
+    headers = auth_headers(client, collaborator.email)
+
+    missing = client.get("/api/v1/learn/modules/999999/quiz", headers=headers)
+    foreign = client.get(f"/api/v1/learn/modules/{_modules(course)[1].id}/quiz", headers=headers)  # not enrolled
+
+    assert missing.status_code == foreign.status_code == 404
+    assert missing.json()["detail"] == foreign.json()["detail"]
+
+
+def test_legacy_questions_without_a_known_answer_are_dropped():
+    questions = quiz.normalize_legacy_questions([
+        {"question": "Sin clave", "options": ["A", "B"]},
+        {"question": "Repetidas", "options": ["Sí", "No", "sí"], "correct": 2},
+        {"question": "Rara", "options": ["A", "B"], "correct": [1, "0"]},
+        {"type": "ordering", "items": ["a", "b"], "correct_order": [1, "0"]},
+    ])
+
+    assert [q.prompt for q in questions] == ["Repetidas"]
+    assert questions[0].options == ["Sí", "No"] and questions[0].correct_index == 0
+
+
+def test_fixing_an_explanation_does_not_invalidate_a_quiz_in_progress(client, enrolled, course, collaborator, admin):
+    headers = auth_headers(client, collaborator.email)
+    intro, epp, _ = _modules(course)
+    client.post(f"/api/v1/learn/modules/{intro.id}/complete", headers=headers)
+    version = client.get(f"/api/v1/learn/modules/{epp.id}/quiz", headers=headers).json()["version"]
+    fixed = [{**QUESTIONS[0], "explanation": "El casco protege la cabeza."}, *QUESTIONS[1:]]
+    client.put(
+        f"/api/v1/modules/{epp.id}/evaluation", headers=auth_headers(client, admin.email),
+        json={"questions": fixed, "max_attempts": 2, "passing_score": 80},
+    )
+
+    attempt = client.post(f"/api/v1/learn/modules/{epp.id}/quiz/attempts", headers=headers, json={"answers": [], "version": version})
+
+    assert attempt.status_code == 200

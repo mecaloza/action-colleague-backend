@@ -3,12 +3,12 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import or_
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_admin
 from app.api.lookups import course_or_404, module_or_404
-from app.db.models import Course, Evaluation, Module, User, UserVideo
+from app.db.models import Course, Enrollment, Evaluation, EvaluationAttempt, Module, ModuleProgress, User, UserVideo
 from app.schemas.courses import (
     CourseCreate,
     CourseDetail,
@@ -37,12 +37,23 @@ def _renumber(course: Course) -> None:
         module.order = index
 
 
-def _detach_legacy_videos(db: Session, module_ids: list[int]) -> None:
+def _detach_legacy_videos(db: Session, module_ids) -> None:
     # Recordings from the previous app may point at the modules; keep the recordings.
-    if module_ids:
-        db.query(UserVideo).filter(UserVideo.module_id.in_(module_ids)).update(
-            {UserVideo.module_id: None}, synchronize_session=False
-        )
+    db.execute(
+        update(UserVideo).where(UserVideo.module_id.in_(module_ids)).values(module_id=None),
+        execution_options={"synchronize_session": False},
+    )
+
+
+def _purge_modules(db: Session, module_ids) -> None:
+    """Attempts, progress and evaluations of these modules: one statement per table, whatever the audience."""
+    no_sync = {"synchronize_session": False}
+    _detach_legacy_videos(db, module_ids)
+    # Progress first: it waits for quiz submissions in flight (they lock their progress row), whose
+    # attempts are then deleted too instead of breaking the evaluations' foreign key.
+    db.execute(delete(ModuleProgress).where(ModuleProgress.module_id.in_(module_ids)), execution_options=no_sync)
+    db.execute(delete(EvaluationAttempt).where(EvaluationAttempt.module_id.in_(module_ids)), execution_options=no_sync)
+    db.execute(delete(Evaluation).where(Evaluation.module_id.in_(module_ids)), execution_options=no_sync)
 
 
 # ── Courses ───────────────────────────────────────────────────────────
@@ -55,8 +66,8 @@ def list_courses(
     db: Session = Depends(get_db),
 ):
     query = db.query(Course)
-    if status_filter:
-        query = query.filter(Course.status == status_filter)
+    # Archived courses only show up when asked for.
+    query = query.filter(Course.status == status_filter) if status_filter else query.filter(Course.status != "archived")
     if q and q.strip():
         pattern = f"%{q.strip()}%"
         query = query.filter(or_(Course.title.ilike(pattern), Course.description.ilike(pattern)))
@@ -94,7 +105,7 @@ def update_course(course_id: int, payload: CourseUpdate, db: Session = Depends(g
     for field, value in data.items():
         setattr(course, field, value)
     if payload.settings is not None:
-        course.settings = {**(course.settings or {}), **payload.settings.model_dump()}
+        course.settings = {**(course.settings or {}), **payload.settings.model_dump(exclude_unset=True)}
     db.commit()
     return course_detail(db, course)
 
@@ -102,10 +113,16 @@ def update_course(course_id: int, payload: CourseUpdate, db: Session = Depends(g
 @router.delete("/courses/{course_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_course(course_id: int, db: Session = Depends(get_db)):
     """Deletes the course with its modules, evaluations and participants' results."""
-    course = course_or_404(db, course_id)
-    _detach_legacy_videos(db, [module.id for module in course.modules])
-    legacy_data.delete_certificates(db, [enrollment.id for enrollment in course.enrollments])
-    db.delete(course)
+    course_or_404(db, course_id)
+    no_sync = {"synchronize_session": False}
+    enrollment_ids = [row[0] for row in db.execute(select(Enrollment.id).where(Enrollment.course_id == course_id))]
+    legacy_data.delete_certificates(db, enrollment_ids)
+    _purge_modules(db, select(Module.id).where(Module.course_id == course_id))
+    db.execute(delete(EvaluationAttempt).where(EvaluationAttempt.enrollment_id.in_(enrollment_ids)), execution_options=no_sync)
+    db.execute(delete(ModuleProgress).where(ModuleProgress.enrollment_id.in_(enrollment_ids)), execution_options=no_sync)
+    db.execute(delete(Enrollment).where(Enrollment.course_id == course_id), execution_options=no_sync)
+    db.execute(delete(Module).where(Module.course_id == course_id), execution_options=no_sync)
+    db.execute(delete(Course).where(Course.id == course_id), execution_options=no_sync)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -200,7 +217,14 @@ def update_module(module_id: int, payload: ModuleUpdate, db: Session = Depends(g
 def delete_module(module_id: int, db: Session = Depends(get_db)):
     module = module_or_404(db, module_id)
     course = module.course
-    _detach_legacy_videos(db, [module.id])
+    if course.status in ("published", "archived") and len(course.modules) == 1:
+        # Learners would be left with an empty course (and their completions undone).
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Un curso publicado o archivado necesita al menos un módulo. Pásalo a borrador para quitar el último.",
+        )
+    _purge_modules(db, [module.id])
+    db.expire(module)  # its evaluation and progress were deleted in bulk
     db.delete(module)
     db.flush()
     db.refresh(course)
@@ -220,9 +244,7 @@ def reorder_modules(course_id: int, payload: ModuleOrder, db: Session = Depends(
         )
     for index, module_id in enumerate(payload.module_ids, start=1):
         by_id[module_id].order = index
-    db.flush()
-    progress.refresh_course_enrollments(db, course)
-    db.commit()
+    db.commit()  # same modules: percentages and statuses don't change
     return course_detail(db, course).modules
 
 
@@ -252,8 +274,8 @@ def put_evaluation(module_id: int, payload: EvaluationPut, db: Session = Depends
     module = module_or_404(db, module_id)
     try:
         questions = quiz.validate_questions(payload.questions)
-    except ValueError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"Hay una pregunta inválida: {exc}") from exc
+    except quiz.InvalidQuestions as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
     evaluation = module.evaluation or Evaluation(module_id=module.id)
     evaluation.spec = quiz.dump_questions(questions)
     evaluation.questions_json = "[]"  # the previous format is superseded by the spec
@@ -270,5 +292,10 @@ def delete_evaluation(module_id: int, db: Session = Depends(get_db)):
     module = module_or_404(db, module_id)
     if module.evaluation:
         db.delete(module.evaluation)
+        # Its attempts are gone: a future quiz must not start "exhausted" or "already passed".
+        db.execute(
+            update(ModuleProgress).where(ModuleProgress.module_id == module.id).values(attempts=0, passed=False, score=None),
+            execution_options={"synchronize_session": False},
+        )
         db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

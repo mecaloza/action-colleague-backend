@@ -1,6 +1,6 @@
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.schemas.common import UtcDatetime
+from app.schemas.common import UtcDatetime, required_text
 
 
 class LoginRequest(BaseModel):
@@ -35,6 +35,8 @@ class MeUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     current_password: str | None = Field(default=None, max_length=200)
     new_password: str | None = Field(default=None, min_length=8, max_length=128)
+
+    _name = field_validator("name")(classmethod(lambda cls, v: required_text(v) if v is not None else v))
 
     @model_validator(mode="after")
     def _password_change_needs_current(self) -> "MeUpdate":

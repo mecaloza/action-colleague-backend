@@ -3,7 +3,7 @@
 import pytest
 
 from app.db.models import Enrollment, Evaluation, Module
-from tests.conftest import auth_headers
+from tests.conftest import TEST_PASSWORD, auth_headers, login
 
 QUESTION = {"id": "q1", "type": "true_false", "prompt": "El casco es obligatorio", "correct": True, "explanation": ""}
 
@@ -269,3 +269,79 @@ def test_explicit_nulls_do_not_break_or_lock_out_users(client, admin, admin_head
         response = client.patch(f"/api/v1/users/{collaborator.id}", headers=admin_headers, json=body)
         assert response.status_code == 200, body
     assert client.patch(f"/api/v1/users/{admin.id}", headers=admin_headers, json={"is_active": None}).json()["is_active"] is True
+
+
+def test_partial_settings_keep_the_rest(client, admin_headers):
+    course = _create_course(client, admin_headers)
+    url = f"/api/v1/courses/{course['id']}"
+    client.patch(url, headers=admin_headers, json={"settings": {"tone": "cercano", "voice_id": "v1", "presenter": False}})
+
+    settings = client.patch(url, headers=admin_headers, json={"settings": {"audience": "Operarios"}}).json()["settings"]
+
+    assert settings["audience"] == "Operarios"
+    assert settings["tone"] == "cercano" and settings["voice_id"] == "v1" and settings["presenter"] is False
+
+
+def test_invalid_questions_get_a_readable_reason(client, admin_headers):
+    course = _create_course(client, admin_headers)
+    module = client.post(f"/api/v1/courses/{course['id']}/modules", headers=admin_headers, json={"title": "M"}).json()
+    questions = [QUESTION, {"type": "single_choice", "prompt": "¿Color?", "options": ["Sí", " sí "], "correct_index": 0}]
+
+    response = client.put(f"/api/v1/modules/{module['id']}/evaluation", headers=admin_headers, json={"questions": questions})
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Pregunta 2: hay opciones repetidas"
+
+
+def test_a_published_course_keeps_at_least_one_module(client, admin_headers):
+    course = _create_course(client, admin_headers)
+    module = client.post(
+        f"/api/v1/courses/{course['id']}/modules", headers=admin_headers, json={"title": "Único", "content_text": "x"}
+    ).json()
+    assert client.post(f"/api/v1/courses/{course['id']}/publish", headers=admin_headers).status_code == 200
+
+    assert client.delete(f"/api/v1/modules/{module['id']}", headers=admin_headers).status_code == 409
+    client.post(f"/api/v1/courses/{course['id']}/unpublish", headers=admin_headers)
+    assert client.delete(f"/api/v1/modules/{module['id']}", headers=admin_headers).status_code == 204
+
+
+def test_archived_courses_only_show_when_asked_for(client, admin_headers):
+    _create_course(client, admin_headers, "Activo")
+    old = _create_course(client, admin_headers, "Viejo")
+    client.post(f"/api/v1/courses/{old['id']}/archive", headers=admin_headers)
+
+    assert [c["title"] for c in client.get("/api/v1/courses", headers=admin_headers).json()] == ["Activo"]
+    archived = client.get("/api/v1/courses", headers=admin_headers, params={"status": "archived"}).json()
+    assert [c["title"] for c in archived] == ["Viejo"]
+
+
+def test_changing_my_password_ends_every_session(client, collaborator):
+    tokens = login(client, collaborator.email)
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+
+    changed = client.patch(
+        "/api/v1/auth/me", headers=headers, json={"current_password": TEST_PASSWORD, "new_password": "Otra-clave-9"}
+    )
+
+    assert changed.status_code == 200
+    assert client.post("/api/v1/auth/refresh", json={"refresh_token": tokens["refresh_token"]}).status_code == 401
+    login(client, collaborator.email, "Otra-clave-9")
+
+
+def test_validation_errors_never_echo_what_was_sent(client, collaborator):
+    headers = auth_headers(client, collaborator.email)
+
+    response = client.patch("/api/v1/auth/me", headers=headers, json={"current_password": TEST_PASSWORD, "new_password": "Corta7!"})
+
+    assert response.status_code == 422
+    assert "Corta7!" not in response.text and TEST_PASSWORD not in response.text
+
+
+def test_names_cannot_be_blank(client, admin_headers, collaborator):
+    created = client.post(
+        "/api/v1/users", headers=admin_headers, json={"name": "   ", "email": "nuevo@test.dev", "password": "Passw0rd!x"}
+    )
+    assert created.status_code == 422
+    assert client.patch(f"/api/v1/users/{collaborator.id}", headers=admin_headers, json={"name": "  "}).status_code == 422
+    me = auth_headers(client, collaborator.email)
+    assert client.patch("/api/v1/auth/me", headers=me, json={"name": " "}).status_code == 422

@@ -4,6 +4,7 @@ from collections import Counter, defaultdict
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import func
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_db, require_admin
@@ -105,13 +106,15 @@ def add_participants(
             Enrollment.course_id == course.id, Enrollment.user_id.in_(payload.user_ids)
         )
     }
-    for user in users:
-        if user.id not in existing:
-            db.add(
-                Enrollment(
-                    user_id=user.id, course_id=course.id, status="assigned", progress_pct=0.0, assigned_by=admin.id
-                )
-            )
+    rows = [
+        {"user_id": user.id, "course_id": course.id, "status": "assigned", "progress_pct": 0.0, "assigned_by": admin.id}
+        for user in users
+        if user.id not in existing
+    ]
+    if rows:
+        insert = postgresql.insert if db.get_bind().dialect.name == "postgresql" else sqlite.insert
+        # One statement; someone assigned at the same moment by another request is simply skipped.
+        db.execute(insert(Enrollment).values(rows).on_conflict_do_nothing(index_elements=["user_id", "course_id"]))
     db.commit()
     db.refresh(course)
     return _participants(db, course)

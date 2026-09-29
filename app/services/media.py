@@ -9,6 +9,8 @@ through a read-only fallback until the legacy media migration moves them to stor
 
 import time
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
@@ -21,20 +23,44 @@ _LEGACY_CACHE_SECONDS = 20 * 60
 _legacy_cache: dict[str, tuple[float, str | None]] = {}
 
 
+def _heygen_reference(value: str | None) -> str | None:
+    if not value or value.startswith(legacy_heygen.PENDING_PREFIX):
+        return None
+    return legacy_heygen.video_id(value)
+
+
+def _cached(video_id: str) -> tuple[float, str | None] | None:
+    cached = _legacy_cache.get(video_id)
+    return cached if cached and cached[0] > time.monotonic() else None
+
+
+def _remember(video_id: str, url: str | None) -> str | None:
+    _legacy_cache[video_id] = (time.monotonic() + _LEGACY_CACHE_SECONDS, url)
+    return url
+
+
+def prefetch_legacy_urls(values: Iterable[str | None]) -> None:
+    """Ask HeyGen for every uncached reference of a response at once, instead of one after another."""
+    if datetime.now(UTC).date() > legacy_heygen.RETIRED_ON:
+        return  # its API is gone: those references resolve to nothing
+    ids = sorted({video_id for value in values if (video_id := _heygen_reference(value)) and not _cached(video_id)})
+    if not ids:
+        return
+    with ThreadPoolExecutor(max_workers=min(8, len(ids))) as pool:
+        for video_id, url in zip(ids, pool.map(legacy_heygen.fresh_url, ids)):
+            _remember(video_id, url)
+
+
 def legacy_video_url(value: str | None) -> str | None:
     if not value:
         return None
     if value.startswith(("http://", "https://")):
         return value
-    video_id = legacy_heygen.video_id(value)
-    if not video_id or value.startswith(legacy_heygen.PENDING_PREFIX):
+    video_id = _heygen_reference(value)
+    if not video_id:
         return None
-    cached = _legacy_cache.get(video_id)
-    if cached and cached[0] > time.monotonic():
-        return cached[1]
-    url = legacy_heygen.fresh_url(video_id)
-    _legacy_cache[video_id] = (time.monotonic() + _LEGACY_CACHE_SECONDS, url)
-    return url
+    cached = _cached(video_id)
+    return cached[1] if cached else _remember(video_id, legacy_heygen.fresh_url(video_id))
 
 
 def sign_assets(assets: list[MediaAsset], expires_in: int) -> dict[str, str]:
@@ -55,6 +81,8 @@ class MediaResolver:
         self._urls: dict[str, str] = {}
 
     def prepare(self, modules: Iterable[Module] = (), extra_asset_ids: Iterable[str | None] = ()) -> "MediaResolver":
+        modules = list(modules)
+        prefetch_legacy_urls(module.video_url for module in modules if not module.video_asset_id)
         ids = {asset_id for module in modules for asset_id in _asset_ids(module) if asset_id}
         ids.update(asset_id for asset_id in extra_asset_ids if asset_id)
         if ids:

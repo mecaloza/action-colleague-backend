@@ -2,19 +2,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.schemas.common import UtcDatetime
+from app.schemas.common import UtcDatetime, required_text
 
 Language = Literal["es", "en", "pt"]
 CourseStatus = Literal["draft", "published", "archived"]
 CourseSource = Literal["ai", "manual"]
 ModuleSource = Literal["ai", "upload", "recording", "text", "document"]
-
-
-def _required_text(value: str) -> str:
-    value = value.strip()
-    if not value:
-        raise ValueError("No puede quedar vacío")
-    return value
 
 
 class MediaRef(BaseModel):
@@ -44,7 +37,7 @@ class CourseCreate(BaseModel):
     language: Language = "es"
     source: CourseSource = "manual"
 
-    _title = field_validator("title")(classmethod(lambda cls, v: _required_text(v)))
+    _title = field_validator("title")(classmethod(lambda cls, v: required_text(v)))
 
 
 class CourseUpdate(BaseModel):
@@ -53,7 +46,7 @@ class CourseUpdate(BaseModel):
     language: Language | None = None
     settings: CourseSettings | None = None
 
-    _title = field_validator("title")(classmethod(lambda cls, v: _required_text(v) if v is not None else v))
+    _title = field_validator("title")(classmethod(lambda cls, v: required_text(v) if v is not None else v))
 
 
 class CourseSummary(BaseModel):
@@ -111,7 +104,7 @@ class ModuleCreate(BaseModel):
     content_text: str = Field(default="", max_length=100_000)
     source: ModuleSource = "text"
 
-    _title = field_validator("title")(classmethod(lambda cls, v: _required_text(v)))
+    _title = field_validator("title")(classmethod(lambda cls, v: required_text(v)))
 
 
 class ModuleUpdate(BaseModel):
@@ -119,7 +112,7 @@ class ModuleUpdate(BaseModel):
     description: str | None = Field(default=None, max_length=3000)
     content_text: str | None = Field(default=None, max_length=100_000)
 
-    _title = field_validator("title")(classmethod(lambda cls, v: _required_text(v) if v is not None else v))
+    _title = field_validator("title")(classmethod(lambda cls, v: required_text(v) if v is not None else v))
 
 
 class ModuleOrder(BaseModel):

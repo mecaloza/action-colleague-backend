@@ -3,12 +3,12 @@
 import json
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
-from app.api.lookups import module_or_404
 from app.core.config import get_settings
-from app.db.models import Course, Enrollment, EvaluationAttempt, User
+from app.db.models import Course, Enrollment, EvaluationAttempt, Module, User
 from app.schemas.learn import (
     AttemptCreate,
     AttemptResult,
@@ -25,6 +25,9 @@ from app.services.media import MediaResolver
 
 router = APIRouter(prefix="/learn", tags=["learn"])
 
+# Same answer for "doesn't exist" and "not yours": ids of other courses can't be probed.
+NO_ACCESS = "No tienes acceso a este contenido"
+
 
 def _token_secret() -> str:
     return quiz.token_secret(get_settings().jwt_secret)
@@ -38,7 +41,7 @@ def _enrollment_for_course(db: Session, user: User, course_id: int) -> Enrollmen
         .first()
     )
     if not enrollment:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "No tienes acceso a este curso")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, NO_ACCESS)
     return enrollment
 
 
@@ -46,7 +49,9 @@ def _unlocked_module(
     db: Session, user: User, module_id: int
 ) -> tuple[Enrollment, progress.ModuleState, list[progress.ModuleState]]:
     """The learner's enrollment, the module's state and all the course's states; 403 while it is locked."""
-    module = module_or_404(db, module_id)
+    module = db.get(Module, module_id)
+    if module is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, NO_ACCESS)
     enrollment = _enrollment_for_course(db, user, module.course_id)
     states = progress.module_states(db, enrollment)
     state = next(s for s in states if s.module.id == module_id)
@@ -89,8 +94,10 @@ def _learner_results(graded_results: list[dict], reveal: bool) -> list[QuestionR
 def my_courses(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     enrollments = progress.user_enrollments(db, user.id, published_only=True)
     media = MediaResolver(db).prepare(extra_asset_ids=[e.course.cover_asset_id for e in enrollments])
+    evaluations = progress.evaluations_by_module(db, [m for e in enrollments for m in e.course.modules])
     return [
-        learner_course(e, progress.module_states(db, e), media.url(e.course.cover_asset_id)) for e in enrollments
+        learner_course(e, progress.module_states(db, e, evaluations), media.url(e.course.cover_asset_id))
+        for e in enrollments
     ]
 
 
@@ -111,6 +118,7 @@ def get_quiz(module_id: int, db: Session = Depends(get_db), user: User = Depends
         attempts_used=state.attempts_used,
         passing_score=quiz.passing_score(state.evaluation),
         passed=state.passed,
+        version=quiz.questions_version(questions),
     )
 
 
@@ -124,6 +132,11 @@ def submit_quiz(
     enrollment, state, states = _unlocked_module(db, user, module_id)
     evaluation = state.evaluation
     questions = _quiz_questions(state)
+    if payload.version and payload.version != quiz.questions_version(questions):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "La evaluación cambió mientras la respondías. Vuelve a cargarla: este intento no cuenta.",
+        )
 
     # Locked row: two submissions at once can't both use the last attempt.
     record = progress.get_or_create_progress(db, enrollment, state.module, lock=True)
@@ -134,7 +147,7 @@ def submit_quiz(
     if used >= max_attempts:
         raise HTTPException(status.HTTP_403_FORBIDDEN, f"Agotaste los {max_attempts} intentos de esta evaluación")
 
-    answers = [answer.model_dump() for answer in payload.answers]
+    answers = [answer.model_dump(exclude_none=True) for answer in payload.answers]
     graded = quiz.grade(questions, answers, _token_secret(), quiz.quiz_scope(evaluation.id))
     passed = graded["score"] >= quiz.passing_score(evaluation)
     attempt_number = used + 1
@@ -159,8 +172,9 @@ def submit_quiz(
     progress.refresh_enrollment(db, enrollment)
     db.commit()
 
-    # Correct answers are revealed only once they can no longer help pass the quiz.
-    reveal = passed or attempt_number >= max_attempts
+    # Solutions only once passed: shown after the last attempt, they would pass the quiz as soon as the
+    # admin grants more attempts or reassigns the course.
+    reveal = passed
     return AttemptResult(
         score=graded["score"],
         passed=passed,
@@ -198,7 +212,13 @@ def save_position(
     enrollment, state, _ = _unlocked_module(db, user, module_id)
     record = progress.get_or_create_progress(db, enrollment, state.module)
     record.last_position_seconds = payload.seconds
-    if enrollment.status == "assigned":
-        enrollment.status = "in_progress"
+    db.flush()  # progress row first, enrollment second: the lock order of every learner path
+    # Conditional UPDATE: a stale read must never overwrite a status another request just set.
+    db.execute(
+        update(Enrollment)
+        .where(Enrollment.id == enrollment.id, Enrollment.status == "assigned")
+        .values(status="in_progress"),
+        execution_options={"synchronize_session": False},
+    )
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

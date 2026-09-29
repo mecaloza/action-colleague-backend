@@ -125,7 +125,6 @@ def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db)
 def user_courses(user_id: int, db: Session = Depends(get_db)):
     """A person's assigned courses and progress (drafts included, for the admin's view)."""
     user_or_404(db, user_id)
-    return [
-        learner_course(enrollment, progress.module_states(db, enrollment))
-        for enrollment in progress.user_enrollments(db, user_id)
-    ]
+    enrollments = progress.user_enrollments(db, user_id)
+    evaluations = progress.evaluations_by_module(db, [m for e in enrollments for m in e.course.modules])
+    return [learner_course(e, progress.module_states(db, e, evaluations)) for e in enrollments]

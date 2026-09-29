@@ -12,8 +12,16 @@ def build_engine(database_url: str) -> Engine:
     if database_url.startswith("sqlite"):
         return create_engine(database_url, connect_args={"check_same_thread": False}, hide_parameters=True)
     # Supabase's pooler closes idle connections; pre-ping and recycle avoid stale ones.
+    # values_plus_batch: executemany UPDATE/DELETE go in pages of 100 statements instead of one
+    # round trip per row (recomputing 1000 enrollments, cascades).
     return create_engine(
-        database_url, pool_pre_ping=True, pool_recycle=300, pool_size=5, max_overflow=5, hide_parameters=True
+        database_url,
+        pool_pre_ping=True,
+        pool_recycle=300,
+        pool_size=5,
+        max_overflow=5,
+        hide_parameters=True,
+        executemany_mode="values_plus_batch",
     )
 
 

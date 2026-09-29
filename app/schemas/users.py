@@ -3,7 +3,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from app.schemas.common import UtcDatetime
+from app.schemas.common import UtcDatetime, required_text
 
 Role = Literal["admin", "collaborator"]
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -25,6 +25,7 @@ class UserCreate(BaseModel):
     department: str = Field(default="", max_length=200)
 
     _email = field_validator("email")(classmethod(lambda cls, v: normalize_email(v)))
+    _name = field_validator("name")(classmethod(lambda cls, v: required_text(v)))
 
 
 class UserUpdate(BaseModel):
@@ -37,6 +38,7 @@ class UserUpdate(BaseModel):
     is_active: bool | None = None
 
     _email = field_validator("email")(classmethod(lambda cls, v: normalize_email(v) if v is not None else v))
+    _name = field_validator("name")(classmethod(lambda cls, v: required_text(v) if v is not None else v))
 
 
 class UserRow(BaseModel):

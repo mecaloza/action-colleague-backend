@@ -1,7 +1,9 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from app.api.routes import (
@@ -35,6 +37,12 @@ ROUTERS = (
 )
 
 
+async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """422 with where and what is wrong, never echoing the values sent (passwords, answers)."""
+    errors = [{"loc": list(error.get("loc", ())), "msg": error.get("msg", ""), "type": error.get("type", "")} for error in exc.errors()]
+    return JSONResponse({"detail": errors}, status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_migrations()
@@ -48,6 +56,7 @@ def create_app() -> FastAPI:
     configure_logging(settings.log_level)
 
     app = FastAPI(title="Action Colleague API", version="2.0.0", lifespan=lifespan)
+    app.add_exception_handler(RequestValidationError, validation_error)
     # Middleware added last runs first: proxy headers -> CORS -> request logging -> routes.
     app.add_middleware(RequestLogMiddleware)
     app.add_middleware(

@@ -47,6 +47,19 @@ def test_legacy_multiple_choice_accepts_letters_and_text():
     assert [q.correct_index for q in quiz.normalize_legacy_questions(raw)] == [1, 2, 1]
 
 
+
+def test_legacy_numeric_options_and_long_texts_are_kept():
+    raw = [
+        {"question": "¿Días?", "options": ["15", "30", "45"], "correct": "30"},  # the option's text, not an index
+        {"question": "¿Año?", "options": ["1990", "2000"], "correct": 2000},
+        {"type": "scenario", "question": "¿Qué harías?", "options": ["x" * 400, "Nada"], "correct": 0},
+        {"type": "ordering", "question": "Ordena", "items": ["y" * 400, "Fin"], "correct_order": [0, 1]},
+    ]
+    questions = quiz.normalize_legacy_questions(raw)
+    assert [q.prompt for q in questions] == ["¿Días?", "¿Año?", "¿Qué harías?", "Ordena"]
+    assert [q.correct_index for q in questions[:3]] == [1, 1, 0]
+    assert len(questions[2].options[0]) == 300 and len(questions[3].items[0]) == 300
+
 def test_duplicate_legacy_ids_get_deterministic_ids():
     raw = [{"id": "q1", "type": "true_false", "statement": "A", "correct": True}] * 2
     first = [q.id for q in quiz.normalize_legacy_questions(raw)]

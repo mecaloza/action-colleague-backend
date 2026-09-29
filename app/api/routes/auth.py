@@ -135,5 +135,9 @@ def update_me(payload: MeUpdate, db: Session = Depends(get_db), current_user: Us
         if not verify_password(payload.current_password or "", current_user.password_hash):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Tu contraseña actual no es correcta")
         current_user.password_hash = hash_password(payload.new_password)
+        # Every session ends (a stolen one too); the client signs in again with the new password.
+        db.query(RefreshToken).filter(RefreshToken.user_id == current_user.id).update(
+            {RefreshToken.revoked: True}, synchronize_session=False
+        )
     db.commit()
     return _current_user(current_user)

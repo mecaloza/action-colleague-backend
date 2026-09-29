@@ -14,45 +14,55 @@ HMAC from the server secret, so neither ids nor order leak the solution; grading
 
 import hashlib
 import hmac
+import json
+import logging
 import random
 import re
 import unicodedata
 import uuid
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, Field, TypeAdapter, field_validator, model_validator
+from pydantic import BaseModel, Field, StringConstraints, TypeAdapter, ValidationError, field_validator, model_validator
 
 from app.services.metrics import percentage
+
+logger = logging.getLogger(__name__)
 
 
 def _new_id() -> str:
     return uuid.uuid4().hex[:10]
 
 
+# Whitespace is stripped before the length limits apply: "   " is empty, not a valid prompt.
+Prompt = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1000)]
+Choice = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=300)]
+LongText = Annotated[str, StringConstraints(strip_whitespace=True, max_length=1500)]
+ShortText = Annotated[str, StringConstraints(strip_whitespace=True, max_length=300)]
+
+
+def _repeats(values: list[str]) -> bool:
+    return len({value.casefold() for value in values}) != len(values)
+
+
 class _QuestionBase(BaseModel):
     id: str = Field(default_factory=_new_id, min_length=1, max_length=40)
-    prompt: str = Field(min_length=1, max_length=1000)
-    explanation: str = Field(default="", max_length=1500)
-
-    @field_validator("prompt", "explanation")
-    @classmethod
-    def _strip(cls, value: str) -> str:
-        return value.strip()
+    prompt: Prompt
+    explanation: LongText = ""
 
 
 class SingleChoiceQuestion(_QuestionBase):
     type: Literal["single_choice"] = "single_choice"
-    scenario: str = Field(default="", max_length=1500)
-    options: list[str] = Field(min_length=2, max_length=6)
+    scenario: LongText = ""
+    options: list[Choice] = Field(min_length=2, max_length=6)
     correct_index: int
 
     @model_validator(mode="after")
     def _check(self) -> "SingleChoiceQuestion":
-        self.options = [option.strip() for option in self.options]
-        if any(not option for option in self.options):
-            raise ValueError("options cannot be empty")
+        # Graded by position: two options that read the same would make a right answer look wrong.
+        if _repeats(self.options):
+            raise ValueError("Hay opciones repetidas")
         if not 0 <= self.correct_index < len(self.options):
-            raise ValueError("correct_index is out of range")
+            raise ValueError("Marca la respuesta correcta")
         return self
 
 
@@ -63,20 +73,19 @@ class TrueFalseQuestion(_QuestionBase):
 
 class OrderingQuestion(_QuestionBase):
     type: Literal["ordering"] = "ordering"
-    items: list[str] = Field(min_length=2, max_length=8)  # in the correct order
+    items: list[Choice] = Field(min_length=2, max_length=8)  # in the correct order
 
     @field_validator("items")
     @classmethod
     def _check_items(cls, items: list[str]) -> list[str]:
-        items = [item.strip() for item in items]
-        if any(not item for item in items):
-            raise ValueError("items cannot be empty")
+        if _repeats(items):
+            raise ValueError("Hay pasos repetidos")
         return items
 
 
 class MatchPair(BaseModel):
-    left: str = Field(min_length=1, max_length=300)
-    right: str = Field(min_length=1, max_length=300)
+    left: Choice
+    right: Choice
 
 
 class MatchingQuestion(_QuestionBase):
@@ -85,24 +94,23 @@ class MatchingQuestion(_QuestionBase):
 
     @model_validator(mode="after")
     def _check(self) -> "MatchingQuestion":
-        lefts = [pair.left.strip() for pair in self.pairs]
-        rights = [pair.right.strip() for pair in self.pairs]
-        if len(set(lefts)) != len(lefts) or len(set(rights)) != len(rights):
-            raise ValueError("matching sides must not repeat")
+        if _repeats([pair.left for pair in self.pairs]) or _repeats([pair.right for pair in self.pairs]):
+            raise ValueError("Hay elementos repetidos en las parejas")
         return self
 
 
 class FillBlankQuestion(_QuestionBase):
     type: Literal["fill_blank"] = "fill_blank"
-    answers: list[str] = Field(min_length=1, max_length=5)
-    hint: str = Field(default="", max_length=300)
+    answers: list[ShortText] = Field(min_length=1, max_length=5)
+    hint: ShortText = ""
 
     @field_validator("answers")
     @classmethod
     def _check_answers(cls, answers: list[str]) -> list[str]:
-        answers = [answer.strip() for answer in answers if answer.strip()]
+        # Compared without punctuation: an answer like "%" would accept an empty response.
+        answers = [answer for answer in answers if normalize_text(answer)]
         if not answers:
-            raise ValueError("at least one accepted answer is required")
+            raise ValueError("Escribe al menos una respuesta aceptada con letras o números")
         return answers
 
 
@@ -110,15 +118,82 @@ Question = Annotated[
     Union[SingleChoiceQuestion, TrueFalseQuestion, OrderingQuestion, MatchingQuestion, FillBlankQuestion],
     Field(discriminator="type"),
 ]
+QUESTION_TYPES = ("single_choice", "true_false", "ordering", "matching", "fill_blank")
 _questions_adapter = TypeAdapter(list[Question])
 
 
+class InvalidQuestions(ValueError):
+    """Questions rejected, with a message the admin can act on."""
+
+
+_TEXTS = {
+    "prompt": "el enunciado",
+    "explanation": "la explicación",
+    "scenario": "el caso",
+    "hint": "la pista",
+    "left": "la pareja",
+    "right": "la pareja",
+    "options": "una opción",
+    "items": "un paso",
+    "answers": "una respuesta aceptada",
+}
+_LISTS = {
+    "options": ("opción", "opciones"),
+    "items": ("paso", "pasos"),
+    "pairs": ("pareja", "parejas"),
+    "answers": ("respuesta aceptada", "respuestas aceptadas"),
+}
+
+
+def _count(number: Any, field: str) -> str:
+    singular, plural = _LISTS[field]
+    return f"{number} {singular if number == 1 else plural}"
+
+
+def _describe(error: dict) -> str:
+    """One pydantic error as a short Spanish sentence ("Pregunta 2: completa el enunciado")."""
+    loc = [part for part in error.get("loc", ()) if part not in QUESTION_TYPES]
+    position = f"Pregunta {loc[0] + 1}: " if loc and isinstance(loc[0], int) else ""
+    names = [part for part in loc if isinstance(part, str)]
+    field = names[-1] if names else ""
+    kind, ctx = error.get("type", ""), error.get("ctx") or {}
+    if kind == "value_error":
+        message = str(ctx.get("error") or error.get("msg", ""))
+    elif field in {"correct", "correct_index"}:
+        message = "marca la respuesta correcta"
+    elif kind in {"union_tag_invalid", "union_tag_not_found"}:
+        message = "el tipo de pregunta no es válido"
+    elif kind in {"string_too_short", "missing"} and field in _TEXTS:
+        message = f"completa {_TEXTS[field]}"
+    elif kind == "string_too_long" and field in _TEXTS:
+        message = f"{_TEXTS[field]} supera los {ctx.get('max_length')} caracteres"
+    elif kind == "too_short" and field in _LISTS:
+        message = f"se necesitan al menos {_count(ctx.get('min_length'), field)}"
+    elif kind == "too_long" and field in _LISTS:
+        message = f"se admiten máximo {_count(ctx.get('max_length'), field)}"
+    else:
+        message = "hay un dato que no es válido"
+    message = message[:1].lower() + message[1:] if position else message[:1].upper() + message[1:]
+    return position + message
+
+
 def validate_questions(raw: list[dict]) -> list[Question]:
-    questions = _questions_adapter.validate_python(raw)
+    """Canonical questions, or InvalidQuestions with a readable reason."""
+    try:
+        questions = _questions_adapter.validate_python(raw)
+    except ValidationError as exc:
+        raise InvalidQuestions(_describe(exc.errors()[0])) from exc
     ids = [question.id for question in questions]
     if len(set(ids)) != len(ids):
-        raise ValueError("question ids must be unique")
+        raise InvalidQuestions("Hay preguntas repetidas")
     return questions
+
+
+def questions_version(questions: list[Question]) -> str:
+    """Changes whenever what the learner answers changes (texts, options or keys); fixing an explanation doesn't."""
+    answered = [{k: v for k, v in question.items() if k != "explanation"} for question in dump_questions(questions)]
+    payload = json.dumps(answered, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 def dump_questions(questions: list[Question]) -> list[dict]:
@@ -137,19 +212,39 @@ def _to_bool(value: Any) -> bool:
 
 
 def _legacy_choice_index(question: dict, options: list[str]) -> int:
-    correct = question.get("correct", question.get("answer", 0))
-    if isinstance(correct, bool):
-        return 0
-    if isinstance(correct, int):
-        return correct if 0 <= correct < len(options) else 0
-    text = str(correct).strip()
-    if len(text) == 1 and text.lower() in "abcdef":
-        index = ord(text.lower()) - ord("a")
-        return index if index < len(options) else 0
-    if text.isdecimal() and int(text) < len(options):
-        return int(text)
+    """Index of the correct option; ValueError when the old data doesn't say which one it is."""
+    correct = question.get("correct", question.get("answer"))
+    if correct is None or isinstance(correct, bool):
+        raise ValueError("no correct option")
+    number = isinstance(correct, int) or (isinstance(correct, float) and correct.is_integer())
+    text = str(int(correct) if number else correct).strip().lower()
     lowered = [option.strip().lower() for option in options]
-    return lowered.index(text.lower()) if text.lower() in lowered else 0
+    if len(text) == 1 and text in "abcdef" and not number:
+        index = ord(text) - ord("a")
+    elif (number or text.isdecimal()) and int(text) < len(options):
+        index = int(text)
+    elif text in lowered:  # the option's own text, numbers included ("30" among "15", "30", "45")
+        index = lowered.index(text)
+    else:
+        raise ValueError("unknown correct option")
+    if not 0 <= index < len(options):
+        raise ValueError("correct option out of range")
+    return index
+
+
+def _clip(value: Any, limit: int = 300) -> str:
+    """Old data had no per-item limit: clipping keeps the question (graded by token, not by text)."""
+    return str(value).strip()[:limit]
+
+
+def _without_repeats(options: list[str], correct_index: int) -> tuple[list[str], int]:
+    """The old editor allowed repeated options: keep the first of each, pointing at the same answer."""
+    kept: list[str] = []
+    for option in options:
+        if option.strip().casefold() not in {k.strip().casefold() for k in kept}:
+            kept.append(option)
+    correct = options[correct_index].strip().casefold()
+    return kept, next(i for i, option in enumerate(kept) if option.strip().casefold() == correct)
 
 
 def normalize_legacy_question(question: dict, index: int) -> dict:
@@ -165,7 +260,7 @@ def normalize_legacy_question(question: dict, index: int) -> dict:
                 "explanation": explanation}
 
     if qtype == "ordering":
-        items = [str(item) for item in question.get("items") or []]
+        items = [_clip(item) for item in question.get("items") or []]
         order = question.get("correct_order") or list(range(len(items)))
         if sorted(order) != list(range(len(items))):
             order = list(range(len(items)))
@@ -182,9 +277,10 @@ def normalize_legacy_question(question: dict, index: int) -> dict:
         return {"id": qid, "type": "fill_blank", "prompt": prompt, "answers": [str(question.get("answer", ""))],
                 "hint": str(question.get("hint") or ""), "explanation": explanation}
 
-    options = [str(option) for option in question.get("options") or []]
+    options = [_clip(option) for option in question.get("options") or []]
+    options, correct_index = _without_repeats(options, _legacy_choice_index(question, options))
     return {"id": qid, "type": "single_choice", "prompt": prompt, "scenario": str(question.get("scenario") or ""),
-            "options": options, "correct_index": _legacy_choice_index(question, options), "explanation": explanation}
+            "options": options, "correct_index": correct_index, "explanation": explanation}
 
 
 def _valid_question(raw: Any) -> "Question | None":
@@ -199,10 +295,14 @@ def normalize_legacy_questions(raw: list) -> list[Question]:
     """Best effort: questions that cannot be made valid are dropped rather than breaking the quiz."""
     questions: list[Question] = []
     seen: set[str] = set()
-    for index, item in enumerate(raw or []):
+    for index, item in enumerate(raw if isinstance(raw, list) else []):
         if not isinstance(item, dict):
             continue
-        candidate = normalize_legacy_question(item, index)
+        try:
+            candidate = normalize_legacy_question(item, index)
+        except (TypeError, ValueError, IndexError, AttributeError):
+            logger.warning("legacy_question_dropped", extra={"question_index": index})
+            continue
         if candidate["id"] in seen:
             # Deterministic: the learner's quiz and the grading must derive the same id.
             candidate = {**candidate, "id": f"{candidate['id']}-{index + 1}"}
@@ -231,7 +331,12 @@ def evaluation_questions(evaluation) -> list[Question]:
         return []
     if evaluation.spec:
         return normalize_stored_questions(evaluation.spec)
-    return normalize_legacy_questions(evaluation.questions)
+    try:
+        raw = evaluation.questions
+    except ValueError:  # questions_json that is not JSON
+        logger.warning("legacy_questions_unreadable", extra={"evaluation_id": evaluation.id})
+        return []
+    return normalize_legacy_questions(raw)
 
 
 # Older rows can hold NULL (or 0) for these; the defaults are the ones of the `evaluations` columns.
@@ -264,15 +369,11 @@ def _token(secret: str, scope: str, question_id: str, kind: str, index: int) -> 
     return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()[:12]
 
 
-def _shuffled_positions(count: int, rng: random.Random, avoid_identity: bool = False) -> list[int]:
-    """Positions 0..count-1 in random order; `avoid_identity` retries so they don't come out unshuffled."""
-    identity = list(range(count))
-    shuffled = identity[:]
-    for _ in range(10):
-        rng.shuffle(shuffled)
-        if not avoid_identity or shuffled != identity:
-            break
-    return shuffled
+def _shuffled_positions(count: int, rng: random.Random) -> list[int]:
+    """Positions 0..count-1 uniformly shuffled (avoiding the correct order would give it away with 2 items)."""
+    positions = list(range(count))
+    rng.shuffle(positions)
+    return positions
 
 
 def learner_view(questions: list[Question], secret: str, scope: str, rng: random.Random | None = None) -> list[dict]:
@@ -290,7 +391,7 @@ def learner_view(questions: list[Question], secret: str, scope: str, rng: random
         elif isinstance(q, OrderingQuestion):
             item["items"] = [
                 {"id": _token(secret, scope, q.id, "item", i), "text": q.items[i]}
-                for i in _shuffled_positions(len(q.items), rng, avoid_identity=True)
+                for i in _shuffled_positions(len(q.items), rng)
             ]
         elif isinstance(q, MatchingQuestion):
             item["lefts"] = [
@@ -298,7 +399,7 @@ def learner_view(questions: list[Question], secret: str, scope: str, rng: random
             ]
             item["rights"] = [
                 {"id": _token(secret, scope, q.id, "right", i), "text": q.pairs[i].right}
-                for i in _shuffled_positions(len(q.pairs), rng, avoid_identity=True)
+                for i in _shuffled_positions(len(q.pairs), rng)
             ]
         elif isinstance(q, FillBlankQuestion):
             item["hint"] = q.hint

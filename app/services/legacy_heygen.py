@@ -6,6 +6,7 @@ that knows these ids) retires on 2026-10-31; after that this returns None.
 """
 
 import logging
+from datetime import UTC, date, datetime
 
 import httpx
 
@@ -18,14 +19,20 @@ __all__ = ["PENDING_PREFIX", "fresh_url", "video_id"]
 
 video_id = heygen_video_id
 
+RETIRED_ON = date(2026, 10, 31)
+TIMEOUT_SECONDS = 5  # on a page request: better no video than a page that hangs
+
 
 def fresh_url(heygen_id: str) -> str | None:
     api_key = get_settings().heygen_api_key
-    if not api_key:
+    if not api_key or datetime.now(UTC).date() > RETIRED_ON:
         return None
     try:
         response = httpx.get(
-            HEYGEN_STATUS_URL, params={"video_id": heygen_id}, headers={"X-Api-Key": api_key}, timeout=15
+            HEYGEN_STATUS_URL,
+            params={"video_id": heygen_id},
+            headers={"X-Api-Key": api_key},
+            timeout=TIMEOUT_SECONDS,
         )
         response.raise_for_status()
         data = response.json().get("data") or {}

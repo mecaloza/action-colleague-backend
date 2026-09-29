@@ -45,7 +45,9 @@ Tests:
 
 Reglas clave:
 - Los módulos se desbloquean en orden. Un módulo con evaluación se completa aprobándola y uno sin evaluación, al marcarlo como visto.
-- El colaborador nunca recibe las respuestas correctas. Las opciones llevan IDs opacos (HMAC) y la calificación ocurre en el servidor (`app/services/quiz.py`, la única implementación). La solución se muestra solo al aprobar o al agotar los intentos.
+- Si el admin edita una evaluación mientras alguien la responde, ese intento no se califica ni se cuenta (409) y el quiz se recarga.
+- Cambiar la contraseña propia cierra todas las sesiones (el frontend vuelve a iniciar sesión con la nueva).
+- El colaborador nunca recibe las respuestas correctas. Las opciones llevan IDs opacos (HMAC) y la calificación ocurre en el servidor (`app/services/quiz.py`, la única implementación). La solución se muestra solo al aprobar: mostrada al agotar los intentos, bastaría con que el admin diera más intentos para aprobar sin saber. Antes de aprobar, cada intento dice qué preguntas estuvieron bien.
 
 ## Migraciones
 
