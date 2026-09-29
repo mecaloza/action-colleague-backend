@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 from auth import get_current_user, require_admin
 from database import get_db
 from models import Course, Evaluation, Module, User
+from utils.heygen_persist import start_background_persist
 
 router = APIRouter(prefix="/courses/ai", tags=["course-wizard"])
 
@@ -867,7 +868,9 @@ async def check_video_status(
             mod.video_url = f"heygen://video/{video_id}"
             mod.generation_status = "completed"
             db.commit()
-            
+            # Copia el video a Storage (la URL de HeyGen expira y su API v1 se apaga)
+            start_background_persist()
+
             # Para la respuesta devolvemos la URL fresca
             fresh_url = data.get("video_url", "")
             return {
@@ -946,6 +949,9 @@ async def check_all_videos(
             results.append({"module_id": mod.id, "status": "error", "error": str(e)})
 
     db.commit()
+    if any(result["status"] == "completed" for result in results):
+        # Copia los videos a Storage (la URL de HeyGen expira y su API v1 se apaga)
+        start_background_persist()
     return {"results": results}
 
 
