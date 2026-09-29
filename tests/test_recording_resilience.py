@@ -78,7 +78,8 @@ def test_a_recording_must_be_an_uploaded_file_of_the_course(client, db, admin_he
     for status in ("pending", "failed"):
         asset = _asset(db, module.course_id, status=status)
         response = client.post(url, headers=admin_headers, json={"recording_asset_id": asset.id})
-        assert response.status_code == 409 and "no terminó de subirse" in response.json()["detail"]
+        assert response.status_code == 409 and response.json()["detail"]["code"] == "upload_not_ready"
+        assert "no terminó de subirse" in response.json()["detail"]["message"]
     assert db.query(Job).count() == 0
 
 

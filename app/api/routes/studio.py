@@ -468,8 +468,10 @@ def compose_recording(
         if asset is None or asset.kind not in kinds or asset.course_id not in (None, module.course_id):
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "La grabación o la presentación no son válidas")
         if asset.status not in USABLE_UPLOADS:
+            # A code the client can rely on: this upload can't be used, the next try must upload again.
             raise HTTPException(
-                status.HTTP_409_CONFLICT, "La grabación o la presentación no terminó de subirse; súbela de nuevo"
+                status.HTTP_409_CONFLICT,
+                {"code": "upload_not_ready", "message": "La grabación o la presentación no terminó de subirse; súbela de nuevo"},
             )
     request = payload.model_dump()
     job = queue.enqueue(
