@@ -43,10 +43,52 @@ def _close(a, b, tolerance=40) -> bool:
 
 
 def test_slide_segments_follow_the_recorded_changes():
-    assert compose.slide_segments([(0, 0), (2, 1), (5, 0)], 2, 7) == [(0, 2), (1, 3), (0, 2)]
-    # A change shorter than a frame is absorbed; the total is always the recording's length.
-    segments = compose.slide_segments([(0, 0), (2, 1), (2.01, 0)], 2, 4)
-    assert sum(s for _, s in segments) == pytest.approx(4) and len(segments) == 1
+    fps = compose.FPS
+    assert compose.slide_segments([(0, 0), (2, 1), (5, 0)], 2, 7) == [(0, 2 * fps), (1, 3 * fps), (0, 2 * fps)]
+    # Changes within one frame: the last one recorded wins, so here nothing changes at all.
+    assert compose.slide_segments([(0, 0), (2, 1), (2.01, 0)], 2, 4) == [(0, 4 * fps)]
+    # A first slide replaced at once (both at 0 s) must not keep the first page on screen.
+    assert compose.slide_segments([(0, 0), (0, 1)], 2, 3) == [(1, 3 * fps)]
+    # Equal times keep the order they were recorded in, not the page number's.
+    assert compose.slide_segments([(0, 0), (2.0, 5), (2.0, 3)], 6, 4) == [(0, 2 * fps), (3, 2 * fps)]
+
+
+def test_many_quick_changes_stay_on_the_frame_grid():
+    timeline = [(index * 1.01, index % 2) for index in range(40)]
+    segments = compose.slide_segments(timeline, 2, 41.4)
+    starts, frame = [], 0
+    for _, frames in segments:
+        starts.append(frame)
+        frame += frames
+    assert frame == round(41.4 * compose.FPS)  # the video track lasts as long as the recording
+    assert starts == [round(at * compose.FPS) for at, _ in timeline]  # each change exactly on its frame
+
+
+def test_the_deck_is_one_ffmpeg_input_however_many_changes(tmp_path, monkeypatch):
+    pages = []
+    for index, color in enumerate((ORANGE, BLUE)):
+        page = tmp_path / f"p{index}.png"
+        Image.new("RGB", (320, 180), color).save(page)
+        pages.append(page)
+    commands = []
+    monkeypatch.setattr(compose, "run", lambda cmd, timeout=None: commands.append(cmd))
+    for changes in (1, 400):
+        timeline = [(index * 0.5, index % 2) for index in range(changes)]
+        compose.compose_recording(pages, timeline, tmp_path / "cam.webm", 200.0, tmp_path / "out.mp4", tmp_path)
+    assert [cmd.count("-i") for cmd in commands] == [4, 4]  # the deck, the camera, its mask and its ring
+
+
+def test_a_silent_recording_gets_a_silent_track(tmp_path):
+    page = tmp_path / "p0.png"
+    Image.new("RGB", (1280, 720), ORANGE).save(page)
+    camera = tmp_path / "mudo.webm"
+    subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=640x480:rate=25",
+                    "-t", "2", "-c:v", "libvpx", "-b:v", "300k", str(camera)], check=True, capture_output=True)
+    output = tmp_path / "out.mp4"
+    compose.compose_recording([page], [(0, 0)], camera, 2.0, output, tmp_path, camera_has_audio=False)
+    info = _probe(output)
+    assert any(stream["codec_type"] == "audio" for stream in info["streams"])
+    assert float(info["format"]["duration"]) == pytest.approx(2.0, abs=0.15)
 
 
 def test_recording_is_composed_with_the_slides_at_the_right_times(tmp_path):
@@ -152,7 +194,7 @@ def test_transcribe_queues_one_captions_job_per_video(client, db, admin, admin_h
 
     assert first.status_code == 202 and first.json()["type"] == "media.transcribe"
     job = db.query(Job).filter(Job.type == "media.transcribe").one()
-    assert (job.dedupe_key, job.created_by, job.max_attempts) == (f"transcribe:{video.id}", admin.id, 2)
+    assert (job.dedupe_key, job.created_by, job.max_attempts) == (f"transcribe:{module.id}:{video.id}", admin.id, 2)
     assert client.post(f"/api/v1/modules/{module.id}/transcribe", headers=admin_headers).json()["id"] == job.id
 
 
@@ -200,7 +242,9 @@ def test_legacy_migration_stops_waiting_once_heygen_retires_its_api(db, admin, w
 
     job = db.query(Job).filter(Job.type == "legacy.migrate").one()
     db.refresh(job)
-    assert job.status == "succeeded" and job.result["unrecoverable"] == 1
+    assert job.status == "succeeded" and job.result["videos"] == {"lost": 1}
+    module = db.query(Module).one()
+    assert module.generation_status == "failed" and module.generation_error == recording.LOST_VIDEO
 
 
 def test_access_tokens_are_short_lived():

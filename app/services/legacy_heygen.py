@@ -1,25 +1,36 @@
 """
-Playable URLs for videos the previous app left in HeyGen (`heygen://video/{id}`).
+Videos the previous app left in HeyGen (`heygen://video/{id}`, `heygen://pending/{id}`).
 
-Read-only fallback until `heygen_persist` copies them to Storage. HeyGen's v1 API (the only one
-that knows these ids) retires on 2026-10-31; after that this returns None.
+HeyGen's v1 API is the only one that knows these ids, and it retires on 2026-10-31. Until then
+`fresh_url` gives a playable (short-lived) link: pages use it until `legacy.migrate` has copied the
+video into the private bucket, and the migration downloads from it. After that date it returns None.
 """
 
 import logging
+import re
 from datetime import UTC, date, datetime
 
 import httpx
 
 from app.core.config import get_settings
-from app.services.heygen_persist import HEYGEN_STATUS_URL, PENDING_PREFIX, heygen_video_id
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["PENDING_PREFIX", "fresh_url", "video_id"]
-
-video_id = heygen_video_id
-
+HEYGEN_STATUS_URL = "https://api.heygen.com/v1/video_status.get"
+PENDING_PREFIX = "heygen://pending/"
+VIDEO_PREFIX = "heygen://video/"
 RETIRED_ON = date(2026, 10, 31)
+_VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def video_id(video_url: str | None) -> str | None:
+    """The HeyGen id of a `heygen://` reference, or None (anything else, or a malformed id)."""
+    for prefix in (VIDEO_PREFIX, PENDING_PREFIX):
+        if video_url and video_url.startswith(prefix):
+            heygen_id = video_url[len(prefix):]
+            return heygen_id if _VIDEO_ID.fullmatch(heygen_id) else None
+    return None
+
 TIMEOUT_SECONDS = 5  # on a page request: better no video than a page that hangs
 
 

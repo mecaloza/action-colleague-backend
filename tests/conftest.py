@@ -69,7 +69,6 @@ def client(session_factory, monkeypatch):
     monkeypatch.setattr(main, "run_migrations", lambda: None)
     monkeypatch.setattr(main, "start_worker", lambda: None)
     monkeypatch.setattr(main, "schedule_maintenance", lambda: None)
-    monkeypatch.setattr(main, "start_background_sweeps", lambda: None)
     main.app.dependency_overrides[get_db] = override_get_db
     with TestClient(main.app) as test_client:
         yield test_client

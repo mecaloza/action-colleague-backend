@@ -184,14 +184,11 @@ class SupabaseStorage:
     def copy_from(self, source_bucket: str, source_path: str, dest_path: str) -> None:
         """Server-side copy from another bucket of the project (no download)."""
         self.ensure_bucket()
-        self._check(
-            self.client.post(
-                f"{self.base}/object/copy",
-                headers=self.headers,
-                json={"bucketId": source_bucket, "sourceKey": source_path, "destinationBucket": self.bucket,
-                      "destinationKey": dest_path},
-            ),
-            "copiar el archivo",
+        self._send(
+            "POST", f"{self.base}/object/copy", "copiar el archivo",
+            headers=self.headers, timeout=TRANSFER_TIMEOUT_SECONDS,  # the copy of a long video takes a while
+            json={"bucketId": source_bucket, "sourceKey": source_path, "destinationBucket": self.bucket,
+                  "destinationKey": dest_path},
         )
 
 

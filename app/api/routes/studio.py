@@ -61,6 +61,7 @@ SAMPLE_EXTENSIONS = {
     "audio/webm": ".webm", "video/webm": ".webm", "video/mp4": ".mp4",
 }
 RENDER_CHOICES = ("voice_id", "avatar_id", "presenter", "theme")  # the course settings a render is made with
+USABLE_UPLOADS = ("uploaded", "processing", "ready")  # pending: never confirmed; failed: unusable
 CATALOG_CACHE_SECONDS = 10 * 60
 
 
@@ -466,11 +467,18 @@ def compose_recording(
         asset = db.get(MediaAsset, asset_id)
         if asset is None or asset.kind not in kinds or asset.course_id not in (None, module.course_id):
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "La grabación o la presentación no son válidas")
-    module.generation_status, module.generation_error = "queued", None
+        if asset.status not in USABLE_UPLOADS:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "La grabación o la presentación no terminó de subirse; súbela de nuevo"
+            )
+    request = payload.model_dump()
     job = queue.enqueue(
-        db, "video.compose_recording", payload.model_dump(), course_id=module.course_id, module_id=module.id,
+        db, "video.compose_recording", request, course_id=module.course_id, module_id=module.id,
         created_by=admin.id, dedupe_key=f"recording:{module.id}", commit=False,
     )
+    _same_request(job, request)  # another take while one is being combined: 409, never silently the old one
+    if job.status == "queued":  # one already running keeps showing "generating"
+        module.generation_status, module.generation_error = "queued", None
     db.commit()
     return job_out(job)
 

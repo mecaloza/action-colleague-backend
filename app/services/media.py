@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
 from sqlalchemy import or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 
 from app.db.models import Course, MediaAsset, Module
 from app.schemas.courses import MediaRef
@@ -140,7 +140,12 @@ class MediaResolver:
         ids = {asset_id for module in modules for asset_id in _asset_ids(module) if asset_id}
         ids.update(asset_id for asset_id in extra_asset_ids if asset_id)
         if ids:
-            assets = self.db.query(MediaAsset).filter(MediaAsset.id.in_(ids), MediaAsset.status == "ready").all()
+            assets = (
+                self.db.query(MediaAsset)
+                .options(defer(MediaAsset.meta))  # a video's transcript lives there: no page needs it
+                .filter(MediaAsset.id.in_(ids), MediaAsset.status == "ready")
+                .all()
+            )
             self._assets = {asset.id: asset for asset in assets}
             self._urls = sign_assets(list(self._assets.values()), SIGNED_URL_SECONDS)
         return self

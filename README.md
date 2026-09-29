@@ -146,11 +146,7 @@ El entorno se detecta con `RAILWAY_ENVIRONMENT_NAME` (Railway lo define) o `ENVI
 
 ## Videos de HeyGen
 
-HeyGen apaga su API v1/v2 el 31-oct-2026. Al arrancar (y cada 30 min durante un día) la app copia a Storage los videos que aún apuntan a HeyGen; luego `legacy.migrate` los mueve al bucket privado. Pasada manual:
-
-```bash
-.venv/bin/python -m app.services.heygen_persist
-```
+HeyGen apaga su API v1/v2 el 31-oct-2026. En cada arranque, `legacy.migrate` copia al bucket privado los videos de la app anterior: los de HeyGen (mientras su API v1 responda) y los de sus buckets públicos (`course-videos`, `user-videos`). Luego los procesa como cualquier subida. Mientras queden videos de HeyGen sin terminar, vuelve a revisar cada 6 h. Los que ya no se pueden recuperar (los de `/uploads/…` y los de HeyGen después del apagado) quedan marcados en su módulo para volver a subirlos o producirlos, y el log `legacy_migration_pass` resume cada pasada.
 
 ## Logs
 

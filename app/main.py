@@ -4,6 +4,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import update
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from app.api.routes import (
@@ -19,8 +20,8 @@ from app.api.routes import (
 from app.core.config import get_settings
 from app.core.logging import RequestLogMiddleware, configure_logging
 from app.db.migrate import run_migrations
+from app.db.models import Job
 from app.db.session import SessionLocal
-from app.services.heygen_persist import start_background_sweeps
 from app.worker import queue
 from app.worker.runner import WorkerPool
 
@@ -46,7 +47,10 @@ async def validation_error(request: Request, exc: RequestValidationError) -> JSO
 def schedule_maintenance() -> None:
     """Background upkeep that must run once per deploy (idempotent)."""
     with SessionLocal() as db:
-        queue.enqueue(db, "legacy.migrate", dedupe_key="legacy-migrate", max_attempts=5)
+        job = queue.enqueue(db, "legacy.migrate", dedupe_key="legacy-migrate", max_attempts=5)
+        now = queue.utcnow()  # a pass waiting for its next recheck runs now: every deploy looks again
+        db.execute(update(Job).where(Job.id == job.id, Job.status == "queued", Job.run_after > now).values(run_after=now))
+        db.commit()
 
 
 def start_worker() -> WorkerPool | None:
@@ -61,9 +65,7 @@ def start_worker() -> WorkerPool | None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_migrations()
-    # HeyGen retires its v1/v2 API on 2026-10-31: copy finished videos to Storage now.
-    start_background_sweeps()
-    schedule_maintenance()
+    schedule_maintenance()  # among others, copies the previous app's HeyGen videos before HeyGen retires them
     worker = start_worker()
     yield
     if worker:

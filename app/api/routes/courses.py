@@ -62,7 +62,12 @@ def _detach_legacy_videos(db: Session, module_ids) -> None:
 
 
 def _module_media(module: Module) -> list[str | None]:
-    return [module.video_asset_id, module.poster_asset_id, module.captions_asset_id, module.document_asset_id]
+    """What the module shows, plus the camera and deck of its recording (they can be combined again)."""
+    take = (module.storyboard or {}).get("recording") or {}
+    return [
+        module.video_asset_id, module.poster_asset_id, module.captions_asset_id, module.document_asset_id,
+        take.get("recording_asset_id"), take.get("deck_asset_id"),
+    ]
 
 
 BOUND_PURPOSES = (*PURPOSES_NEEDING_MODULE, "course_cover")  # uploads only their module or course can use

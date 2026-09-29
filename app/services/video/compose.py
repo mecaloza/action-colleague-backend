@@ -36,6 +36,10 @@ class ComposeError(RuntimeError):
     """FFmpeg failed, or the pieces don't fit together; the job logs it and shows the admin its own message."""
 
 
+class ComposeTimeout(ComposeError):
+    """FFmpeg did not finish in time: trying again with the same input won't help."""
+
+
 @dataclass
 class Narration:
     """The master narration and where each scene's speech starts in it (seconds)."""
@@ -53,7 +57,7 @@ def run(cmd: list[str], timeout: int = FFMPEG_TIMEOUT_SECONDS) -> None:
         stderr = (exc.stderr or b"")[-ERROR_TAIL_BYTES:].decode(errors="replace")
         raise ComposeError(f"FFmpeg falló: {stderr}") from exc
     except subprocess.TimeoutExpired as exc:  # subprocess already killed it
-        raise ComposeError(f"FFmpeg no terminó en {timeout} s") from exc
+        raise ComposeTimeout(f"FFmpeg no terminó en {timeout} s") from exc
 
 
 def to_wav(src: Path, dest: Path) -> None:
@@ -154,16 +158,19 @@ def _bubble_inputs(avatar: Path, mask: Path, ring: Path, duration: float) -> lis
     return ["-i", str(avatar), *still, "-i", str(mask), *still, "-i", str(ring)]
 
 
-def _bubble_filters(background: str, first_input: int, duration: float) -> list[str]:
+def _bubble_filters(background: str, first_input: int, duration: float, keep_timing: bool = False) -> list[str]:
     """Overlay the presenter as a round bubble, with its ring, on the `background` stream.
 
     Inputs `first_input`, `first_input + 1` and `first_input + 2` are the presenter, the mask and the ring.
+    `keep_timing`: the clip's own audio is used too (a camera recording), so its video keeps its start
+    time instead of being moved to zero (a video that starts after its audio would lose the lip sync).
     """
     avatar, mask, ring = first_input, first_input + 1, first_input + 2
     x, y = WIDTH - BUBBLE - BUBBLE_MARGIN, HEIGHT - BUBBLE - BUBBLE_MARGIN
+    timing = f"fps={FPS}:start_time=0" if keep_timing else f"setpts=PTS-STARTPTS,fps={FPS}"
     return [
         # Square crop from the centre, then scaled: never stretched. The last frame holds if short.
-        f"[{avatar}:v]setpts=PTS-STARTPTS,fps={FPS},crop='min(iw,ih)':'min(iw,ih)',"
+        f"[{avatar}:v]{timing},crop='min(iw,ih)':'min(iw,ih)',"
         f"scale={BUBBLE}:{BUBBLE},tpad=stop_mode=clone:stop_duration={PRESENTER_HOLD_SECONDS},"
         f"trim=duration={duration:.3f},format=rgba[av]",
         f"[{mask}:v]fps={FPS},format=gray[mask]",
@@ -223,7 +230,7 @@ SLIDE_BACKGROUND = (12, 12, 12)
 SLIDE_MARGIN = 48
 
 
-def _letterbox(page: Path, dest: Path) -> Path:
+def letterbox(page: Path, dest: Path) -> Path:
     """A deck page fitted inside 1920x1080 on the dark background, never stretched."""
     with Image.open(page) as image:
         image = image.convert("RGB")
@@ -234,44 +241,65 @@ def _letterbox(page: Path, dest: Path) -> Path:
     return dest
 
 
-def slide_segments(timeline: list[tuple[float, int]], page_count: int, duration: float) -> list[tuple[int, float]]:
-    """(page index, seconds on screen) for each slide change; the segments always add up to `duration`."""
-    points = sorted((max(0.0, min(at, duration)), max(0, min(page, page_count - 1))) for at, page in timeline)
-    if not points or points[0][0] > 0:  # the first slide is on screen from the start
-        points.insert(0, (0.0, points[0][1] if points else 0))
-    ends = [at for at, _ in points[1:]] + [duration]  # each slide stays until the next change
-    segments: list[tuple[int, float]] = []
-    for (start, page), end in zip(points, ends):
-        seconds = end - start
-        if segments and (segments[-1][0] == page or seconds < 1 / FPS):
-            # Same page again, or a change shorter than a frame: extend what is already on screen.
-            segments[-1] = (segments[-1][0], segments[-1][1] + seconds)
+def slide_segments(timeline: list[tuple[float, int]], page_count: int, duration: float) -> list[tuple[int, int]]:
+    """(page index, frames on screen) for each slide change, on the video's frame grid.
+
+    Changes keep the order they were recorded in (the last one within a frame wins), the first slide
+    is on screen from the start, empty segments are dropped and the frames add up to the recording.
+    """
+    total = max(1, round(duration * FPS))
+
+    def clamp(page: int) -> int:
+        return max(0, min(page, page_count - 1))
+
+    ordered = sorted(timeline, key=lambda point: point[0])  # stable: equal times keep their recorded order
+    starts = {0: clamp(ordered[0][1]) if ordered else 0}
+    for at, page in ordered:
+        starts[min(max(round(at * FPS), 0), total)] = clamp(page)
+    frames = sorted(frame for frame in starts if frame < total)
+    segments: list[tuple[int, int]] = []
+    for start, end in zip(frames, [*frames[1:], total]):
+        page = starts[start]
+        if segments and segments[-1][0] == page:  # the same page again: it just stays on screen
+            segments[-1] = (page, segments[-1][1] + end - start)
         else:
-            segments.append((page, seconds))
+            segments.append((page, end - start))
     return segments
 
 
 def compose_recording(
-    pages: list[Path], timeline: list[tuple[float, int]], camera: Path, duration: float, output: Path, work: Path
-) -> None:
-    """Deck pages full screen, switched at the recorded times, with the camera in the bubble."""
+    pages: list[Path], timeline: list[tuple[float, int]], camera: Path, duration: float, output: Path, work: Path,
+    camera_has_audio: bool = True,
+) -> Path:
+    """Deck pages full screen, switched at the recorded times, with the camera in the bubble.
+
+    Only the pages the timeline shows are read. Returns the first slide as shown (for the poster).
+    """
     if not pages:
         raise ComposeError("La presentación no tiene páginas")
     segments = slide_segments(timeline, len(pages), duration)
-    letterboxed: dict[int, Path] = {}  # a page shown several times is fitted once
-    cmd = [*FFMPEG]
-    for page, seconds in segments:
-        if page not in letterboxed:
-            letterboxed[page] = _letterbox(pages[page], work / f"page_{page:03d}.png")
-        cmd += ["-loop", "1", "-framerate", str(FPS), "-t", f"{seconds:.3f}", "-i", str(letterboxed[page])]
-    count = len(segments)
-    camera_index = count  # the camera, then its mask and ring, come after the slides
+    shown: dict[int, Path] = {}  # a page shown several times is fitted once
+    for page, _ in segments:
+        if page not in shown:
+            shown[page] = letterbox(pages[page], work / f"page_{page:03d}.png")
+    # One FFmpeg input for the whole deck, however many changes: the concat demuxer switches the images.
+    lines = ["ffconcat version 1.0"]
+    for page, frames in segments:
+        lines += [f"file '{shown[page].name}'", f"duration {frames / FPS:.6f}"]
+    lines.append(f"file '{shown[segments[-1][0]].name}'")  # the demuxer ignores the last duration otherwise
+    listing = work / "slides.ffconcat"
+    listing.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
     mask, ring = _bubble_assets(work)
-    cmd += _bubble_inputs(camera, mask, ring, duration)
-    filters = [f"[{i}:v]scale={WIDTH}:{HEIGHT},setsar=1,fps={FPS},format=yuv420p[p{i}]" for i in range(count)]
-    filters.append("".join(f"[p{i}]" for i in range(count)) + f"concat=n={count}:v=1:a=0[slides]")
-    filters += _bubble_filters("slides", camera_index, duration)
-    filters.append(f"[{camera_index}:a]{LOUDNORM},aresample={SAMPLE_RATE}[aout]")
+    cmd = [*FFMPEG, "-f", "concat", "-safe", "0", "-i", str(listing), *_bubble_inputs(camera, mask, ring, duration)]
+    filters = [f"[0:v]scale={WIDTH}:{HEIGHT},setsar=1,fps={FPS},format=yuv420p[slides]"]
+    filters += _bubble_filters("slides", 1, duration, keep_timing=True)
+    if camera_has_audio:
+        filters.append(f"[1:a]{LOUDNORM},aresample={SAMPLE_RATE}[aout]")
+    else:  # e.g. the microphone was denied: a silent track, so every player handles the file the same way
+        cmd += ["-f", "lavfi", "-t", f"{duration:.3f}", "-i", f"anullsrc=r={SAMPLE_RATE}:cl=mono"]
+        filters.append("[4:a]anull[aout]")  # inputs: 0 slides, 1 camera, 2 mask, 3 ring, 4 silence
     cmd += ["-filter_complex", ";".join(filters), "-map", "[vout]", "-map", "[aout]"]
     cmd += [*_encode_options(duration), str(output)]
-    run(cmd)
+    run(cmd, timeout=max(FFMPEG_TIMEOUT_SECONDS, int(duration * 3)))  # a long class takes a while to encode
+    return shown[segments[0][0]]
