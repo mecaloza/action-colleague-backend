@@ -15,6 +15,7 @@ __all__ = [
     "DraftRequest",
     "OutlineGenerate",
     "QuizGenerate",
+    "RecordingCompose",
     "RenderRequest",
     "SlidePreview",
     "Storyboard",
@@ -122,6 +123,17 @@ class RenderRequest(BaseModel):
     avatar_name: str | None = Field(default=None, max_length=200)
     presenter: bool | None = None
     theme: Literal["dark", "light"] | None = None
+
+
+class TimelinePoint(BaseModel):
+    at: float = Field(ge=0, le=6 * 3600)  # seconds into the recording (up to 6 hours)
+    slide: int = Field(ge=0, le=500)  # deck page index
+
+
+class RecordingCompose(BaseModel):
+    recording_asset_id: str = Field(min_length=1, max_length=36)
+    deck_asset_id: str | None = Field(default=None, max_length=36)  # without a deck the recording is the video
+    timeline: list[TimelinePoint] = Field(default_factory=list, max_length=2000)  # slide changes
 
 
 class Capabilities(BaseModel):

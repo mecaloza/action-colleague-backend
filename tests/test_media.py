@@ -95,7 +95,7 @@ def test_uploaded_video_becomes_the_modules_web_video(
     assert done.status_code == 200 and done.json()["status"] == "uploaded"
     assert client.get(f"/api/v1/courses/{module.course_id}", headers=admin_headers).json()["modules"][0]["generation_status"] == "queued"
 
-    assert worker() == 1
+    assert worker() >= 1  # processing (then the captions job)
 
     course = client.get(f"/api/v1/courses/{module.course_id}", headers=admin_headers).json()
     [detail] = course["modules"]

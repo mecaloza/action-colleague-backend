@@ -8,7 +8,6 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from app.api.routes import (
     auth,
-    course_wizard,
     courses,
     dashboard,
     learn,
@@ -16,12 +15,13 @@ from app.api.routes import (
     participants,
     studio,
     users,
-    videos,
 )
 from app.core.config import get_settings
 from app.core.logging import RequestLogMiddleware, configure_logging
 from app.db.migrate import run_migrations
+from app.db.session import SessionLocal
 from app.services.heygen_persist import start_background_sweeps
+from app.worker import queue
 from app.worker.runner import WorkerPool
 
 API_PREFIX = "/api/v1"
@@ -34,9 +34,6 @@ ROUTERS = (
     dashboard,
     media,
     studio,
-    # Previous app, replaced in the next releases (AI wizard and manual video upload).
-    course_wizard,
-    videos,
 )
 
 
@@ -44,6 +41,12 @@ async def validation_error(request: Request, exc: RequestValidationError) -> JSO
     """422 with where and what is wrong, never echoing the values sent (passwords, answers)."""
     errors = [{"loc": list(error.get("loc", ())), "msg": error.get("msg", ""), "type": error.get("type", "")} for error in exc.errors()]
     return JSONResponse({"detail": errors}, status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+
+
+def schedule_maintenance() -> None:
+    """Background upkeep that must run once per deploy (idempotent)."""
+    with SessionLocal() as db:
+        queue.enqueue(db, "legacy.migrate", dedupe_key="legacy-migrate", max_attempts=5)
 
 
 def start_worker() -> WorkerPool | None:
@@ -60,6 +63,7 @@ async def lifespan(app: FastAPI):
     run_migrations()
     # HeyGen retires its v1/v2 API on 2026-10-31: copy finished videos to Storage now.
     start_background_sweeps()
+    schedule_maintenance()
     worker = start_worker()
     yield
     if worker:

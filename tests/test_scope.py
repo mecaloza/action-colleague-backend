@@ -14,6 +14,9 @@ REMOVED_PREFIXES = (
     "/api/v1/module-progress",
     "/api/v1/evaluations",
     "/api/v1/dashboards",
+    # The previous AI wizard and manual video tools, replaced by the course studio.
+    "/api/v1/courses/ai",
+    "/api/v1/videos",
 )
 REMOVED_OPERATIONS = {
     ("get", "/api/v1/users/org-chart"),

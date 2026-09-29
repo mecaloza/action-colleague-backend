@@ -6,6 +6,7 @@ media.process: turn an uploaded file into something the platform can use, then a
 - deck: one image per PDF page (recording studio) + extracted text.
 - image: resized JPEG.
 Then, depending on the purpose, it becomes a module's video or document, or a course's cover.
+A module's new video also gets its captions queued.
 """
 
 import logging
@@ -20,6 +21,7 @@ from app.schemas.media import PURPOSES_NEEDING_MODULE, VIDEO_PURPOSES
 from app.services import media_processing as mp
 from app.services.media import discard_assets
 from app.services.storage import StorageError, get_storage
+from app.worker.jobs.recording import LEGACY_VIDEO, enqueue_captions
 from app.worker.runner import JobCancelled, JobContext, JobError, handler, holds_job, open_session
 
 logger = logging.getLogger(__name__)
@@ -170,13 +172,16 @@ def _attach(db: Session, asset: MediaAsset, purpose: str | None, module_id: int 
     replaced, or None when that module or course was deleted meanwhile. The row is locked: two uploads
     for one module finishing together must each see what the other attached.
     """
-    if purpose in PURPOSES_NEEDING_MODULE:
+    if purpose in PURPOSES_NEEDING_MODULE or purpose == LEGACY_VIDEO:
         module = db.get(Module, module_id, with_for_update=True) if module_id else None
         if module is None:
             return None
         if purpose == "module_document":
             return _attach_document(module, asset)
-        return _attach_video(module, asset, VIDEO_PURPOSES[purpose])
+        # A migrated video keeps the module's source (it was made with AI or uploaded before).
+        replaced = _attach_video(module, asset, VIDEO_PURPOSES.get(purpose) or module.source)
+        enqueue_captions(db, module)
+        return replaced
     if purpose == "course_cover" and asset.course_id:
         course = db.get(Course, asset.course_id, with_for_update=True)
         if course is None:
@@ -193,11 +198,12 @@ def _media_failed(db: Session, job: Job, error: str) -> None:
     asset = db.get(MediaAsset, payload.get("asset_id"))
     if asset:
         asset.status, asset.error = "failed", error
-    module_id = payload.get("module_id")
-    if module_id and payload.get("purpose") in VIDEO_PURPOSES:
-        module = db.get(Module, module_id)
-        if module:
-            module.generation_status, module.generation_error = "failed", error
+    module_id, purpose = payload.get("module_id"), payload.get("purpose")
+    module = db.get(Module, module_id) if module_id else None
+    if module and purpose in VIDEO_PURPOSES:
+        module.generation_status, module.generation_error = "failed", error
+    elif module and purpose == LEGACY_VIDEO:
+        module.generation_status = "completed"  # its previous video still plays from where it was
 
 
 def _start_processing(ctx: JobContext) -> AssetSnapshot | None:

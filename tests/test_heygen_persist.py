@@ -341,31 +341,6 @@ def test_trigger_during_a_run_causes_one_more_pass(monkeypatch):
     assert not heygen_persist._run_lock.locked()
 
 
-def test_status_endpoint_triggers_a_copy_when_heygen_finishes(db, monkeypatch):
-    import asyncio
-
-    from app.api.routes import course_wizard
-
-    module = _module(db, "heygen://pending/done")
-    triggered = []
-
-    class FakeResponse:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {"data": {"status": "completed", "video_url": "https://files.heygen.test/done.mp4"}}
-
-    monkeypatch.setenv("HEYGEN_API_KEY", "hg-key")
-    monkeypatch.setattr("httpx.get", lambda *args, **kwargs: FakeResponse())
-    monkeypatch.setattr(course_wizard, "start_background_persist", lambda: triggered.append(True))
-
-    result = asyncio.run(course_wizard.check_video_status(module.id, db))
-
-    assert result["status"] == "completed"
-    assert triggered == [True]
-
-
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg not installed")
 def test_compress_produces_720p_h264_within_the_size_cap(tmp_path):
     src = tmp_path / "src.mp4"

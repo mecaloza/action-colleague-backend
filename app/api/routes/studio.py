@@ -1,6 +1,6 @@
 """
-AI course studio: outline, per-module storyboards, quiz suggestions and slide previews, plus the
-voices and presenters to choose from and the production of each module's video.
+AI course studio: outline, per-module storyboards, quiz suggestions and slide previews, the voices and
+presenters to choose from, the production of each module's video, and camera recordings with their captions.
 """
 
 import tempfile
@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db, require_admin
 from app.api.lookups import course_or_404, module_or_404
 from app.core.config import get_settings
-from app.db.models import Course, Job, Module, User
+from app.db.models import Course, Job, MediaAsset, Module, User
 from app.schemas.courses import CourseDetail
 from app.schemas.media import JobOut
 from app.schemas.studio import (
@@ -29,6 +29,7 @@ from app.schemas.studio import (
     DraftRequest,
     OutlineGenerate,
     QuizGenerate,
+    RecordingCompose,
     RenderRequest,
     SlidePreview,
     Storyboard,
@@ -45,6 +46,7 @@ from app.services.storage import StorageError, get_storage
 from app.services.video.avatar import AvatarError, get_avatar_provider
 from app.services.video.voice import VoiceError, get_voice_provider
 from app.worker import queue
+from app.worker.jobs.recording import enqueue_transcription, voice_available
 
 router = APIRouter(tags=["studio"], dependencies=[Depends(require_admin)])
 
@@ -67,18 +69,13 @@ def _ai_available() -> bool:
     return settings.use_fake_providers or bool(settings.openai_api_key)
 
 
-def _voice_available() -> bool:
-    settings = get_settings()
-    return settings.use_fake_providers or bool(settings.elevenlabs_api_key)
-
-
 def _require_ai() -> None:
     if not _ai_available():
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "La IA no está configurada en el servidor (OPENAI_API_KEY)")
 
 
 def _require_voice() -> None:
-    if not _voice_available():
+    if not voice_available():
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "La narración no está configurada en el servidor (ELEVENLABS_API_KEY)")
 
 
@@ -102,7 +99,7 @@ def capabilities():
     """What the studio can do on this server (the UI hides what isn't configured)."""
     return Capabilities(
         ai=_ai_available(),
-        voice=_voice_available(),
+        voice=voice_available(),
         avatar=get_avatar_provider() is not None,
         storage=_storage_available(),
     )
@@ -332,7 +329,7 @@ def _cached(key: str, load: Callable[[], list]) -> list:
 
 @router.get("/studio/voices", response_model=list[VoiceOut])
 def list_voices():
-    if not _voice_available():
+    if not voice_available():
         return []
     try:
         voices = _cached("voices", lambda: get_voice_provider().voices())
@@ -344,7 +341,7 @@ def list_voices():
 @router.post("/studio/voices/clone", response_model=VoiceOut, status_code=status.HTTP_201_CREATED)
 async def clone_voice(name: str = Form(min_length=1, max_length=100), file: UploadFile = File(...)):
     """Instant voice clone from a clean sample (1-3 minutes of speech works best)."""
-    if not _voice_available():
+    if not voice_available():
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "La narración no está configurada en el servidor")
     mime = (file.content_type or "").split(";")[0].strip().lower()
     if not (mime.startswith("audio/") or mime in VOICE_SAMPLE_VIDEO_TYPES):
@@ -451,3 +448,39 @@ def render_module(module_id: int, db: Session = Depends(get_db), admin: User = D
     job = _enqueue_render(db, module, admin, _render_choices(module.course))
     db.commit()
     return job_out(job)
+
+
+# ── Recordings and captions ───────────────────────────────────────────
+
+
+@router.post("/modules/{module_id}/recording", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
+def compose_recording(
+    module_id: int, payload: RecordingCompose, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+):
+    """Use a camera recording as the module's video, combined with the admin's slides when a deck is given."""
+    module = module_or_404(db, module_id)
+    # The camera recording (or an uploaded video) is required; the deck is optional.
+    for asset_id, kinds in ((payload.recording_asset_id, {"recording", "video"}), (payload.deck_asset_id, {"deck"})):
+        if asset_id is None:
+            continue
+        asset = db.get(MediaAsset, asset_id)
+        if asset is None or asset.kind not in kinds or asset.course_id not in (None, module.course_id):
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "La grabación o la presentación no son válidas")
+    module.generation_status, module.generation_error = "queued", None
+    job = queue.enqueue(
+        db, "video.compose_recording", payload.model_dump(), course_id=module.course_id, module_id=module.id,
+        created_by=admin.id, dedupe_key=f"recording:{module.id}", commit=False,
+    )
+    db.commit()
+    return job_out(job)
+
+
+@router.post("/modules/{module_id}/transcribe", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
+def transcribe_module(module_id: int, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    """(Re)create the captions of the module's video from its audio."""
+    if not voice_available():
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "La transcripción no está configurada en el servidor")
+    module = module_or_404(db, module_id)
+    if not module.video_asset_id:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "El módulo no tiene video")
+    return job_out(enqueue_transcription(db, module, created_by=admin.id, commit=True))

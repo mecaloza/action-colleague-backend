@@ -49,6 +49,7 @@ class Storage(Protocol):
     def size(self, path: str) -> int | None: ...
     def signed_urls(self, paths: list[str], expires_in: int) -> dict[str, str]: ...
     def delete(self, paths: list[str]) -> None: ...
+    def copy_from(self, source_bucket: str, source_path: str, dest_path: str) -> None: ...
 
 
 class StorageError(RuntimeError):
@@ -180,6 +181,19 @@ class SupabaseStorage:
                 headers=self.headers, json={"prefixes": paths},
             )
 
+    def copy_from(self, source_bucket: str, source_path: str, dest_path: str) -> None:
+        """Server-side copy from another bucket of the project (no download)."""
+        self.ensure_bucket()
+        self._check(
+            self.client.post(
+                f"{self.base}/object/copy",
+                headers=self.headers,
+                json={"bucketId": source_bucket, "sourceKey": source_path, "destinationBucket": self.bucket,
+                      "destinationKey": dest_path},
+            ),
+            "copiar el archivo",
+        )
+
 
 # ── Local storage (development and tests) ─────────────────────────────
 
@@ -245,6 +259,14 @@ class LocalStorage:
     def delete(self, paths: list[str]) -> None:
         for path in paths:
             self.file_path(path).unlink(missing_ok=True)
+
+    def copy_from(self, source_bucket: str, source_path: str, dest_path: str) -> None:
+        source = LocalStorage(self.root, source_bucket, self.public_api_url).file_path(source_path)
+        if not source.exists():
+            raise StorageError("El archivo no existe")
+        dest = self.file_path(dest_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, dest)
 
 
 @lru_cache

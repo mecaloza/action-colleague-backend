@@ -35,9 +35,8 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./local.db"
 
     jwt_secret: str = Field("", validation_alias=AliasChoices("JWT_SECRET", "SECRET_KEY"), repr=False)
-    # 7 days, as before: the deployed frontend calls fetch() directly and never refreshes.
-    # Lowered once every screen goes through the new API client (which refreshes).
-    access_token_minutes: int = 10080
+    # Short-lived: every screen goes through the API client, which refreshes it transparently.
+    access_token_minutes: int = 60
     refresh_token_days: int = 30
 
     # Comma-separated list of allowed browser origins, plus an optional regex (e.g. Vercel previews).

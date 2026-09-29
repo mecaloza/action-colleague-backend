@@ -27,7 +27,7 @@ SUPERSAMPLE = 4  # the bubble's circles are drawn this many times larger, then s
 PRESENTER_HOLD_SECONDS = 5  # a presenter clip shorter than the narration freezes on its last frame this long
 ACCENT = (255, 76, 1)
 FFMPEG = ("ffmpeg", "-nostdin", "-y", "-loglevel", "error")
-LOUDNORM = "loudnorm=I=-16:TP=-1.5:LRA=11"
+LOUDNORM = "loudnorm=I=-16:TP=-1.5:LRA=11"  # loudness target of every narration and recording
 FFMPEG_TIMEOUT_SECONDS = 3600
 ERROR_TAIL_BYTES = 800  # of FFmpeg's stderr kept in the error message
 
@@ -215,3 +215,63 @@ def poster(slide: Path, dest: Path) -> tuple[int, int]:
         image.thumbnail((1280, 720))
         image.save(dest, "JPEG", quality=85, optimize=True)
         return image.size
+
+
+# ── Recording with slides ─────────────────────────────────────────────
+
+SLIDE_BACKGROUND = (12, 12, 12)
+SLIDE_MARGIN = 48
+
+
+def _letterbox(page: Path, dest: Path) -> Path:
+    """A deck page fitted inside 1920x1080 on the dark background, never stretched."""
+    with Image.open(page) as image:
+        image = image.convert("RGB")
+        image.thumbnail((WIDTH - 2 * SLIDE_MARGIN, HEIGHT - 2 * SLIDE_MARGIN), Image.LANCZOS)
+        canvas = Image.new("RGB", (WIDTH, HEIGHT), SLIDE_BACKGROUND)
+        canvas.paste(image, ((WIDTH - image.width) // 2, (HEIGHT - image.height) // 2))
+        canvas.save(dest)
+    return dest
+
+
+def slide_segments(timeline: list[tuple[float, int]], page_count: int, duration: float) -> list[tuple[int, float]]:
+    """(page index, seconds on screen) for each slide change; the segments always add up to `duration`."""
+    points = sorted((max(0.0, min(at, duration)), max(0, min(page, page_count - 1))) for at, page in timeline)
+    if not points or points[0][0] > 0:  # the first slide is on screen from the start
+        points.insert(0, (0.0, points[0][1] if points else 0))
+    ends = [at for at, _ in points[1:]] + [duration]  # each slide stays until the next change
+    segments: list[tuple[int, float]] = []
+    for (start, page), end in zip(points, ends):
+        seconds = end - start
+        if segments and (segments[-1][0] == page or seconds < 1 / FPS):
+            # Same page again, or a change shorter than a frame: extend what is already on screen.
+            segments[-1] = (segments[-1][0], segments[-1][1] + seconds)
+        else:
+            segments.append((page, seconds))
+    return segments
+
+
+def compose_recording(
+    pages: list[Path], timeline: list[tuple[float, int]], camera: Path, duration: float, output: Path, work: Path
+) -> None:
+    """Deck pages full screen, switched at the recorded times, with the camera in the bubble."""
+    if not pages:
+        raise ComposeError("La presentación no tiene páginas")
+    segments = slide_segments(timeline, len(pages), duration)
+    letterboxed: dict[int, Path] = {}  # a page shown several times is fitted once
+    cmd = [*FFMPEG]
+    for page, seconds in segments:
+        if page not in letterboxed:
+            letterboxed[page] = _letterbox(pages[page], work / f"page_{page:03d}.png")
+        cmd += ["-loop", "1", "-framerate", str(FPS), "-t", f"{seconds:.3f}", "-i", str(letterboxed[page])]
+    count = len(segments)
+    camera_index = count  # the camera, then its mask and ring, come after the slides
+    mask, ring = _bubble_assets(work)
+    cmd += _bubble_inputs(camera, mask, ring, duration)
+    filters = [f"[{i}:v]scale={WIDTH}:{HEIGHT},setsar=1,fps={FPS},format=yuv420p[p{i}]" for i in range(count)]
+    filters.append("".join(f"[p{i}]" for i in range(count)) + f"concat=n={count}:v=1:a=0[slides]")
+    filters += _bubble_filters("slides", camera_index, duration)
+    filters.append(f"[{camera_index}:a]{LOUDNORM},aresample={SAMPLE_RATE}[aout]")
+    cmd += ["-filter_complex", ";".join(filters), "-map", "[vout]", "-map", "[aout]"]
+    cmd += [*_encode_options(duration), str(output)]
+    run(cmd)

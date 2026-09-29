@@ -10,9 +10,9 @@ from app.services.progress import ordered_modules
 MATERIAL_KINDS = ("document", "deck")
 
 
-def _asset_text(asset: MediaAsset) -> str:
-    """The text extracted from an uploaded document (stored by the media.process job)."""
-    return (asset.meta or {}).get("text", "")
+def _asset_text(asset: MediaAsset | None, key: str = "text") -> str:
+    """A text the worker stored on the asset: `text` of a document or deck (media.process), `transcript` of a video."""
+    return (asset.meta or {}).get(key, "") if asset else ""
 
 
 def materials_text(db: Session, course_id: int) -> str:
@@ -83,9 +83,8 @@ def narration_text(module: Module) -> str:
 
 
 def module_content_for_quiz(db: Session, module: Module) -> str:
-    """Everything a learner studies in the module: reading, narration and the attached document."""
-    parts = [module.content_text or "", narration_text(module)]
+    """Everything a learner studies in the module: reading, narration, the video's transcript and the document."""
+    video = db.get(MediaAsset, module.video_asset_id) if module.video_asset_id else None
     document = db.get(MediaAsset, module.document_asset_id) if module.document_asset_id else None
-    if document:
-        parts.append(_asset_text(document))
+    parts = [module.content_text or "", narration_text(module), _asset_text(video, "transcript"), _asset_text(document)]
     return "\n\n".join(part for part in parts if part and part.strip())
