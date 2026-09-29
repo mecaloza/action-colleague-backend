@@ -40,6 +40,8 @@ from app.services import legacy_data, progress, quiz
 from app.services.course_views import ACTIVE_GENERATION, course_counts, course_detail, course_summary, module_admin
 from app.services.learner_views import course_player_detail
 from app.services.media import MediaResolver, discard_assets
+from app.services.storage import StorageError, get_storage
+from app.worker.jobs import render as render_jobs
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["courses"], dependencies=[Depends(require_admin)])
@@ -66,24 +68,37 @@ def _module_media(module: Module) -> list[str | None]:
 BOUND_PURPOSES = (*PURPOSES_NEEDING_MODULE, "course_cover")  # uploads only their module or course can use
 
 
-def _drop_pending_jobs(db: Session, *conditions) -> list[str]:
+def _drop_pending_jobs(db: Session, *conditions) -> tuple[list[str], list[str]]:
     """
     Delete the jobs that would only work on deleted rows (running ones finish on their own and clean
-    up). Returns the uploads the queued ones were bringing to the module or course: nothing will use
-    them now. A queued course material keeps its job: that file is still wanted.
+    up). Returns the uploads the queued ones were bringing to the module or course (nothing will use
+    them now) and the files a render waiting for its presenter had made so far. A queued course
+    material keeps its job: that file is still wanted.
     """
-    dropped, uploads = [], []
-    rows = db.query(Job.id, Job.type, Job.status, Job.payload).filter(*conditions, Job.status != "running")
-    for job_id, job_type, job_status, payload in rows:
+    dropped, uploads, files = [], [], []
+    rows = db.query(Job.id, Job.type, Job.status, Job.payload, Job.state).filter(*conditions, Job.status != "running")
+    for job_id, job_type, job_status, payload, state in rows:
         if job_type == "media.process" and job_status == "queued":
             if (payload or {}).get("purpose") not in BOUND_PURPOSES:
                 continue
             uploads.append((payload or {}).get("asset_id"))
+        elif job_type == "video.render":
+            files += render_jobs.intermediate_paths(state)
         dropped.append(job_id)
     if dropped:  # a job claimed since the query keeps running: it cleans up after itself
         no_sync = {"synchronize_session": False}
         db.execute(delete(Job).where(Job.id.in_(dropped), Job.status != "running"), execution_options=no_sync)
-    return uploads
+    return uploads, files
+
+
+def _delete_files_quietly(paths: list[str]) -> None:
+    """After the commit, like `_discard_quietly`: a leftover file only costs storage."""
+    if not paths:
+        return
+    try:
+        get_storage().delete(paths)
+    except StorageError as exc:
+        logger.warning("render_files_cleanup_failed", extra={"files": len(paths), "error": str(exc)[:300]})
 
 
 def _discard_quietly(db: Session, asset_ids: list[str | None]) -> None:
@@ -175,9 +190,10 @@ def delete_course(course_id: int, db: Session = Depends(get_db)):
     db.execute(delete(Enrollment).where(Enrollment.course_id == course_id), execution_options=no_sync)
     db.execute(delete(Module).where(Module.course_id == course_id), execution_options=no_sync)
     db.execute(delete(Course).where(Course.id == course_id), execution_options=no_sync)
-    media += _drop_pending_jobs(db, Job.course_id == course_id)
+    uploads, files = _drop_pending_jobs(db, Job.course_id == course_id)
     db.commit()
-    _discard_quietly(db, media)  # its videos, documents, cover and materials, in storage too
+    _discard_quietly(db, media + uploads)  # its videos, documents, cover and materials, in storage too
+    _delete_files_quietly(files)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -279,7 +295,8 @@ def delete_module(module_id: int, db: Session = Depends(get_db)):
         )
     media = _module_media(module)
     _purge_modules(db, [module.id])
-    media += _drop_pending_jobs(db, Job.module_id == module.id)
+    uploads, files = _drop_pending_jobs(db, Job.module_id == module.id)
+    media += uploads
     db.expire(module)  # its evaluation and progress were deleted in bulk
     db.delete(module)
     db.flush()
@@ -288,6 +305,7 @@ def delete_module(module_id: int, db: Session = Depends(get_db)):
     progress.refresh_course_enrollments(db, course)
     db.commit()
     _discard_quietly(db, media)
+    _delete_files_quietly(files)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

@@ -10,12 +10,18 @@ Phases (the state is saved between them, so a restart or a wait resumes where it
   3. compose   — branded slides + narration + bubble -> MP4, poster and WebVTT; attached to the
                  module, replacing its previous video.
 
+The first run freezes what it renders (scenes, voice, presenter and look) in the state, so a retry
+or a wait never mixes two voices or pairs slides with another script's audio. Only the worker that
+still holds the job publishes, into a folder of its own, and only while the module is still an AI
+module: a video the admin uploads meanwhile wins.
+
 Progress goes 5-48% while narrating, 50-70% with the presenter and 75-95% composing.
 """
 
 import logging
 import tempfile
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -31,15 +37,18 @@ from app.services.storage import StorageError, get_storage
 from app.services.video import captions, compose
 from app.services.video.avatar import MAX_ASSET_BYTES, AvatarError, AvatarProvider, get_avatar_provider
 from app.services.video.voice import VoiceError, get_voice_provider
-from app.worker.runner import JobContext, JobError, Reschedule, handler, open_session
+from app.worker.runner import JobCancelled, JobContext, JobError, Reschedule, handler, holds_job, open_session
 
 logger = logging.getLogger(__name__)
 
 PRESENTER_POLL_SECONDS = 30
-MAX_PRESENTER_WAIT_SECONDS = 45 * 60
+MAX_PRESENTER_WAIT_SECONDS = 45 * 60  # at least: a long narration gets PRESENTER_WAIT_FACTOR times its length
+PRESENTER_WAIT_FACTOR = 3
 MAX_PRESENTER_ERRORS = 5
 PRESENTER_BACKGROUND = "#1D1D1D"
 MAX_LOG_ERROR_CHARS = 800  # of an FFmpeg error kept in the log line
+MEDIA_ERROR = "No pudimos procesar el audio o el video. Intenta de nuevo; si sigue fallando, revisa el guion."
+INTERMEDIATE_KEYS = ("master_path", "captions_path", "avatar_path", "narration_mp3_path")
 
 
 @dataclass
@@ -57,38 +66,70 @@ class RenderInput:
     theme: str
 
 
+class _Skip(Exception):
+    """Nothing to render: the module is gone, has the admin's own video now, or this job already published."""
+
+
+def _delete_files(paths: list[str], module_id: int | None) -> None:
+    """Best effort: a leftover file only costs storage."""
+    if not paths:
+        return
+    try:
+        get_storage().delete(paths)
+    except StorageError as exc:
+        logger.warning("render_cleanup_failed", extra={"module_id": module_id, "error": str(exc)[:MAX_LOG_ERROR_CHARS]})
+
+
+def intermediate_paths(state: dict | None) -> list[str]:
+    """The files a render's phases hand to each other, as its job state records them."""
+    state = state or {}
+    paths = [scene["path"] for scene in (state.get("narration") or {}).values() if scene.get("path")]
+    return paths + [state[key] for key in INTERMEDIATE_KEYS if state.get(key)]
+
+
 def _render_failed(db: Session, job: Job, error: str) -> None:
-    """The job gave up: show the failure on the module."""
+    """The job gave up: show the failure on the module (unless it has its own video now) and drop its files."""
     module = db.get(Module, job.module_id) if job.module_id else None
-    if module:
+    if module and module.source == "ai":
         module.generation_status, module.generation_error = "failed", error
+    _delete_files(intermediate_paths(job.state), job.module_id)
 
 
-def _load(ctx: JobContext) -> RenderInput | None:
-    """What the render needs, read up front so no session stays open; marks the module as generating."""
-    settings = get_settings()
+def _read_input(module: Module, choices: dict) -> RenderInput:
+    scenes = studio.scenes_of(module)
+    if not scenes:
+        raise JobError("El módulo no tiene guion; genéralo antes de producir el video.", permanent=True)
+    course = module.course
+    options = {**(course.settings or {}), **choices}  # what the render was asked with wins
+    return RenderInput(
+        course_id=course.id,
+        course_title=course.title,
+        language=course.language or "es",
+        module_label=f"Módulo {module.order}",
+        scenes=scenes,
+        voice_id=options.get("voice_id") or get_settings().elevenlabs_voice_id,
+        avatar_id=options.get("avatar_id") or "",
+        presenter=bool(options.get("presenter", True)),
+        theme=options.get("theme") or "dark",
+    )
+
+
+def _load(ctx: JobContext) -> RenderInput:
+    """What the render works on, frozen in the state by the first run; marks the module as generating."""
     with open_session() as db:
         module = db.get(Module, ctx.module_id)
         if module is None:
-            return None
-        scenes = studio.scenes_of(module)
-        if not scenes:
-            raise JobError("El módulo no tiene guion; genéralo antes de producir el video.")
-        course = module.course
-        options = {**(course.settings or {}), **ctx.payload}
+            raise _Skip("module deleted")
+        if ((module.storyboard or {}).get("render") or {}).get("job_id") == ctx.job_id:
+            raise _Skip("already published")  # run again after its result was saved
+        if module.source != "ai":
+            raise _Skip("module has its own video")
+        frozen = ctx.state.get("input")
+        render = RenderInput(**frozen) if frozen else _read_input(module, ctx.payload)
         module.generation_status, module.generation_error = "generating", None
         db.commit()
-        return RenderInput(
-            course_id=course.id,
-            course_title=course.title,
-            language=course.language or "es",
-            module_label=f"Módulo {module.order}",
-            scenes=scenes,
-            voice_id=options.get("voice_id") or settings.elevenlabs_voice_id,
-            avatar_id=options.get("avatar_id") or "",
-            presenter=bool(options.get("presenter", True)),
-            theme=options.get("theme") or "dark",
-        )
+    ctx.state["input"] = asdict(render)
+    return render
 
 
 def _module_folder(render: RenderInput, ctx: JobContext) -> str:
@@ -96,7 +137,7 @@ def _module_folder(render: RenderInput, ctx: JobContext) -> str:
 
 
 def _intermediate_prefix(render: RenderInput, ctx: JobContext) -> str:
-    """Storage folder of the files the phases hand to each other; `_cleanup` deletes them at the end."""
+    """Storage folder of the files the phases hand to each other; they are deleted at the end."""
     return f"{_module_folder(render, ctx)}/render/{ctx.job_id}"
 
 
@@ -132,7 +173,7 @@ def _speak_scenes(ctx: JobContext, render: RenderInput, work: Path) -> None:
                 next_text=narrations[index + 1] if index + 1 < len(narrations) else "",
             )
         except VoiceError as exc:
-            raise JobError(str(exc)) from exc
+            raise JobError(str(exc), permanent=exc.permanent) from exc
         local = work / _scene_file(index)
         local.write_bytes(speech.audio)
         path = f"{_intermediate_prefix(render, ctx)}/{_scene_file(index)}"
@@ -175,6 +216,8 @@ def _narrate(ctx: JobContext, render: RenderInput, work: Path) -> None:
         lengths=narration.lengths,
         total=narration.total,
     )
+    for scene in done.values():
+        scene.pop("alignment", None)  # only the captions needed it: keep the saved state small
 
 
 def _narration_from_state(ctx: JobContext, work: Path) -> compose.Narration:
@@ -209,21 +252,36 @@ def _plan_presenter(ctx: JobContext, render: RenderInput) -> None:
         ctx.state["phase"] = "compose"
 
 
-def _start_presenter(ctx: JobContext, render: RenderInput, work: Path, provider: AvatarProvider) -> Reschedule:
-    """Send the narration to HeyGen and start waiting for the presenter."""
-    ctx.progress(50, "Preparando al presentador")
+def _hand_over_narration(ctx: JobContext, render: RenderInput, work: Path, provider: AvatarProvider) -> dict:
+    """The narration as HeyGen takes it, handed over once and saved: a retry sends the very same request."""
+    heygen = ctx.state["heygen"]
+    if heygen.get("audio_asset_id") or heygen.get("audio_url"):
+        return heygen
     audio = compose.to_mp3(_narration_from_state(ctx, work).audio, work / "narration.mp3")
-    audio_url = None
-    if audio.stat().st_size > MAX_ASSET_BYTES:  # too big to upload to HeyGen: let it download it
+    if audio.stat().st_size > MAX_ASSET_BYTES:  # too big to upload to HeyGen: it downloads it from a link
         storage = get_storage()
         path = f"{_intermediate_prefix(render, ctx)}/narration.mp3"
         storage.upload_file(path, audio, "audio/mpeg")
-        ctx.state["narration_mp3_path"] = path  # intermediate too: `_cleanup` deletes it
-        audio_url = storage.signed_urls([path], SIGNED_URL_SECONDS).get(path)
-    ctx.state["heygen"].update(
-        video_id=provider.start(audio, render.avatar_id, PRESENTER_BACKGROUND, audio_url),
-        started_at=time.time(),
+        ctx.state["narration_mp3_path"] = path  # an intermediate too: deleted with the others
+        heygen["audio_url"] = storage.signed_urls([path], SIGNED_URL_SECONDS).get(path)
+    else:
+        heygen["audio_asset_id"] = provider.upload_audio(audio)
+    ctx.progress(52, "Preparando al presentador")  # saved before asking for the video
+    return heygen
+
+
+def _start_presenter(ctx: JobContext, render: RenderInput, work: Path, provider: AvatarProvider) -> Reschedule:
+    """Send the narration to HeyGen and start waiting for the presenter."""
+    ctx.progress(50, "Preparando al presentador")
+    heygen = _hand_over_narration(ctx, render, work, provider)
+    video_id = provider.start(
+        render.avatar_id,
+        PRESENTER_BACKGROUND,
+        idempotency_key=f"ac-presenter-{ctx.job_id}",  # this job's one presenter video, however often asked
+        audio_asset_id=heygen.get("audio_asset_id"),
+        audio_url=heygen.get("audio_url"),
     )
+    heygen.update(video_id=video_id, started_at=time.time())
     ctx.progress(55, "El presentador se está grabando")
     return Reschedule(PRESENTER_POLL_SECONDS)
 
@@ -238,7 +296,8 @@ def _poll_presenter(
         _skip_presenter(ctx, f"HeyGen no pudo generar el presentador ({status.error or 'sin detalle'}).")
         return None
     if status.status != "completed" or not status.video_url:
-        if time.time() - heygen["started_at"] > MAX_PRESENTER_WAIT_SECONDS:
+        patience = max(MAX_PRESENTER_WAIT_SECONDS, PRESENTER_WAIT_FACTOR * ctx.state.get("total", 0))
+        if time.time() - heygen["started_at"] > patience:
             _skip_presenter(ctx, "El presentador tardó demasiado en generarse.")
             return None
         ctx.progress(60, "El presentador se está grabando")
@@ -267,6 +326,12 @@ def _presenter(ctx: JobContext, render: RenderInput, work: Path) -> Reschedule |
         if exc.retryable and errors < MAX_PRESENTER_ERRORS:
             return Reschedule(PRESENTER_POLL_SECONDS * errors)
         _skip_presenter(ctx, str(exc))
+        return None
+    except (JobCancelled, StorageError):
+        raise  # the job was lost, or storage is down: the whole render retries
+    except Exception:  # anything else about the presenter must not cost the video
+        logger.exception("presenter_failed", extra={"module_id": ctx.module_id})
+        _skip_presenter(ctx, "No pudimos preparar al presentador.")
         return None
 
 
@@ -335,20 +400,28 @@ def _new_asset(db: Session, render: RenderInput, kind: str, upload: _Upload, **f
 def _publish(ctx: JobContext, render: RenderInput, made: _Composition) -> dict:
     """Store the files, make them the module's video (replacing the previous one) and clean up."""
     ctx.progress(95, "Guardando el video")
-    folder = f"{_module_folder(render, ctx)}/video-{ctx.job_id}"
+    # A folder per run: a worker that lost the job only ever deletes its own copies.
+    folder = f"{_module_folder(render, ctx)}/video-{ctx.job_id}-{uuid.uuid4().hex[:8]}"
     video = _Upload(f"{folder}/video.mp4", "video/mp4", made.video)
     poster = _Upload(f"{folder}/poster.jpg", "image/jpeg", made.poster)
     vtt = _Upload(f"{folder}/captions.vtt", "text/vtt", made.vtt)
+    uploads = (video, poster, vtt)
     storage = get_storage()
-    for upload in (video, poster, vtt):
+    for upload in uploads:
         storage.upload_file(upload.path, upload.local, upload.mime)
+    published = [upload.path for upload in uploads]
 
     seconds = round(made.duration, 2)
     with open_session() as db:
-        module = db.get(Module, ctx.module_id)
-        if module is None:  # deleted while rendering: nothing will show these files
-            _cleanup(ctx, [upload.path for upload in (video, poster, vtt)])
-            return {"skipped": "module deleted"}
+        if not holds_job(db, ctx):  # handed back or reaped while uploading: its next owner publishes
+            db.rollback()
+            _delete_files(published, ctx.module_id)
+            raise JobCancelled(ctx.job_id)
+        module = db.get(Module, ctx.module_id, with_for_update=True)
+        if module is None or module.source != "ai":  # deleted, or the admin gave it their own video meanwhile
+            db.rollback()
+            _delete_files(published + intermediate_paths(ctx.state), ctx.module_id)
+            return {"skipped": "module deleted" if module is None else "module has its own video"}
         replaced = [module.video_asset_id, module.poster_asset_id, module.captions_asset_id]
         video_asset = _new_asset(
             db, render, "video", video, duration_seconds=seconds, width=compose.WIDTH, height=compose.HEIGHT
@@ -363,6 +436,7 @@ def _publish(ctx: JobContext, render: RenderInput, made: _Composition) -> dict:
         module.storyboard = {
             **(module.storyboard or {}),
             "render": {
+                "job_id": ctx.job_id,  # a run of this job after the commit knows it has nothing left to do
                 "voice_id": render.voice_id,
                 "avatar_id": render.avatar_id if made.presenter else "",
                 "warning": ctx.state.get("warning"),
@@ -376,42 +450,30 @@ def _publish(ctx: JobContext, render: RenderInput, made: _Composition) -> dict:
             db.rollback()
             logger.exception("render_replaced_cleanup_failed", extra={"module_id": ctx.module_id})
 
-    _cleanup(ctx)
+    _delete_files(intermediate_paths(ctx.state), ctx.module_id)
     return {"duration_seconds": seconds, "presenter": made.presenter, "warning": ctx.state.get("warning")}
-
-
-INTERMEDIATE_KEYS = ("master_path", "captions_path", "avatar_path", "narration_mp3_path")
-
-
-def _cleanup(ctx: JobContext, extra_paths: list[str] | None = None) -> None:
-    """The intermediate files the phases handed to each other are no longer needed (best effort)."""
-    state = ctx.state
-    paths = [scene["path"] for scene in state.get("narration", {}).values()]
-    paths += [state[key] for key in INTERMEDIATE_KEYS if state.get(key)]
-    try:
-        get_storage().delete(paths + (extra_paths or []))
-    except StorageError as exc:
-        logger.warning("render_cleanup_failed", extra={"module_id": ctx.module_id, "error": str(exc)})
 
 
 @handler("video.render", on_failure=_render_failed)
 def render_module(ctx: JobContext) -> dict | Reschedule:
-    render = _load(ctx)
-    if render is None:
-        return {"skipped": "module deleted"}
+    try:
+        render = _load(ctx)
+    except _Skip as skip:
+        _delete_files(intermediate_paths(ctx.state), ctx.module_id)  # what an earlier run left, if anything
+        return {"skipped": str(skip)}
     with tempfile.TemporaryDirectory(prefix="render-") as tmp:
         work = Path(tmp)
-        if ctx.state.get("phase", "narrate") == "narrate":
-            _narrate(ctx, render, work)
-            _plan_presenter(ctx, render)
-            ctx.progress(48, "Narración lista")
-        if ctx.state["phase"] == "presenter":
-            waiting = _presenter(ctx, render, work)
-            if waiting is not None:
-                return waiting
         try:
+            if ctx.state.get("phase", "narrate") == "narrate":
+                _narrate(ctx, render, work)
+                _plan_presenter(ctx, render)
+                ctx.progress(48, "Narración lista")
+            if ctx.state["phase"] == "presenter":
+                waiting = _presenter(ctx, render, work)
+                if waiting is not None:
+                    return waiting
             made = _compose(ctx, render, work)
         except compose.ComposeError as exc:
             logger.error("compose_failed", extra={"module_id": ctx.module_id, "error": str(exc)[:MAX_LOG_ERROR_CHARS]})
-            raise JobError("No pudimos componer el video. Intenta de nuevo; si sigue fallando, revisa el guion.") from exc
+            raise JobError(MEDIA_ERROR) from exc
         return _publish(ctx, render, made)

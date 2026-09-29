@@ -141,15 +141,24 @@ class FakeAvatar:
     """Renders a square test pattern as long as the narration, like a presenter would be."""
 
     def __init__(self):
-        self._durations: dict[str, float] = {}
+        self._audio: dict[str, float] = {}  # uploaded narration id -> its duration
+        self._durations: dict[str, float] = {}  # video id -> its duration
+        self._videos: dict[str, str] = {}  # idempotency key -> video id, like HeyGen
 
     def looks(self):
         return [AvatarLook(id="fake-avatar", name="Presentadora de prueba", preview_image_url="", preview_video_url="")]
 
-    def start(self, audio, avatar_id, background, audio_url=None):
-        video_id = uuid.uuid4().hex
-        self._durations[video_id] = _duration(audio)
-        return video_id
+    def upload_audio(self, audio):
+        asset_id = uuid.uuid4().hex
+        self._audio[asset_id] = _duration(audio)
+        return asset_id
+
+    def start(self, avatar_id, background, *, idempotency_key, audio_asset_id=None, audio_url=None):
+        if idempotency_key not in self._videos:
+            video_id = uuid.uuid4().hex
+            self._durations[video_id] = self._audio.get(audio_asset_id or "", FALLBACK_SECONDS)
+            self._videos[idempotency_key] = video_id
+        return self._videos[idempotency_key]
 
     def status(self, video_id):
         return RenderStatus(status="completed", video_url=f"fake://{video_id}")

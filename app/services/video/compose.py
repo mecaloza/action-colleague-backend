@@ -52,6 +52,8 @@ def run(cmd: list[str], timeout: int = FFMPEG_TIMEOUT_SECONDS) -> None:
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or b"")[-ERROR_TAIL_BYTES:].decode(errors="replace")
         raise ComposeError(f"FFmpeg falló: {stderr}") from exc
+    except subprocess.TimeoutExpired as exc:  # subprocess already killed it
+        raise ComposeError(f"FFmpeg no terminó en {timeout} s") from exc
 
 
 def to_wav(src: Path, dest: Path) -> None:

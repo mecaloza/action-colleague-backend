@@ -95,6 +95,7 @@ class ModuleAdmin(BaseModel):
     document: MediaRef | None = None
     duration_seconds: float | None = None
     scene_count: int = 0
+    video_warning: str | None = None  # e.g. the AI video came out without its presenter, and why
     evaluation: EvaluationSummary | None = None
     updated_at: UtcDatetime | None = None
 

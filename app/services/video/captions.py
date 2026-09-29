@@ -96,9 +96,14 @@ def build_cues(words: list[TimedWord]) -> list[Cue]:
     return cues
 
 
+def _escape(text: str) -> str:
+    """Cue text is markup in WebVTT: a literal "<" or "&" must be escaped, or players read a tag."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def to_vtt(words: list[TimedWord]) -> str:
     """The WebVTT file of the words: one numbered cue per `build_cues` entry."""
     blocks = ["WEBVTT", ""]
     for index, (start, end, text) in enumerate(build_cues(words), start=1):
-        blocks += [str(index), f"{_timestamp(start)} --> {_timestamp(end)}", text, ""]
+        blocks += [str(index), f"{_timestamp(start)} --> {_timestamp(end)}", _escape(text), ""]
     return "\n".join(blocks)

@@ -116,7 +116,7 @@ class RenderRequest(BaseModel):
     """Voice, presenter and look for the course's videos (saved as the course defaults)."""
 
     module_ids: list[int] | None = Field(default=None, max_length=50)
-    voice_id: str | None = Field(default=None, max_length=100)
+    voice_id: str | None = Field(default=None, max_length=100, pattern=r"^[A-Za-z0-9_-]+$")  # goes into a URL path
     voice_name: str | None = Field(default=None, max_length=200)
     avatar_id: str | None = Field(default=None, max_length=100)
     avatar_name: str | None = Field(default=None, max_length=200)

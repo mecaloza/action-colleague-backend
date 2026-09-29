@@ -53,6 +53,12 @@ BUSY_WITH_OTHER_REQUEST = "Ya se está generando con otras indicaciones; espera 
 RENDER_JOB_ATTEMPTS = 3  # tries before a render is given up
 MAX_VOICE_SAMPLE_BYTES = 10 * 1024 * 1024
 VOICE_SAMPLE_VIDEO_TYPES = ("video/webm", "video/mp4")  # audio saved as .webm or .mp4 is often typed as video
+SAMPLE_EXTENSIONS = {
+    "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav",
+    "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/aac": ".aac", "audio/ogg": ".ogg", "audio/flac": ".flac",
+    "audio/webm": ".webm", "video/webm": ".webm", "video/mp4": ".mp4",
+}
+RENDER_CHOICES = ("voice_id", "avatar_id", "presenter", "theme")  # the course settings a render is made with
 CATALOG_CACHE_SECONDS = 10 * 60
 
 
@@ -177,16 +183,25 @@ def apply_outline(course_id: int, outline: CourseOutlineIn, db: Session = Depend
 # ── Storyboards ───────────────────────────────────────────────────────
 
 
-def _require_ai_module(module: Module) -> None:
-    """Only AI modules have a storyboard: drafting rewrites the module's reading text, never the admin's own content."""
+def _require_ai_module(module: Module, what: str = "el guion con IA") -> None:
+    """Only AI modules have a storyboard and an AI video: the admin's own content is never replaced."""
     if module.source != "ai":
         raise HTTPException(
-            status.HTTP_409_CONFLICT, f"«{module.title}» tiene su propio contenido; el guion con IA es para módulos creados con IA"
+            status.HTTP_409_CONFLICT, f"«{module.title}» tiene su propio contenido; {what} es para módulos creados con IA"
         )
+
+
+def _require_no_active(db: Session, dedupe_key: str, message: str) -> None:
+    """The module's script and its video are made by different jobs: one waits for the other to finish."""
+    if queue.active_with_key(db, dedupe_key) is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, message)
 
 
 def _enqueue_draft(db: Session, module: Module, admin: User, feedback: str = "") -> Job:
     """Queue the module's storyboard job; the caller commits (several modules can be queued at once)."""
+    _require_no_active(
+        db, f"render:{module.id}", f"«{module.title}» se está produciendo; espera a que termine para cambiar su guion"
+    )
     job = queue.enqueue(
         db, "ai.module_draft", {"module_id": module.id, "feedback": feedback}, course_id=module.course_id,
         module_id=module.id, created_by=admin.id, dedupe_key=f"draft:{module.id}", max_attempts=AI_JOB_ATTEMPTS,
@@ -231,8 +246,12 @@ def get_storyboard(module_id: int, db: Session = Depends(get_db)):
 @router.put("/modules/{module_id}/storyboard", response_model=Storyboard)
 def save_storyboard(module_id: int, payload: Storyboard, db: Session = Depends(get_db)):
     module = module_or_404(db, module_id)
-    if module.generation_status in ACTIVE_GENERATION:  # the job would overwrite these edits when it finishes
-        raise HTTPException(status.HTTP_409_CONFLICT, "El guion se está generando; edítalo cuando termine")
+    if module.generation_status in ACTIVE_GENERATION:  # the job would overwrite these edits (or render the old script)
+        rendering = queue.active_with_key(db, f"render:{module.id}") is not None
+        message = "El video se está produciendo; edita el guion cuando termine" if rendering else (
+            "El guion se está generando; edítalo cuando termine"
+        )
+        raise HTTPException(status.HTTP_409_CONFLICT, message)
     if not payload.scenes:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "El guion necesita al menos una escena")
     ids = [scene.id for scene in payload.scenes]
@@ -326,16 +345,18 @@ async def clone_voice(name: str = Form(min_length=1, max_length=100), file: Uplo
     """Instant voice clone from a clean sample (1-3 minutes of speech works best)."""
     if not _voice_available():
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "La narración no está configurada en el servidor")
-    mime = (file.content_type or "").split(";")[0]
+    mime = (file.content_type or "").split(";")[0].strip().lower()
     if not (mime.startswith("audio/") or mime in VOICE_SAMPLE_VIDEO_TYPES):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Sube un audio (MP3, WAV, M4A o WEBM)")
+    voice_name = name.strip()
+    if not voice_name:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Escribe un nombre para la voz")
     data = await file.read(MAX_VOICE_SAMPLE_BYTES + 1)  # one byte more tells "too big" from "just fits"
     if len(data) > MAX_VOICE_SAMPLE_BYTES:
         raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "La muestra supera los 10 MB")
-    voice_name = name.strip()
     with tempfile.TemporaryDirectory() as tmp:
-        # Only the name's last part: a client-sent "../x" must not write outside the folder.
-        sample = Path(tmp) / (Path(file.filename or "").name or "muestra")
+        # A name of our own: the client's file name ("..", 300 characters...) never reaches the disk.
+        sample = Path(tmp) / f"muestra{SAMPLE_EXTENSIONS.get(mime, '')}"
         sample.write_bytes(data)
         try:
             # A slow upload to ElevenLabs must not block the server's event loop.
@@ -361,33 +382,56 @@ def list_avatars():
 # ── Video production ──────────────────────────────────────────────────
 
 
-def _enqueue_render(db: Session, module: Module, admin: User) -> Job:
+def _render_choices(course: Course) -> dict:
+    """What the course's videos are made with (voice, presenter, look): travels with each render job."""
+    settings = course.settings or {}
+    return {key: settings[key] for key in RENDER_CHOICES if key in settings}
+
+
+def _enqueue_render(db: Session, module: Module, admin: User, choices: dict) -> Job:
     """Queue the module's video job; the caller commits (several modules can be queued at once)."""
+    _require_ai_module(module, "el video con IA")
     if not studio.scenes_of(module):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"«{module.title}» no tiene guion todavía")
-    module.generation_status, module.generation_error = "queued", None
-    return queue.enqueue(
-        db, "video.render", {}, course_id=module.course_id, module_id=module.id, created_by=admin.id,
+    _require_no_active(
+        db, f"draft:{module.id}", f"«{module.title}» se está escribiendo; espera a que termine para producir su video"
+    )
+    job = queue.enqueue(
+        db, "video.render", choices, course_id=module.course_id, module_id=module.id, created_by=admin.id,
         dedupe_key=f"render:{module.id}", max_attempts=RENDER_JOB_ATTEMPTS, commit=False,
     )
+    _same_request(job, choices)
+    if job.status == "queued":  # one already running keeps showing "generating"
+        module.generation_status, module.generation_error = "queued", None
+    return job
+
+
+def _modules_to_render(course: Course, module_ids: list[int] | None) -> list[Module]:
+    """The requested modules, or (without a list) every AI module that has a script."""
+    modules = ordered_modules(course)
+    if module_ids is None:
+        return [module for module in modules if module.source == "ai" and studio.scenes_of(module)]
+    wanted = set(module_ids)
+    selected = [module for module in modules if module.id in wanted]
+    if len(selected) != len(wanted):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Algún módulo no pertenece a este curso")
+    return selected
 
 
 @router.post("/courses/{course_id}/render", response_model=list[JobOut], status_code=status.HTTP_202_ACCEPTED)
 def render_course(
     course_id: int, payload: RenderRequest, db: Session = Depends(get_db), admin: User = Depends(require_admin)
 ):
-    """Produce the videos of the course's drafted modules with the chosen voice and presenter."""
+    """Produce the videos of the course's AI modules with the chosen voice and presenter."""
     _require_voice()
     course = course_or_404(db, course_id)
     choices = payload.model_dump(exclude_none=True, exclude={"module_ids"})
     course.settings = {**(course.settings or {}), **choices}
-    modules = [module for module in ordered_modules(course) if studio.scenes_of(module)]
-    if payload.module_ids is not None:
-        wanted = set(payload.module_ids)
-        modules = [module for module in modules if module.id in wanted]
+    modules = _modules_to_render(course, payload.module_ids)
     if not modules:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Ningún módulo tiene guion todavía")
-    jobs = [_enqueue_render(db, module, admin) for module in modules]
+    render_choices = _render_choices(course)
+    jobs = [_enqueue_render(db, module, admin, render_choices) for module in modules]
     db.commit()
     return [job_out(job) for job in jobs]
 
@@ -397,6 +441,6 @@ def render_module(module_id: int, db: Session = Depends(get_db), admin: User = D
     """Produce (or re-produce after edits) one module's video with the course's voice and presenter."""
     _require_voice()
     module = module_or_404(db, module_id)
-    job = _enqueue_render(db, module, admin)
+    job = _enqueue_render(db, module, admin, _render_choices(module.course))
     db.commit()
     return job_out(job)

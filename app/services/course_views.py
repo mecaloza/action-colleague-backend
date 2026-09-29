@@ -102,6 +102,7 @@ def module_admin(module: Module, media: MediaResolver, evaluation: Evaluation | 
         document=media.document(module),
         duration_seconds=module.duration_seconds,
         scene_count=len(storyboard.get("scenes", [])),
+        video_warning=(storyboard.get("render") or {}).get("warning") if module.source == "ai" else None,
         evaluation=(
             EvaluationSummary(
                 question_count=len(questions),

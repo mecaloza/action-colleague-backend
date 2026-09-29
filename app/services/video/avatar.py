@@ -3,16 +3,17 @@ AI presenter with HeyGen API v3.
 
 HeyGen never lays out the video: it only animates an avatar lip-synced to OUR narration (the same
 master audio the final video uses), rendered square at 720p. The composer crops it into a bubble.
-Requests carry an Idempotency-Key derived from (audio, avatar, engine), so retries never pay twice.
+The narration is uploaded once and the video request carries an Idempotency-Key chosen by the
+render job, so a retried request never pays twice.
 """
 
-import hashlib
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import quote
 
 import httpx
 
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 API = "https://api.heygen.com"
 MAX_ASSET_BYTES = 32 * 1024 * 1024  # HeyGen's upload limit; bigger narrations go by URL
-CHUNK_BYTES = 1024 * 1024  # when hashing or downloading a file
+CHUNK_BYTES = 1024 * 1024  # when downloading a file
 REQUEST_TIMEOUT_SECONDS = 60
 TRANSFER_TIMEOUT_SECONDS = 600  # uploading the narration, downloading the finished video
 LOOKS_PAGE_SIZE = 50
@@ -59,19 +60,19 @@ class RenderStatus:
 
 class AvatarProvider(Protocol):
     def looks(self) -> list[AvatarLook]: ...
-    def start(self, audio: Path, avatar_id: str, background: str, audio_url: str | None = None) -> str: ...
+    def upload_audio(self, audio: Path) -> str: ...
+    def start(
+        self, avatar_id: str, background: str, *, idempotency_key: str,
+        audio_asset_id: str | None = None, audio_url: str | None = None,
+    ) -> str: ...
     def status(self, video_id: str) -> RenderStatus: ...
     def download(self, url: str, dest: Path) -> None: ...
 
 
-def idempotency_key(audio: Path, avatar_id: str, engine: str) -> str:
-    """The same narration, avatar and engine always give the same key."""
-    digest = hashlib.sha256()
-    with audio.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(CHUNK_BYTES), b""):
-            digest.update(chunk)
-    digest.update(f"|{avatar_id}|{engine}".encode())
-    return f"ac-presenter-{digest.hexdigest()[:48]}"
+def _unexpected(action: str) -> AvatarError:
+    """A response we can't read (not JSON, or missing what we need): maybe a hiccup, so worth a retry."""
+    logger.error("heygen_unexpected_response", extra={"action": action})
+    return AvatarError(f"HeyGen respondió algo inesperado al {action}.", retryable=True)
 
 
 def _avatar_look(item: dict) -> AvatarLook:
@@ -93,10 +94,10 @@ class HeyGen:
     @staticmethod
     @contextmanager
     def _network(action: str):
-        """A dropped connection or timeout is worth a retry, like a 5xx."""
+        """A dropped connection, timeout, redirect loop or garbled body is worth a retry, like a 5xx."""
         try:
             yield
-        except httpx.TransportError as exc:
+        except httpx.RequestError as exc:
             logger.warning("heygen_unreachable", extra={"action": action, "error_type": type(exc).__name__})
             raise AvatarError(f"No pudimos conectar con HeyGen al {action}.", retryable=True) from exc
 
@@ -114,9 +115,25 @@ class HeyGen:
         return response
 
     @staticmethod
-    def _data(response: httpx.Response) -> dict:
-        body = response.json()
-        return body.get("data", body)
+    def _body(response: httpx.Response, action: str) -> dict:
+        """The JSON object of a response."""
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise _unexpected(action) from exc
+        if not isinstance(body, dict):
+            raise _unexpected(action)
+        return body
+
+    @classmethod
+    def _field(cls, response: httpx.Response, key: str, action: str) -> str:
+        """A required text field of the response's `data` object (or of the body itself)."""
+        body = cls._body(response, action)
+        data = body.get("data", body)
+        value = data.get(key) if isinstance(data, dict) else None
+        if not isinstance(value, str) or not value:
+            raise _unexpected(action)
+        return value
 
     def _looks_page(self, token: str | None) -> dict:
         params: dict = {"ownership": "public", "avatar_type": "studio_avatar", "limit": LOOKS_PAGE_SIZE}
@@ -124,7 +141,7 @@ class HeyGen:
             params["token"] = token
         with self._network("listar los avatares"):
             response = self.client.get(f"{API}/v3/avatars/looks", headers=self.headers, params=params)
-        return self._check(response, "listar los avatares").json()
+        return self._body(self._check(response, "listar los avatares"), "listar los avatares")
 
     def _supports_engine(self, look: dict) -> bool:
         engines = look.get("supported_api_engines") or []
@@ -135,13 +152,15 @@ class HeyGen:
         token = None
         for _ in range(MAX_LOOK_PAGES):
             page = self._looks_page(token)
-            looks += [_avatar_look(item) for item in page.get("data") or [] if self._supports_engine(item)]
+            items = [item for item in page.get("data") or [] if isinstance(item, dict) and item.get("id")]
+            looks += [_avatar_look(item) for item in items if self._supports_engine(item)]
             token = page.get("next_token") if page.get("has_more") else None
             if not token:
                 break
         return looks
 
-    def _upload_audio(self, audio: Path) -> str:
+    def upload_audio(self, audio: Path) -> str:
+        """Upload the narration (up to MAX_ASSET_BYTES) and return its asset id."""
         with audio.open("rb") as fh, self._network("subir la narración"):
             response = self._check(
                 self.client.post(
@@ -152,9 +171,13 @@ class HeyGen:
                 ),
                 "subir la narración",
             )
-        return self._data(response)["asset_id"]
+        return self._field(response, "asset_id", "subir la narración")
 
-    def start(self, audio: Path, avatar_id: str, background: str, audio_url: str | None = None) -> str:
+    def start(
+        self, avatar_id: str, background: str, *, idempotency_key: str,
+        audio_asset_id: str | None = None, audio_url: str | None = None,
+    ) -> str:
+        """Ask for the presenter video with an uploaded narration (or one HeyGen downloads from `audio_url`)."""
         body: dict = {
             "type": "avatar",
             "avatar_id": avatar_id,
@@ -165,34 +188,40 @@ class HeyGen:
             "output_format": "mp4",
             "engine": {"type": self.engine},
         }
-        if audio_url and audio.stat().st_size > MAX_ASSET_BYTES:
-            body["audio_url"] = audio_url  # too big to upload: HeyGen downloads it from the link
+        if audio_asset_id:
+            body["audio_asset_id"] = audio_asset_id
         else:
-            body["audio_asset_id"] = self._upload_audio(audio)
-        with self._network("crear el video del presentador"):
+            body["audio_url"] = audio_url  # too big to upload: HeyGen downloads it from the link
+        action = "crear el video del presentador"
+        with self._network(action):
             response = self.client.post(
-                f"{API}/v3/videos",
-                headers={**self.headers, "Idempotency-Key": idempotency_key(audio, avatar_id, self.engine)},
-                json=body,
+                f"{API}/v3/videos", headers={**self.headers, "Idempotency-Key": idempotency_key}, json=body
             )
-        return self._data(self._check(response, "crear el video del presentador"))["video_id"]
+        return self._field(self._check(response, action), "video_id", action)
 
     def status(self, video_id: str) -> RenderStatus:
-        with self._network("consultar el video"):
-            response = self.client.get(f"{API}/v3/videos/{video_id}", headers=self.headers)
-        response = self._check(response, "consultar el video")
-        data = self._data(response)
+        action = "consultar el video"
+        with self._network(action):
+            response = self.client.get(f"{API}/v3/videos/{quote(video_id, safe='')}", headers=self.headers)
+        body = self._body(self._check(response, action), action)
+        data = body.get("data", body)
+        if not isinstance(data, dict):
+            raise _unexpected(action)
         return RenderStatus(
-            status=data.get("status", "processing"),
-            video_url=data.get("video_url"),
+            status=str(data.get("status") or "processing"),
+            video_url=data.get("video_url") or None,
             error=data.get("failure_message") or data.get("failure_code"),
         )
 
     def download(self, url: str, dest: Path) -> None:
-        with self._network("descargar el video del presentador"), self.client.stream(
+        action = "descargar el video del presentador"
+        with self._network(action), self.client.stream(
             "GET", url, follow_redirects=True, timeout=TRANSFER_TIMEOUT_SECONDS
         ) as response:
-            self._check(response, "descargar el video del presentador")
+            if response.is_error:
+                # The link is signed and short-lived: the next status check brings a fresh one.
+                logger.warning("heygen_download_failed", extra={"status": response.status_code})
+                raise AvatarError(f"No pudimos descargar el video del presentador ({response.status_code}).", retryable=True)
             with dest.open("wb") as fh:
                 for chunk in response.iter_bytes(CHUNK_BYTES):
                     fh.write(chunk)

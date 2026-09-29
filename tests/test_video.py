@@ -88,7 +88,8 @@ def test_presenter_bubble_is_round_and_not_stretched(tmp_path, narration, slides
     avatar_source = tmp_path / "narration.mp3"
     compose.to_mp3(narration.audio, avatar_source)
     presenter = FakeAvatar()
-    video_id = presenter.start(avatar_source, "fake-avatar", "#1D1D1D")
+    audio_id = presenter.upload_audio(avatar_source)
+    video_id = presenter.start("fake-avatar", "#1D1D1D", idempotency_key="test", audio_asset_id=audio_id)
     avatar = tmp_path / "presenter.mp4"
     presenter.download(f"fake://{video_id}", avatar)
 

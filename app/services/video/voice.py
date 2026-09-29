@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import quote
 
 import httpx
 
@@ -32,7 +33,14 @@ VOICE_SETTINGS = {"stability": 0.5, "similarity_boost": 0.75, "style": 0.0, "use
 
 
 class VoiceError(RuntimeError):
-    """A narration or voice request failed; the message can be shown to the admin."""
+    """A narration or voice request failed; the message can be shown to the admin.
+
+    `permanent`: retrying can't help (bad key, no quota, a voice that no longer exists, a rejected request).
+    """
+
+    def __init__(self, message: str, permanent: bool = False):
+        super().__init__(message)
+        self.permanent = permanent
 
 
 @dataclass
@@ -105,15 +113,20 @@ class ElevenLabs:
 
     def _check(self, response: httpx.Response, action: str) -> httpx.Response:
         if response.is_error:
-            detail = response.text[:LOG_DETAIL_CHARS]
-            logger.error("elevenlabs_error", extra={"action": action, "status": response.status_code, "detail": detail})
-            if response.status_code == 401:
-                raise VoiceError("La API key de ElevenLabs no es válida.")
-            if response.status_code == 429:
-                raise VoiceError("ElevenLabs está limitando las solicitudes; se reintentará en unos minutos.")
-            if response.status_code == 422 and "voice" in detail.lower():
-                raise VoiceError("La voz elegida ya no está disponible en ElevenLabs; elige otra.")
-            raise VoiceError(f"ElevenLabs respondió {response.status_code} al {action}.")
+            status, detail = response.status_code, response.text[:LOG_DETAIL_CHARS]
+            logger.error("elevenlabs_error", extra={"action": action, "status": status, "detail": detail})
+            reason = detail.lower()
+            if status != 429 and "quota" in reason:  # ElevenLabs answers 401 "quota_exceeded" when the credits run out
+                raise VoiceError("Se acabaron los créditos de ElevenLabs; recárgalos para seguir narrando.", permanent=True)
+            if status == 401:
+                raise VoiceError("La API key de ElevenLabs no es válida.", permanent=True)
+            if status == 429:
+                raise VoiceError("ElevenLabs está limitando las solicitudes; intenta de nuevo en unos minutos.")
+            if status in (400, 404, 422) and ("voice_not_found" in reason or "voice_id" in reason):
+                raise VoiceError("La voz elegida ya no está disponible en ElevenLabs; elige otra.", permanent=True)
+            # Other 4xx (but timeouts and conflicts): the request itself was rejected, so sending it again won't help.
+            permanent = 400 <= status < 500 and status not in (408, 409)
+            raise VoiceError(f"ElevenLabs respondió {status} al {action}.", permanent=permanent)
         return response
 
     def _request(self, method: str, url: str, action: str, **kwargs) -> httpx.Response:
@@ -144,7 +157,7 @@ class ElevenLabs:
             body["next_text"] = next_text[:CONTEXT_CHARS]
         response = self._request(
             "POST",
-            f"{API}/v1/text-to-speech/{voice_id}/with-timestamps",
+            f"{API}/v1/text-to-speech/{quote(voice_id, safe='')}/with-timestamps",  # never a path of its own
             "generar la narración",
             params={"output_format": AUDIO_FORMAT},
             json=body,
