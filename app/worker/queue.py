@@ -46,7 +46,7 @@ def enqueue(
 ) -> Job:
     """Create a job, or return the active one with the same `dedupe_key`."""
     if dedupe_key:
-        existing = _active_with_key(db, dedupe_key)
+        existing = active_with_key(db, dedupe_key)
         if existing:
             return existing
     job = Job(
@@ -65,7 +65,7 @@ def enqueue(
         with db.begin_nested():  # a unique index allows one active job per dedupe key
             db.add(job)
     except IntegrityError:
-        existing = _active_with_key(db, dedupe_key) if dedupe_key else None
+        existing = active_with_key(db, dedupe_key) if dedupe_key else None
         if existing is None:
             raise
         return existing  # another process enqueued the same work first
@@ -74,7 +74,7 @@ def enqueue(
     return job
 
 
-def _active_with_key(db: Session, dedupe_key: str) -> Job | None:
+def active_with_key(db: Session, dedupe_key: str) -> Job | None:
     return db.query(Job).filter(Job.dedupe_key == dedupe_key, Job.status.in_(ACTIVE)).first()
 
 

@@ -65,6 +65,14 @@ Reglas clave:
 
 Las diapositivas se dibujan en el servidor a 1920×1080 (`app/services/slides`): siete layouts de marca, tipografías libres incluidas (OFL), texto que se ajusta solo y zona reservada para el presentador. `POST /slides/preview` devuelve exactamente la misma imagen que usará el video.
 
+## Video IA (híbrido)
+
+`POST /courses/{id}/render` (o `/modules/{id}/render`) produce cada módulo con guion (trabajo `video.render`):
+
+1. **Narración**: ElevenLabs por escena con tiempos por carácter (la voz elegida o clonada). Las duraciones salen del audio real, unido a nivel de muestra con pausas, y normalizado (`loudnorm`); de los tiempos salen los subtítulos WebVTT.
+2. **Presentador**: HeyGen v3 anima el avatar con **esa misma narración**, en cuadrado 720p. El trabajo se reprograma mientras HeyGen trabaja (no ocupa un worker) y, si HeyGen falla o no está configurado, el video sale igual sin presentador y con un aviso.
+3. **Composición** (FFmpeg): diapositivas de marca a 1920×1080 con transiciones, burbuja circular con aro naranja (recorte cuadrado, nunca estirado), H.264/AAC con `+faststart`, portada y subtítulos. Todo va a Storage privado y reemplaza el video anterior del módulo.
+
 ## Migraciones
 
 La app aplica las migraciones al arrancar (`app.db.migrate`), dentro de una transacción con un lock para que dos contenedores no migren a la vez. También se pueden correr a mano:
@@ -109,8 +117,8 @@ Los tests de migraciones corren contra SQLite y contra un PostgreSQL 16 embebido
 | `WORKER_ENABLED`, `WORKER_CONCURRENCY` | no | Trabajos en segundo plano dentro del API (por defecto sí, 2 a la vez). |
 | `OPENAI_API_KEY`, `OPENAI_MODEL` | para IA | Estudio IA (estructura, guiones y evaluaciones con salidas estructuradas). |
 | `USE_FAKE_PROVIDERS` | no | Solo desarrollo y e2e: IA, voz y presentador falsos y deterministas, sin llaves ni red. |
-| `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | para voz | Narración. |
-| `HEYGEN_API_KEY` | para avatar | Presentador IA. |
+| `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL` | para voz | Narración (voz por defecto y modelo `eleven_multilingual_v2`). |
+| `HEYGEN_API_KEY`, `HEYGEN_ENGINE` | para presentador | Presentador IA con la API v3 (`avatar_iii` por costo; `avatar_iv`/`avatar_v` más naturales). Sin llave, los videos salen sin presentador. |
 
 El entorno se detecta con `RAILWAY_ENVIRONMENT_NAME` (Railway lo define) o `ENVIRONMENT`.
 

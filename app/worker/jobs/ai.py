@@ -132,7 +132,8 @@ def draft_module(ctx: JobContext) -> dict:
             return {"skipped": "module deleted"}
         if module.source != "ai":  # a video or document was attached while the model wrote
             return {"skipped": "not an AI module"}
-        module.storyboard = {"outline": entry.model_dump(), "scenes": scenes}
+        render = (module.storyboard or {}).get("render")  # about the video still attached: it stays
+        module.storyboard = {"outline": entry.model_dump(), "scenes": scenes, **({"render": render} if render else {})}
         module.content_text = designer.plain_markdown(draft.reading_summary)
         # Ready to produce the video; the storyboard can be reviewed and edited first.
         module.generation_status, module.generation_error = "pending", None

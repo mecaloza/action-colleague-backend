@@ -154,7 +154,7 @@ def test_canceled_jobs_are_not_claimed(db):
 
 def test_concurrent_enqueues_with_the_same_key_create_one_job(db, session_factory, monkeypatch):
     # The other process wins the race after our check but before our insert.
-    real_lookup = queue._active_with_key
+    real_lookup = queue.active_with_key
     calls = []
 
     def lookup_after_race(session, key):
@@ -165,7 +165,7 @@ def test_concurrent_enqueues_with_the_same_key_create_one_job(db, session_factor
             return None
         return real_lookup(session, key)
 
-    monkeypatch.setattr(queue, "_active_with_key", lookup_after_race)
+    monkeypatch.setattr(queue, "active_with_key", lookup_after_race)
     job = queue.enqueue(db, "demo", dedupe_key="same")
 
     assert db.query(Job).count() == 1 and job.dedupe_key == "same"

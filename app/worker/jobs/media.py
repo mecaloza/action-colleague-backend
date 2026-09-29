@@ -13,7 +13,6 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import Course, Job, MediaAsset, Module
@@ -21,7 +20,7 @@ from app.schemas.media import PURPOSES_NEEDING_MODULE, VIDEO_PURPOSES
 from app.services import media_processing as mp
 from app.services.media import discard_assets
 from app.services.storage import StorageError, get_storage
-from app.worker.runner import JobCancelled, JobContext, JobError, handler, open_session
+from app.worker.runner import JobCancelled, JobContext, JobError, handler, holds_job, open_session
 
 logger = logging.getLogger(__name__)
 
@@ -233,15 +232,6 @@ def _process_file(ctx: JobContext, asset: AssetSnapshot) -> dict:
             raise JobError(str(exc), permanent=True) from exc
 
 
-def _holds_job(db: Session, ctx: JobContext) -> bool:
-    """Lock the job row until this transaction ends: a shutdown hand-back or the reaper waits for it."""
-    return db.execute(
-        select(Job.id)
-        .where(Job.id == ctx.job_id, Job.locked_by == ctx.worker_id, Job.status == "running")
-        .with_for_update()
-    ).first() is not None
-
-
 def _delete_files(paths: list[str], asset_id: str) -> None:
     try:
         get_storage().delete(paths)
@@ -258,7 +248,7 @@ def _finish_processing(ctx: JobContext, snapshot: AssetSnapshot, changes: dict) 
     asset_id, purpose = ctx.payload["asset_id"], ctx.payload.get("purpose")
     new_meta = changes.get("meta", {})
     with open_session() as db:
-        if not _holds_job(db, ctx):
+        if not holds_job(db, ctx):
             raise JobCancelled(ctx.job_id)
         asset = db.get(MediaAsset, asset_id)
         if asset is None:

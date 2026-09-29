@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import session as db_session
@@ -95,6 +96,19 @@ class JobContext:
             )
         if not still_ours:
             raise JobCancelled(self.job_id)
+
+
+def holds_job(db: Session, ctx: JobContext) -> bool:
+    """
+    Lock the job row until this transaction ends, if this worker still runs it. A handler saves its
+    result in that same transaction: a shutdown hand-back or the reaper waits for it, and after either
+    one the result belongs to the job's next owner.
+    """
+    return db.execute(
+        select(Job.id)
+        .where(Job.id == ctx.job_id, Job.locked_by == ctx.worker_id, Job.status == "running")
+        .with_for_update()
+    ).first() is not None
 
 
 Handler = Callable[[JobContext], dict | Reschedule | None]

@@ -134,26 +134,29 @@ class SupabaseStorage:
     def upload_file(self, path: str, file_path: Path, content_type: str) -> None:
         self.ensure_bucket()
         with file_path.open("rb") as fh:
-            self._check(
-                self.client.post(
-                    f"{self.base}/object/{self._object(path)}",
-                    headers={**self.headers, "content-type": content_type, "x-upsert": "true", "cache-control": "max-age=31536000"},
-                    content=fh,
-                    timeout=TRANSFER_TIMEOUT_SECONDS,
-                ),
-                "subir el archivo",
+            self._send(
+                "POST", f"{self.base}/object/{self._object(path)}", "subir el archivo",
+                headers={**self.headers, "content-type": content_type, "x-upsert": "true", "cache-control": "max-age=31536000"},
+                content=fh,
+                timeout=TRANSFER_TIMEOUT_SECONDS,
             )
 
     def download_file(self, path: str, dest: Path) -> None:
         url = f"{self.base}/object/authenticated/{self._object(path)}"
-        with self.client.stream("GET", url, headers=self.headers, timeout=TRANSFER_TIMEOUT_SECONDS) as response:
-            self._check(response, "descargar el archivo")
-            with dest.open("wb") as fh:
-                for chunk in response.iter_bytes(DOWNLOAD_CHUNK_BYTES):
-                    fh.write(chunk)
+        try:
+            with self.client.stream("GET", url, headers=self.headers, timeout=TRANSFER_TIMEOUT_SECONDS) as response:
+                self._check(response, "descargar el archivo")
+                with dest.open("wb") as fh:
+                    for chunk in response.iter_bytes(DOWNLOAD_CHUNK_BYTES):
+                        fh.write(chunk)
+        except httpx.HTTPError as exc:  # a dropped connection mid-file, like an HTTP error, is the storage's
+            raise StorageError("Storage no pudo descargar el archivo (sin conexión)") from exc
 
     def size(self, path: str) -> int | None:
-        response = self.client.head(f"{self.base}/object/authenticated/{self._object(path)}", headers=self.headers)
+        try:
+            response = self.client.head(f"{self.base}/object/authenticated/{self._object(path)}", headers=self.headers)
+        except httpx.HTTPError as exc:
+            raise StorageError("Storage no pudo revisar el archivo (sin conexión)") from exc
         length = response.headers.get("content-length", "")
         return int(length) if response.status_code == 200 and length.isdigit() else None
 

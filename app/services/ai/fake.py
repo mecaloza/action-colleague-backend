@@ -1,13 +1,22 @@
 """
-Offline stand-in for the LLM (tests, local development and e2e without API keys).
+Offline stand-ins for the AI providers (tests, local development and e2e without API keys).
 
-It produces schema-valid, deterministic content instantly, so the whole studio flow — outline,
-storyboard, quiz — runs end to end with no network.
+They produce schema-valid, deterministic content quickly, so every flow — outline, storyboard,
+quiz, narration, presenter, rendering — runs end to end with real FFmpeg and no network.
 """
 
 import re
+import subprocess
+import tempfile
+import uuid
+from pathlib import Path
 
 from app.services.ai import designer
+from app.services.video.avatar import AvatarLook, RenderStatus
+from app.services.video.voice import Alignment, Speech, VoiceInfo, Word
+
+SECONDS_PER_WORD = 0.32
+FALLBACK_SECONDS = 5.0  # length of a fake clip when it can't be measured
 
 
 def _topic(text: str) -> str:
@@ -88,3 +97,76 @@ class FakeLLM:
             designer.QuestionDraft(**{**empty, "type": "fill_blank", "prompt": "Hay que trabajar con _____.",
                                       "answers": ["cuidado"], "hint": "c...", "explanation": "Con cuidado."}),
         ]
+
+
+def _tone(seconds: float, dest: Path) -> None:
+    subprocess.run(
+        ["ffmpeg", "-nostdin", "-y", "-v", "error", "-f", "lavfi", "-i", f"sine=frequency=220:duration={seconds:.2f}",
+         "-ar", "44100", "-ac", "1", "-b:a", "96k", str(dest)],
+        check=True, capture_output=True,
+    )
+
+
+def _duration(path: Path) -> float:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    return float(out or FALLBACK_SECONDS)
+
+
+class FakeVoice:
+    def voices(self):
+        return [VoiceInfo(id="fake-voice-es", name="Voz de prueba", gender="female", language="es", category="premade")]
+
+    def speak(self, text, voice_id, previous_text="", next_text=""):
+        seconds = max(1.0, len(text.split()) * SECONDS_PER_WORD)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "speech.mp3"
+            _tone(seconds, path)
+            audio = path.read_bytes()
+        step = seconds / max(len(text), 1)  # every character gets the same slice of the clip
+        chars = range(len(text))
+        alignment = Alignment(list(text), [i * step for i in chars], [(i + 1) * step for i in chars])
+        return Speech(audio, alignment)
+
+    def clone(self, name, sample, mime_type):
+        return f"fake-clone-{uuid.uuid4().hex[:8]}"
+
+    def transcribe(self, media_url, language):
+        return [Word("Transcripción", 0.0, 0.8), Word("de", 0.8, 1.0), Word("prueba.", 1.0, 1.6)]
+
+
+class FakeAvatar:
+    """Renders a square test pattern as long as the narration, like a presenter would be."""
+
+    def __init__(self):
+        self._audio: dict[str, float] = {}  # uploaded narration id -> its duration
+        self._durations: dict[str, float] = {}  # video id -> its duration
+        self._videos: dict[str, str] = {}  # idempotency key -> video id, like HeyGen
+
+    def looks(self):
+        return [AvatarLook(id="fake-avatar", name="Presentadora de prueba", preview_image_url="", preview_video_url="")]
+
+    def upload_audio(self, audio):
+        asset_id = uuid.uuid4().hex
+        self._audio[asset_id] = _duration(audio)
+        return asset_id
+
+    def start(self, avatar_id, background, *, idempotency_key, audio_asset_id=None, audio_url=None):
+        if idempotency_key not in self._videos:
+            video_id = uuid.uuid4().hex
+            self._durations[video_id] = self._audio.get(audio_asset_id or "", FALLBACK_SECONDS)
+            self._videos[idempotency_key] = video_id
+        return self._videos[idempotency_key]
+
+    def status(self, video_id):
+        return RenderStatus(status="completed", video_url=f"fake://{video_id}")
+
+    def download(self, url, dest):
+        duration = self._durations.get(url.removeprefix("fake://"), FALLBACK_SECONDS)
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-y", "-v", "error", "-f", "lavfi", "-i",
+             f"testsrc2=size=720x720:rate=25:duration={duration:.2f}", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(dest)],
+            check=True, capture_output=True,
+        )
