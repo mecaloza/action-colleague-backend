@@ -21,11 +21,16 @@ from routers import (
     users,
     videos,
 )
+from utils.heygen_persist import start_background_sweeps
+from utils.json_logging import configure_logging
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    configure_logging()
     create_tables()
+    # HeyGen retires its v1/v2 API on 2026-10-31: copy finished videos to Storage now.
+    start_background_sweeps()
     yield
 
 
