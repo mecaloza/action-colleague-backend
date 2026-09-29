@@ -70,7 +70,10 @@ class Settings(BaseSettings):
     use_fake_providers: bool = False
     elevenlabs_api_key: str = Field("", repr=False)
     elevenlabs_voice_id: str = "onwK4e9ZLuTAKqWnGpdt"
+    elevenlabs_model: str = "eleven_multilingual_v2"  # es / en / pt with the same voice
     heygen_api_key: str = Field("", repr=False)
+    # HeyGen v3 avatar engine: avatar_iii is the most affordable; avatar_iv / avatar_v look more natural.
+    heygen_engine: str = "avatar_iii"
 
     @field_validator("database_url")
     @classmethod

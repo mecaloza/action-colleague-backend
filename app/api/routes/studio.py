@@ -1,8 +1,16 @@
-"""AI course studio: outline, per-module storyboards, quiz suggestions and slide previews."""
+"""
+AI course studio: outline, per-module storyboards, quiz suggestions and slide previews, plus the
+voices and presenters to choose from and the production of each module's video.
+"""
 
+import tempfile
 import threading
+import time
+from collections.abc import Callable
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_admin
@@ -14,15 +22,18 @@ from app.schemas.media import JobOut
 from app.schemas.studio import (
     MAX_MODULES,
     MAX_TITLE_CHARS,
+    AvatarOut,
     Capabilities,
     CourseOutline,
     CourseOutlineIn,
     DraftRequest,
     OutlineGenerate,
     QuizGenerate,
+    RenderRequest,
     SlidePreview,
     Storyboard,
     StoryboardRegenerate,
+    VoiceOut,
 )
 from app.services import studio
 from app.services.course_views import ACTIVE_GENERATION, course_detail
@@ -31,12 +42,18 @@ from app.services.progress import ordered_modules, refresh_course_enrollments
 from app.services.slides.render import render_png
 from app.services.slides.spec import SlideContext
 from app.services.storage import StorageError, get_storage
+from app.services.video.avatar import AvatarError, get_avatar_provider
+from app.services.video.voice import VoiceError, get_voice_provider
 from app.worker import queue
 
 router = APIRouter(tags=["studio"], dependencies=[Depends(require_admin)])
 
 AI_JOB_ATTEMPTS = 2  # a second try covers a transient provider error
 BUSY_WITH_OTHER_REQUEST = "Ya se está generando con otras indicaciones; espera a que termine para pedir cambios."
+RENDER_JOB_ATTEMPTS = 3  # tries before a render is given up
+MAX_VOICE_SAMPLE_BYTES = 10 * 1024 * 1024
+VOICE_SAMPLE_VIDEO_TYPES = ("video/webm", "video/mp4")  # audio saved as .webm or .mp4 is often typed as video
+CATALOG_CACHE_SECONDS = 10 * 60
 
 
 def _ai_available() -> bool:
@@ -44,9 +61,19 @@ def _ai_available() -> bool:
     return settings.use_fake_providers or bool(settings.openai_api_key)
 
 
+def _voice_available() -> bool:
+    settings = get_settings()
+    return settings.use_fake_providers or bool(settings.elevenlabs_api_key)
+
+
 def _require_ai() -> None:
     if not _ai_available():
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "La IA no está configurada en el servidor (OPENAI_API_KEY)")
+
+
+def _require_voice() -> None:
+    if not _voice_available():
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "La narración no está configurada en el servidor (ELEVENLABS_API_KEY)")
 
 
 def _same_request(job: Job, payload: dict) -> Job:
@@ -67,7 +94,12 @@ def _storage_available() -> bool:
 @router.get("/studio/capabilities", response_model=Capabilities)
 def capabilities():
     """What the studio can do on this server (the UI hides what isn't configured)."""
-    return Capabilities(ai=_ai_available(), voice=False, avatar=False, storage=_storage_available())
+    return Capabilities(
+        ai=_ai_available(),
+        voice=_voice_available(),
+        avatar=get_avatar_provider() is not None,
+        storage=_storage_available(),
+    )
 
 
 # ── Outline ───────────────────────────────────────────────────────────
@@ -261,3 +293,110 @@ def preview_slide(payload: SlidePreview):
     finally:
         _PREVIEW_SLOTS.release()
     return Response(png, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+# ── Voices and presenters ─────────────────────────────────────────────
+
+_catalog_cache: dict[str, tuple[float, list]] = {}  # catalog name -> (expires at, catalog)
+
+
+def _cached(key: str, load: Callable[[], list]) -> list:
+    """Provider catalogs change rarely and are slow to list: keep them for a few minutes."""
+    cached = _catalog_cache.get(key)
+    if cached and cached[0] > time.monotonic():
+        return cached[1]
+    value = load()
+    _catalog_cache[key] = (time.monotonic() + CATALOG_CACHE_SECONDS, value)
+    return value
+
+
+@router.get("/studio/voices", response_model=list[VoiceOut])
+def list_voices():
+    if not _voice_available():
+        return []
+    try:
+        voices = _cached("voices", lambda: get_voice_provider().voices())
+    except VoiceError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    return [VoiceOut(**{field: getattr(voice, field) for field in VoiceOut.model_fields}) for voice in voices]
+
+
+@router.post("/studio/voices/clone", response_model=VoiceOut, status_code=status.HTTP_201_CREATED)
+async def clone_voice(name: str = Form(min_length=1, max_length=100), file: UploadFile = File(...)):
+    """Instant voice clone from a clean sample (1-3 minutes of speech works best)."""
+    if not _voice_available():
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "La narración no está configurada en el servidor")
+    mime = (file.content_type or "").split(";")[0]
+    if not (mime.startswith("audio/") or mime in VOICE_SAMPLE_VIDEO_TYPES):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Sube un audio (MP3, WAV, M4A o WEBM)")
+    data = await file.read(MAX_VOICE_SAMPLE_BYTES + 1)  # one byte more tells "too big" from "just fits"
+    if len(data) > MAX_VOICE_SAMPLE_BYTES:
+        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "La muestra supera los 10 MB")
+    voice_name = name.strip()
+    with tempfile.TemporaryDirectory() as tmp:
+        # Only the name's last part: a client-sent "../x" must not write outside the folder.
+        sample = Path(tmp) / (Path(file.filename or "").name or "muestra")
+        sample.write_bytes(data)
+        try:
+            # A slow upload to ElevenLabs must not block the server's event loop.
+            voice_id = await run_in_threadpool(get_voice_provider().clone, voice_name, sample, mime)
+        except VoiceError as exc:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    _catalog_cache.pop("voices", None)
+    return VoiceOut(id=voice_id, name=voice_name, category="cloned")
+
+
+@router.get("/studio/avatars", response_model=list[AvatarOut])
+def list_avatars():
+    provider = get_avatar_provider()
+    if provider is None:
+        return []
+    try:
+        looks = _cached("avatars", provider.looks)
+    except AvatarError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    return [AvatarOut(**{field: getattr(look, field) for field in AvatarOut.model_fields}) for look in looks]
+
+
+# ── Video production ──────────────────────────────────────────────────
+
+
+def _enqueue_render(db: Session, module: Module, admin: User) -> Job:
+    """Queue the module's video job; the caller commits (several modules can be queued at once)."""
+    if not studio.scenes_of(module):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"«{module.title}» no tiene guion todavía")
+    module.generation_status, module.generation_error = "queued", None
+    return queue.enqueue(
+        db, "video.render", {}, course_id=module.course_id, module_id=module.id, created_by=admin.id,
+        dedupe_key=f"render:{module.id}", max_attempts=RENDER_JOB_ATTEMPTS, commit=False,
+    )
+
+
+@router.post("/courses/{course_id}/render", response_model=list[JobOut], status_code=status.HTTP_202_ACCEPTED)
+def render_course(
+    course_id: int, payload: RenderRequest, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+):
+    """Produce the videos of the course's drafted modules with the chosen voice and presenter."""
+    _require_voice()
+    course = course_or_404(db, course_id)
+    choices = payload.model_dump(exclude_none=True, exclude={"module_ids"})
+    course.settings = {**(course.settings or {}), **choices}
+    modules = [module for module in ordered_modules(course) if studio.scenes_of(module)]
+    if payload.module_ids is not None:
+        wanted = set(payload.module_ids)
+        modules = [module for module in modules if module.id in wanted]
+    if not modules:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Ningún módulo tiene guion todavía")
+    jobs = [_enqueue_render(db, module, admin) for module in modules]
+    db.commit()
+    return [job_out(job) for job in jobs]
+
+
+@router.post("/modules/{module_id}/render", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
+def render_module(module_id: int, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    """Produce (or re-produce after edits) one module's video with the course's voice and presenter."""
+    _require_voice()
+    module = module_or_404(db, module_id)
+    job = _enqueue_render(db, module, admin)
+    db.commit()
+    return job_out(job)

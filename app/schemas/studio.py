@@ -8,16 +8,19 @@ from app.services.slides.spec import Slide
 
 __all__ = [
     "MAX_MODULES",
+    "AvatarOut",
     "Capabilities",
     "CourseOutline",
     "CourseOutlineIn",
     "DraftRequest",
     "OutlineGenerate",
     "QuizGenerate",
+    "RenderRequest",
     "SlidePreview",
     "Storyboard",
     "StoryboardRegenerate",
     "StoryboardScene",
+    "VoiceOut",
 ]
 
 MAX_MODULES = 12  # per course, both when asking the AI for a structure and when approving one
@@ -89,6 +92,36 @@ class SlidePreviewContext(BaseModel):
 class SlidePreview(BaseModel):
     slide: Slide
     context: SlidePreviewContext = Field(default_factory=SlidePreviewContext)
+
+
+class VoiceOut(BaseModel):
+    id: str
+    name: str
+    gender: str = ""
+    accent: str = ""
+    language: str = ""
+    preview_url: str = ""
+    category: str = ""
+
+
+class AvatarOut(BaseModel):
+    id: str
+    name: str
+    preview_image_url: str = ""
+    preview_video_url: str = ""
+    gender: str = ""
+
+
+class RenderRequest(BaseModel):
+    """Voice, presenter and look for the course's videos (saved as the course defaults)."""
+
+    module_ids: list[int] | None = Field(default=None, max_length=50)
+    voice_id: str | None = Field(default=None, max_length=100)
+    voice_name: str | None = Field(default=None, max_length=200)
+    avatar_id: str | None = Field(default=None, max_length=100)
+    avatar_name: str | None = Field(default=None, max_length=200)
+    presenter: bool | None = None
+    theme: Literal["dark", "light"] | None = None
 
 
 class Capabilities(BaseModel):
