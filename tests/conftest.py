@@ -5,6 +5,7 @@ import os
 os.environ["DATABASE_URL"] = "sqlite://"
 os.environ["ENVIRONMENT"] = "test"
 os.environ["WORKER_ENABLED"] = "false"
+os.environ["USE_FAKE_PROVIDERS"] = "true"  # offline AI, voice and presenter
 for key in (
     "HEYGEN_API_KEY",
     "OPENAI_API_KEY",

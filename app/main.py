@@ -14,7 +14,7 @@ from app.api.routes import (
     learn,
     media,
     participants,
-    slides,
+    studio,
     users,
     videos,
 )
@@ -33,10 +33,10 @@ ROUTERS = (
     users,
     dashboard,
     media,
-    # Previous app, replaced in the next releases (AI wizard, manual video upload, slides).
+    studio,
+    # Previous app, replaced in the next releases (AI wizard and manual video upload).
     course_wizard,
     videos,
-    slides,
 )
 
 

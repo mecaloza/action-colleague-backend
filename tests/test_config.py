@@ -7,6 +7,12 @@ from app.core.config import Settings
 from app.core.logging import configure_logging
 
 
+@pytest.fixture(autouse=True)
+def real_providers(monkeypatch):
+    # The test suite runs with fake providers; these tests build production settings.
+    monkeypatch.setenv("USE_FAKE_PROVIDERS", "false")
+
+
 def test_production_requires_a_real_database(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "sqlite:///./x.db")
     monkeypatch.setenv("JWT_SECRET", "y" * 40)
@@ -90,3 +96,11 @@ def test_log_level_is_case_insensitive():
     configure_logging("debug")
     assert logging.getLogger().level == logging.DEBUG
     configure_logging("INFO")
+
+
+def test_fake_providers_are_refused_outside_local_development(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@h:5432/db")
+    monkeypatch.setenv("JWT_SECRET", "y" * 40)
+    monkeypatch.setenv("USE_FAKE_PROVIDERS", "true")
+    with pytest.raises(ValidationError, match="USE_FAKE_PROVIDERS"):
+        Settings(environment="production", _env_file=None)
