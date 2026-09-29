@@ -19,6 +19,7 @@ class MediaRef(BaseModel):
 
 
 MAX_AUDIENCE_CHARS = 500
+MAX_MODULES = 12  # per course, both when asking the AI for a structure and when approving one
 
 
 class CourseSettings(BaseModel):
@@ -29,6 +30,7 @@ class CourseSettings(BaseModel):
     # What the admin asked the AI studio for: kept so the studio can resume and regenerate.
     brief: str = Field(default="", max_length=8000)
     minutes: int = Field(default=20, ge=5, le=240)
+    modules: int | None = Field(default=None, ge=1, le=MAX_MODULES)  # None lets the AI choose
     voice_id: str = Field(default="", max_length=100)
     voice_name: str = Field(default="", max_length=200)
     avatar_id: str = Field(default="", max_length=100)

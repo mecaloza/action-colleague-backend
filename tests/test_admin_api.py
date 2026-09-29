@@ -273,6 +273,17 @@ def test_partial_settings_keep_the_rest(client, admin_headers):
     assert settings["tone"] == "cercano" and settings["voice_id"] == "v1" and settings["presenter"] is False
 
 
+def test_the_requested_module_count_is_kept_with_the_course(client, admin_headers):
+    course = _create_course(client, admin_headers)
+    url = f"/api/v1/courses/{course['id']}"
+    assert course["settings"]["modules"] is None  # the AI chooses unless the brief asked for a number
+
+    assert client.patch(url, headers=admin_headers, json={"settings": {"modules": 4}}).json()["settings"]["modules"] == 4
+    assert client.patch(url, headers=admin_headers, json={"settings": {"tone": "cercano"}}).json()["settings"]["modules"] == 4
+    assert client.patch(url, headers=admin_headers, json={"settings": {"modules": None}}).json()["settings"]["modules"] is None
+    assert client.patch(url, headers=admin_headers, json={"settings": {"modules": 13}}).status_code == 422
+
+
 def test_invalid_questions_get_a_readable_reason(client, admin_headers):
     course = _create_course(client, admin_headers)
     module = client.post(f"/api/v1/courses/{course['id']}/modules", headers=admin_headers, json={"title": "M"}).json()

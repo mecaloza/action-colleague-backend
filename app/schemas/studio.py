@@ -2,7 +2,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, StringConstraints
 
-from app.schemas.courses import MAX_AUDIENCE_CHARS
+from app.schemas.courses import MAX_AUDIENCE_CHARS, MAX_MODULES
 from app.services.ai.designer import MAX_NARRATION_CHARS, MAX_STORYBOARD_SCENES, CourseOutline, OutlineModule
 from app.services.slides.spec import Slide
 
@@ -24,7 +24,6 @@ __all__ = [
     "VoiceOut",
 ]
 
-MAX_MODULES = 12  # per course, both when asking the AI for a structure and when approving one
 MAX_TITLE_CHARS = 300  # size of the course and module title columns
 MAX_OUTLINE_ITEMS = 10  # objectives / key points per list
 
