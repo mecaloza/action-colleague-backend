@@ -7,6 +7,7 @@ import pytest
 from app.db.models import Course, Job, MediaAsset, Module
 from app.services.ai.fake import FakeAvatar, FakeVoice
 from app.services.video import captions, compose
+from app.services.storage import StorageError
 from app.services.video.avatar import AvatarError
 from app.services.video.voice import VoiceError
 from app.worker import queue
@@ -265,3 +266,165 @@ def test_captions_escape_markup():
     words = [captions.TimedWord("Si", 0.0, 0.2), captions.TimedWord("x<y", 0.2, 0.5), captions.TimedWord("&", 0.5, 0.7)]
     vtt = captions.to_vtt(words)
     assert "x&lt;y &amp;" in vtt and "x<y" not in vtt
+
+
+def _module_render(db, module_id: int) -> dict:
+    db.expire_all()
+    return db.get(Module, module_id).storyboard["render"]
+
+
+def test_a_storage_failure_after_heygen_finished_keeps_the_presenter(
+    client, db, admin_headers, ai_module, storage, worker, monkeypatch
+):
+    upload_file, failed = type(storage).upload_file, []
+
+    def flaky_upload(self, path, file_path, content_type):
+        if path.endswith("/presenter.mp4") and not failed:
+            failed.append(path)
+            raise StorageError("Storage no pudo subir el archivo (sin conexión)")
+        return upload_file(self, path, file_path, content_type)
+
+    monkeypatch.setattr(type(storage), "upload_file", flaky_upload)
+    _start_render(client, admin_headers, ai_module)
+    for _ in range(6):
+        _fast_forward(db)
+        worker()
+    assert failed and db.query(Job).one().status == "succeeded"
+    render = _module_render(db, ai_module.id)
+    assert render["avatar_id"] == "fake-avatar" and render["warning"] is None  # retried, presenter kept
+
+
+def test_a_database_hiccup_while_fetching_the_presenter_keeps_it(
+    client, db, admin_headers, ai_module, storage, worker, monkeypatch
+):
+    from sqlalchemy.exc import OperationalError
+
+    from app.worker.runner import JobContext
+
+    progress, failed = JobContext.progress, []
+
+    def flaky_progress(self, percent, step=""):
+        if percent == 70 and not failed:
+            failed.append(percent)
+            raise OperationalError("UPDATE jobs", {}, Exception("server closed the connection"))
+        return progress(self, percent, step)
+
+    monkeypatch.setattr(JobContext, "progress", flaky_progress)
+    _start_render(client, admin_headers, ai_module)
+    for _ in range(6):
+        _fast_forward(db)
+        worker()
+    assert failed and db.query(Job).one().status == "succeeded"
+    render = _module_render(db, ai_module.id)
+    assert render["avatar_id"] == "fake-avatar" and render["warning"] is None
+
+
+def test_a_new_render_waits_for_a_job_that_already_published(client, db, admin_headers, ai_module, storage, worker):
+    _start_render(client, admin_headers, ai_module)
+    _run_until_done(db, worker)
+    job = db.query(Job).one()
+    job.status, job.run_after = "queued", queue.utcnow()  # e.g. handed back by a deploy right after publishing
+    db.commit()
+
+    again = client.post(f"/api/v1/modules/{ai_module.id}/render", headers=admin_headers)
+    assert again.status_code == 409 and "terminando de guardar" in again.json()["detail"]
+    worker()
+    db.expire_all()
+    assert db.get(Module, ai_module.id).generation_status == "completed"
+    assert client.post(f"/api/v1/modules/{ai_module.id}/render", headers=admin_headers).status_code == 202
+
+
+def test_a_retry_renders_the_script_it_started_with(client, db, admin_headers, ai_module, storage, worker, monkeypatch):
+    speak, spoken, fail = FakeVoice.speak, [], [True]
+
+    def flaky_speak(self, text, voice_id, previous_text="", next_text=""):
+        if "Hay dos reglas" in text and fail:
+            fail.pop()
+            raise VoiceError("ElevenLabs respondió 500 al generar la narración.")
+        spoken.append(text)
+        return speak(self, text, voice_id, previous_text, next_text)
+
+    monkeypatch.setattr(FakeVoice, "speak", flaky_speak)
+    _start_render(client, admin_headers, ai_module)
+    worker()  # scene 1 narrated, scene 2 fails
+    module = db.get(Module, ai_module.id)
+    extra = {**THREE_SCENES[0], "id": "s4", "narration": "Una escena agregada mientras tanto."}
+    module.storyboard = {**module.storyboard, "scenes": [*THREE_SCENES, extra]}  # e.g. a script saved by another tab
+    db.commit()
+    for _ in range(8):
+        _fast_forward(db)
+        worker()
+
+    assert db.query(Job).one().status == "succeeded"
+    assert len(spoken) == 3 and not any("agregada" in text for text in spoken)
+
+
+def test_a_video_the_admin_uploads_while_composing_wins(
+    client, db, admin_headers, ai_module, storage, worker, session_factory, monkeypatch, tmp_path
+):
+    own = tmp_path / "propio.mp4"
+    own.write_bytes(b"\0" * 64)
+    storage.upload_file("uploads/propio.mp4", own, "video/mp4")
+    upload_file, uploaded = type(storage).upload_file, []
+
+    def upload_during_publish(self, path, file_path, content_type):
+        if path.endswith("/video.mp4") and not uploaded:
+            with session_factory() as session:  # the admin's own video lands just now
+                asset = MediaAsset(kind="video", status="ready", bucket=storage.bucket, path="uploads/propio.mp4",
+                                   mime_type="video/mp4", size_bytes=64, course_id=ai_module.course_id)
+                session.add(asset)
+                session.flush()
+                module = session.get(Module, ai_module.id)
+                module.source, module.video_asset_id = "upload", asset.id
+                session.commit()
+                uploaded.append(asset.id)
+        return upload_file(self, path, file_path, content_type)
+
+    monkeypatch.setattr(type(storage), "upload_file", upload_during_publish)
+    _start_render(client, admin_headers, ai_module)
+    _run_until_done(db, worker)
+
+    db.expire_all()
+    assert db.query(Job).one().result == {"skipped": "module has its own video"}
+    assert db.get(Module, ai_module.id).video_asset_id == uploaded[0]
+    assert not list((storage.root / storage.bucket).rglob("video-*/*"))  # the render's copy is gone
+
+
+def test_a_presenter_clip_ffmpeg_cannot_use_drops_only_the_bubble(
+    client, db, admin_headers, ai_module, storage, worker, monkeypatch
+):
+    compose_video = compose.compose_video
+
+    def no_presenter_please(slides, narration, avatar, output, work):
+        if avatar is not None:
+            raise compose.ComposeError("FFmpeg falló: presenter.mp4: Invalid data found when processing input")
+        return compose_video(slides, narration, avatar, output, work)
+
+    monkeypatch.setattr(compose, "compose_video", no_presenter_please)
+    _start_render(client, admin_headers, ai_module)
+    _run_until_done(db, worker)
+
+    render = _module_render(db, ai_module.id)
+    assert db.get(Module, ai_module.id).generation_status == "completed"
+    assert render["avatar_id"] == "" and "sin presentador" in render["warning"]
+
+
+def test_a_copy_left_by_a_failed_publish_is_deleted_by_the_next_run(
+    client, db, admin_headers, ai_module, storage, worker, monkeypatch
+):
+    upload_file, failed = type(storage).upload_file, []
+
+    def poster_fails_once(self, path, file_path, content_type):
+        if path.endswith("/poster.jpg") and not failed:
+            failed.append(path)
+            raise StorageError("Storage no pudo subir el archivo (sin conexión)")
+        return upload_file(self, path, file_path, content_type)
+
+    monkeypatch.setattr(type(storage), "upload_file", poster_fails_once)
+    _start_render(client, admin_headers, ai_module)
+    for _ in range(8):
+        _fast_forward(db)
+        worker()
+
+    assert failed and db.query(Job).one().status == "succeeded"
+    assert len(list((storage.root / storage.bucket).rglob("video.mp4"))) == 1  # only the published one

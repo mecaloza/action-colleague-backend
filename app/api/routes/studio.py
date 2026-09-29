@@ -199,6 +199,7 @@ def _require_no_active(db: Session, dedupe_key: str, message: str) -> None:
 
 def _enqueue_draft(db: Session, module: Module, admin: User, feedback: str = "") -> Job:
     """Queue the module's storyboard job; the caller commits (several modules can be queued at once)."""
+    db.refresh(module, with_for_update=True)  # a script and a video asked for at once: one waits and sees the other
     _require_no_active(
         db, f"render:{module.id}", f"«{module.title}» se está produciendo; espera a que termine para cambiar su guion"
     )
@@ -246,12 +247,12 @@ def get_storyboard(module_id: int, db: Session = Depends(get_db)):
 @router.put("/modules/{module_id}/storyboard", response_model=Storyboard)
 def save_storyboard(module_id: int, payload: Storyboard, db: Session = Depends(get_db)):
     module = module_or_404(db, module_id)
-    if module.generation_status in ACTIVE_GENERATION:  # the job would overwrite these edits (or render the old script)
-        rendering = queue.active_with_key(db, f"render:{module.id}") is not None
-        message = "El video se está produciendo; edita el guion cuando termine" if rendering else (
-            "El guion se está generando; edítalo cuando termine"
-        )
-        raise HTTPException(status.HTTP_409_CONFLICT, message)
+    db.refresh(module, with_for_update=True)
+    # A job would overwrite these edits, or produce the video of the old script.
+    if queue.active_with_key(db, f"render:{module.id}") is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "El video se está produciendo; edita el guion cuando termine")
+    if module.generation_status in ACTIVE_GENERATION:
+        raise HTTPException(status.HTTP_409_CONFLICT, "El guion se está generando; edítalo cuando termine")
     if not payload.scenes:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "El guion necesita al menos una escena")
     ids = [scene.id for scene in payload.scenes]
@@ -393,6 +394,7 @@ def _enqueue_render(db: Session, module: Module, admin: User, choices: dict) -> 
     _require_ai_module(module, "el video con IA")
     if not studio.scenes_of(module):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"«{module.title}» no tiene guion todavía")
+    db.refresh(module, with_for_update=True)  # a script and a video asked for at once: one waits and sees the other
     _require_no_active(
         db, f"draft:{module.id}", f"«{module.title}» se está escribiendo; espera a que termine para producir su video"
     )
@@ -400,9 +402,14 @@ def _enqueue_render(db: Session, module: Module, admin: User, choices: dict) -> 
         db, "video.render", choices, course_id=module.course_id, module_id=module.id, created_by=admin.id,
         dedupe_key=f"render:{module.id}", max_attempts=RENDER_JOB_ATTEMPTS, commit=False,
     )
+    if ((module.storyboard or {}).get("render") or {}).get("job_id") == job.id:
+        # That job already published this video and is only closing: a new render must wait for it.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"«{module.title}» está terminando de guardar su video; intenta en unos segundos"
+        )
     _same_request(job, choices)
-    if job.status == "queued":  # one already running keeps showing "generating"
-        module.generation_status, module.generation_error = "queued", None
+    if job.status == "queued" and module.generation_status not in ACTIVE_GENERATION:
+        module.generation_status, module.generation_error = "queued", None  # a render waiting on HeyGen stays as is
     return job
 
 
@@ -429,7 +436,7 @@ def render_course(
     course.settings = {**(course.settings or {}), **choices}
     modules = _modules_to_render(course, payload.module_ids)
     if not modules:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Ningún módulo tiene guion todavía")
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Ningún módulo creado con IA tiene guion todavía")
     render_choices = _render_choices(course)
     jobs = [_enqueue_render(db, module, admin, render_choices) for module in modules]
     db.commit()

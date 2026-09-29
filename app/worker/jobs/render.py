@@ -22,14 +22,17 @@ import logging
 import tempfile
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
+import httpx
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.db.models import Job, MediaAsset, Module
 from app.services import studio
+from app.services.course_views import ACTIVE_GENERATION
 from app.services.media import SIGNED_URL_SECONDS, discard_assets
 from app.services.slides.render import render as render_slide
 from app.services.slides.spec import Slide, SlideContext
@@ -87,12 +90,24 @@ def intermediate_paths(state: dict | None) -> list[str]:
     return paths + [state[key] for key in INTERMEDIATE_KEYS if state.get(key)]
 
 
+def leftover_paths(state: dict | None) -> list[str]:
+    """Everything a render that will not publish any more left in storage: its intermediates, and the copy
+    of the finished video a run was uploading when it lost the job (e.g. a deploy stopped its process)."""
+    return intermediate_paths(state) + list((state or {}).get("uploading") or [])
+
+
 def _render_failed(db: Session, job: Job, error: str) -> None:
     """The job gave up: show the failure on the module (unless it has its own video now) and drop its files."""
     module = db.get(Module, job.module_id) if job.module_id else None
     if module and module.source == "ai":
         module.generation_status, module.generation_error = "failed", error
-    _delete_files(intermediate_paths(job.state), job.module_id)
+    _delete_files(leftover_paths(job.state), job.module_id)
+
+
+def _thaw(frozen: dict) -> RenderInput | None:
+    """The input the first run froze; None when a new release changed its fields (it is read again)."""
+    names = {field.name for field in fields(RenderInput)}
+    return RenderInput(**{name: frozen[name] for name in names}) if names <= frozen.keys() else None
 
 
 def _read_input(module: Module, choices: dict) -> RenderInput:
@@ -121,11 +136,14 @@ def _load(ctx: JobContext) -> RenderInput:
         if module is None:
             raise _Skip("module deleted")
         if ((module.storyboard or {}).get("render") or {}).get("job_id") == ctx.job_id:
+            if module.generation_status in ACTIVE_GENERATION:  # e.g. asked again while this job was handed back
+                module.generation_status = "completed"
+                db.commit()
             raise _Skip("already published")  # run again after its result was saved
         if module.source != "ai":
             raise _Skip("module has its own video")
         frozen = ctx.state.get("input")
-        render = RenderInput(**frozen) if frozen else _read_input(module, ctx.payload)
+        render = (_thaw(frozen) if frozen else None) or _read_input(module, ctx.payload)
         module.generation_status, module.generation_error = "generating", None
         db.commit()
     ctx.state["input"] = asdict(render)
@@ -292,6 +310,7 @@ def _poll_presenter(
     """Check on HeyGen: keep waiting (Reschedule), give up on the presenter, or fetch the finished video."""
     heygen = ctx.state["heygen"]
     status = provider.status(heygen["video_id"])
+    heygen["errors"] = 0  # HeyGen answered: only errors in a row give up on the presenter
     if status.status == "failed":
         _skip_presenter(ctx, f"HeyGen no pudo generar el presentador ({status.error or 'sin detalle'}).")
         return None
@@ -327,8 +346,8 @@ def _presenter(ctx: JobContext, render: RenderInput, work: Path) -> Reschedule |
             return Reschedule(PRESENTER_POLL_SECONDS * errors)
         _skip_presenter(ctx, str(exc))
         return None
-    except (JobCancelled, StorageError):
-        raise  # the job was lost, or storage is down: the whole render retries
+    except (JobCancelled, StorageError, SQLAlchemyError, httpx.HTTPError):
+        raise  # our lease, database or storage failed: the whole render retries and keeps the presenter
     except Exception:  # anything else about the presenter must not cost the video
         logger.exception("presenter_failed", extra={"module_id": ctx.module_id})
         _skip_presenter(ctx, "No pudimos preparar al presentador.")
@@ -373,9 +392,9 @@ def _draw_slides(render: RenderInput, work: Path, presenter: bool) -> list[Path]
     return paths
 
 
-def _compose(ctx: JobContext, render: RenderInput, work: Path) -> _Composition:
+def _compose(ctx: JobContext, render: RenderInput, work: Path, with_presenter: bool = True) -> _Composition:
     """Slides + narration + presenter bubble -> video, poster and captions files."""
-    avatar_path = ctx.state.get("avatar_path")
+    avatar_path = ctx.state.get("avatar_path") if with_presenter else None
     ctx.progress(75, "Dibujando las diapositivas")
     slides = _draw_slides(render, work, presenter=bool(avatar_path))
     avatar = _local_copy(work, "presenter.mp4", avatar_path) if avatar_path else None
@@ -399,17 +418,21 @@ def _new_asset(db: Session, render: RenderInput, kind: str, upload: _Upload, **f
 
 def _publish(ctx: JobContext, render: RenderInput, made: _Composition) -> dict:
     """Store the files, make them the module's video (replacing the previous one) and clean up."""
-    ctx.progress(95, "Guardando el video")
     # A folder per run: a worker that lost the job only ever deletes its own copies.
     folder = f"{_module_folder(render, ctx)}/video-{ctx.job_id}-{uuid.uuid4().hex[:8]}"
     video = _Upload(f"{folder}/video.mp4", "video/mp4", made.video)
     poster = _Upload(f"{folder}/poster.jpg", "image/jpeg", made.poster)
     vtt = _Upload(f"{folder}/captions.vtt", "text/vtt", made.vtt)
     uploads = (video, poster, vtt)
+    published = [upload.path for upload in uploads]
+    # Saved before uploading: if this process dies meanwhile, whoever comes next deletes the copy.
+    abandoned = ctx.state.get("uploading") or []  # an earlier run's copy: that run never published it
+    ctx.state["uploading"] = published
+    ctx.progress(95, "Guardando el video")
+    _delete_files(abandoned, ctx.module_id)
     storage = get_storage()
     for upload in uploads:
         storage.upload_file(upload.path, upload.local, upload.mime)
-    published = [upload.path for upload in uploads]
 
     seconds = round(made.duration, 2)
     with open_session() as db:
@@ -444,6 +467,7 @@ def _publish(ctx: JobContext, render: RenderInput, made: _Composition) -> dict:
             },
         }
         db.commit()
+        ctx.state.pop("uploading", None)  # the module's video now
         try:
             discard_assets(db, replaced)  # the previous video, poster and captions, unless still in use
         except Exception:  # the new video is in place; leftovers only cost storage
@@ -459,7 +483,9 @@ def render_module(ctx: JobContext) -> dict | Reschedule:
     try:
         render = _load(ctx)
     except _Skip as skip:
-        _delete_files(intermediate_paths(ctx.state), ctx.module_id)  # what an earlier run left, if anything
+        # What an earlier run left, if anything; after publishing, "uploading" is the module's video itself.
+        published = str(skip) == "already published"
+        _delete_files(intermediate_paths(ctx.state) if published else leftover_paths(ctx.state), ctx.module_id)
         return {"skipped": str(skip)}
     with tempfile.TemporaryDirectory(prefix="render-") as tmp:
         work = Path(tmp)
@@ -472,8 +498,20 @@ def render_module(ctx: JobContext) -> dict | Reschedule:
                 waiting = _presenter(ctx, render, work)
                 if waiting is not None:
                     return waiting
-            made = _compose(ctx, render, work)
+            made = _compose_video(ctx, render, work)
         except compose.ComposeError as exc:
             logger.error("compose_failed", extra={"module_id": ctx.module_id, "error": str(exc)[:MAX_LOG_ERROR_CHARS]})
             raise JobError(MEDIA_ERROR) from exc
         return _publish(ctx, render, made)
+
+
+def _compose_video(ctx: JobContext, render: RenderInput, work: Path) -> _Composition:
+    """The video with its presenter; if FFmpeg can't use the presenter's clip, the same video without it."""
+    try:
+        return _compose(ctx, render, work)
+    except compose.ComposeError as exc:
+        if not ctx.state.get("avatar_path"):
+            raise
+        logger.warning("compose_with_presenter_failed", extra={"module_id": ctx.module_id, "error": str(exc)[:MAX_LOG_ERROR_CHARS]})
+        ctx.state["warning"] = "No pudimos usar el video del presentador. El video se produjo sin presentador."
+        return _compose(ctx, render, work, with_presenter=False)

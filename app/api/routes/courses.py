@@ -82,8 +82,8 @@ def _drop_pending_jobs(db: Session, *conditions) -> tuple[list[str], list[str]]:
             if (payload or {}).get("purpose") not in BOUND_PURPOSES:
                 continue
             uploads.append((payload or {}).get("asset_id"))
-        elif job_type == "video.render":
-            files += render_jobs.intermediate_paths(state)
+        elif job_type == "video.render" and job_status == "queued":  # finished ones already cleaned up
+            files += render_jobs.leftover_paths(state)
         dropped.append(job_id)
     if dropped:  # a job claimed since the query keeps running: it cleans up after itself
         no_sync = {"synchronize_session": False}
@@ -293,8 +293,9 @@ def delete_module(module_id: int, db: Session = Depends(get_db)):
             status.HTTP_409_CONFLICT,
             "Un curso publicado o archivado necesita al menos un módulo. Pásalo a borrador para quitar el último.",
         )
+    _purge_modules(db, [module.id])  # progress first (see there), then the module row:
+    db.refresh(module, with_for_update=True)  # a video published meanwhile is read, and discarded, too
     media = _module_media(module)
-    _purge_modules(db, [module.id])
     uploads, files = _drop_pending_jobs(db, Job.module_id == module.id)
     media += uploads
     db.expire(module)  # its evaluation and progress were deleted in bulk
