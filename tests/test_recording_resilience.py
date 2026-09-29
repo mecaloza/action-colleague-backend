@@ -3,7 +3,7 @@
 import json
 import shutil
 import subprocess
-from datetime import date
+from datetime import date, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -42,8 +42,8 @@ def module(db, course):
 
 
 def _asset(db, course_id: int | None, kind: str = "recording", status: str = "ready", **fields) -> MediaAsset:
-    asset = MediaAsset(kind=kind, status=status, bucket="course-media", path=f"x/{kind}-{status}.webm",
-                       mime_type="video/webm", course_id=course_id, **fields)
+    fields.setdefault("path", f"x/{kind}-{status}.webm")
+    asset = MediaAsset(kind=kind, status=status, bucket="course-media", mime_type="video/webm", course_id=course_id, **fields)
     db.add(asset)
     db.commit()
     return asset
@@ -240,3 +240,126 @@ def test_only_the_previous_apps_buckets_are_copied(db, course, legacy, storage, 
     db.expire_all()
     assert db.get(Job, job.id).result["videos"] == {"foreign": 1}
     assert db.get(Module, module.id).video_asset_id is None
+
+
+def _aware(moment):
+    """SQLite gives datetimes back without their zone (they are UTC)."""
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+def test_maintenance_is_scheduled_again_on_every_start(session_factory, monkeypatch):
+    from app import main
+
+    monkeypatch.setattr(main, "SessionLocal", session_factory)
+    main.schedule_maintenance()
+    with session_factory() as db:
+        job = db.query(Job).one()
+        job.run_after = queue.utcnow() + timedelta(hours=6)  # waiting for its next recheck
+        db.commit()
+    main.schedule_maintenance()  # a deploy: the pass runs now instead of in six hours
+    with session_factory() as db:
+        [job] = db.query(Job).all()
+        assert _aware(job.run_after) <= queue.utcnow() + timedelta(seconds=1)
+
+
+def test_a_failed_copy_is_processed_again_a_few_times_then_reported(db, course, storage, worker, monkeypatch):
+    monkeypatch.setattr(recording, "HEYGEN_RETIRED_ON", date.max)
+    module = Module(course_id=course.id, title="HeyGen", order=1, source="ai", video_url="heygen://video/xyz")
+    db.add(module)
+    db.commit()
+    dest = f"courses/{course.id}/modules/{module.id}/legacy/heygen-xyz.mp4"
+    _mp4(storage.file_path(dest))  # copied by an earlier pass
+    copy = _asset(db, course.id, kind="video", status="failed", path=dest, error="Storage no pudo subir el archivo (503)")
+
+    job = _migrate(db, worker)  # e.g. storage was down while it was processed: this pass tries again
+    db.expire_all()
+    assert db.get(MediaAsset, copy.id).meta["legacy_retries"] == 1
+    assert db.get(Job, job.id).status == "queued"  # rechecks later
+
+    db.query(Job).filter(Job.type == recording.LEGACY_VIDEO_JOB).delete()  # say its processing failed again...
+    stored = db.get(MediaAsset, copy.id)
+    stored.status, stored.meta = "failed", {"legacy_retries": recording.MAX_LEGACY_RETRIES}  # ...as often as allowed
+    db.commit()
+    queue.enqueue(db, "legacy.migrate", dedupe_key="legacy-migrate")
+    _fast_forward(db)
+    worker(max_jobs=1)
+    db.expire_all()
+    failed = db.get(Module, module.id)
+    assert failed.generation_status == "failed" and "No pudimos recuperar" in failed.generation_error
+
+
+def test_a_heygen_copy_made_before_the_shutdown_is_used_after_it(db, course, storage, worker, monkeypatch):
+    monkeypatch.setattr(recording, "HEYGEN_RETIRED_ON", date(2026, 1, 1))
+    module = Module(course_id=course.id, title="HeyGen", order=1, source="ai", video_url="heygen://video/xyz")
+    db.add(module)
+    db.commit()
+    _mp4(storage.file_path(f"courses/{course.id}/modules/{module.id}/legacy/heygen-xyz.mp4"))
+
+    _migrate(db, worker)
+    _run_until_done(db, worker)
+    db.expire_all()
+    stored = db.get(Module, module.id)
+    assert stored.video_asset_id and stored.generation_error is None  # not "lost": the copy was there
+
+
+def test_a_module_being_worked_on_is_never_marked_lost(db, course, worker):
+    module = Module(course_id=course.id, title="Local", order=1, source="upload", video_url="/uploads/clase.mp4",
+                    generation_status="generating")
+    db.add(module)
+    db.commit()
+    _migrate(db, worker)
+    db.expire_all()
+    stored = db.get(Module, module.id)
+    assert stored.generation_status == "generating" and stored.generation_error is None
+
+
+def test_slide_changes_land_on_their_exact_frame(tmp_path):
+    from PIL import Image
+
+    from app.services.video import compose
+    from tests.test_recording import BLUE, ORANGE, _camera, _close
+
+    pages = []
+    for index, color in enumerate((ORANGE, BLUE)):
+        page = tmp_path / f"p{index}.png"
+        Image.new("RGB", (1280, 720), color).save(page)
+        pages.append(page)
+    output = tmp_path / "out.mp4"
+    compose.compose_recording(pages, [(0, 0), (0.1, 1)], _camera(tmp_path / "cam.webm"), 1.0, output, tmp_path)
+
+    def frame(number: int):
+        dest = tmp_path / f"frame{number}.png"
+        subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(output), "-vf", f"select=eq(n\\,{number})",
+                        "-frames:v", "1", str(dest)], check=True, capture_output=True)
+        return Image.open(dest).convert("RGB").getpixel((600, 540))
+
+    # 0.1 s is frame 3 exactly: read at 25 fps, the image would only change on frame 4.
+    assert _close(frame(2), ORANGE) and _close(frame(3), BLUE)
+
+
+def test_deleting_a_module_drops_its_queued_legacy_copy(client, db, admin_headers, course, legacy, storage, worker):
+    module = Module(course_id=course.id, title="Viejo", order=1, source="ai", video_url=PUBLIC_URL)
+    db.add(module)
+    db.commit()
+    _migrate(db, worker)  # the copy is queued, not processed yet
+    [(copy_id, copy_path)] = db.query(MediaAsset.id, MediaAsset.path).filter(MediaAsset.path.like("%/legacy/%")).all()
+    assert client.delete(f"/api/v1/modules/{module.id}", headers=admin_headers).status_code == 204
+    db.expire_all()
+    assert db.get(MediaAsset, copy_id) is None and not storage.file_path(copy_path).exists()
+
+
+def test_a_deck_another_module_recorded_with_stays(db, course, storage):
+    deck, camera = _asset(db, course.id, kind="deck"), _asset(db, course.id)
+    take = {"recording": {"recording_asset_id": camera.id, "deck_asset_id": deck.id, "timeline": []}}
+    first = Module(course_id=course.id, title="Uno", order=1, source="recording", storyboard=take)
+    second = Module(course_id=course.id, title="Dos", order=2, source="recording", storyboard=dict(take))
+    db.add_all([first, second])
+    db.commit()
+    assert recording.drop_take(db, second, keep=set()) == []  # the first module can still combine them again
+
+
+def test_a_deck_says_how_many_pages_it_has(db, course):
+    from app.services.media_views import asset_out
+
+    deck = _asset(db, course.id, kind="deck", meta={"pages": ["d/p0.png", "d/p1.png"]})
+    assert asset_out(db, deck, signed={"d/p0.png": "https://signed/p0"}).page_count == 2

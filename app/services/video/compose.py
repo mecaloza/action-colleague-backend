@@ -284,9 +284,10 @@ def compose_recording(
             shown[page] = letterbox(pages[page], work / f"page_{page:03d}.png")
     # One FFmpeg input for the whole deck, however many changes: the concat demuxer switches the images.
     lines = ["ffconcat version 1.0"]
+    rate = f"option framerate {FPS}"  # images default to 25 fps: every change would drift up to a frame
     for page, frames in segments:
-        lines += [f"file '{shown[page].name}'", f"duration {frames / FPS:.6f}"]
-    lines.append(f"file '{shown[segments[-1][0]].name}'")  # the demuxer ignores the last duration otherwise
+        lines += [f"file '{shown[page].name}'", rate, f"duration {frames / FPS:.6f}"]
+    lines += [f"file '{shown[segments[-1][0]].name}'", rate]  # the demuxer ignores the last duration otherwise
     listing = work / "slides.ffconcat"
     listing.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

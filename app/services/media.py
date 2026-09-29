@@ -100,6 +100,9 @@ def discard_assets(db: Session, asset_ids: Iterable[str | None]) -> None:
     after. Storage failures are logged, not raised: an orphaned file costs little, a failed edit more.
     """
     wanted = {asset_id for asset_id in asset_ids if asset_id}
+    if wanted:  # a video's (or recording's) poster is an asset of its own: it goes with it
+        metas = db.query(MediaAsset.meta).filter(MediaAsset.id.in_(wanted)).all()
+        wanted |= {poster for (meta,) in metas if (poster := (meta or {}).get("poster_asset_id"))}
     # Rows locked before the check (in id order: two cleanups can't deadlock), so nothing can start
     # pointing at them in between; ON DELETE SET NULL would silently undo that new link.
     assets = (

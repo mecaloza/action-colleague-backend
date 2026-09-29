@@ -21,7 +21,7 @@ from app.schemas.media import PURPOSES_NEEDING_MODULE, VIDEO_PURPOSES
 from app.services import media_processing as mp
 from app.services.media import discard_assets
 from app.services.storage import StorageError, get_storage
-from app.worker.jobs.recording import LEGACY_VIDEO, LEGACY_VIDEO_JOB, enqueue_captions
+from app.worker.jobs.recording import LEGACY_VIDEO, LEGACY_VIDEO_JOB, drop_take, enqueue_captions
 from app.worker.runner import JobCancelled, JobContext, JobError, handler, holds_job, open_session
 
 logger = logging.getLogger(__name__)
@@ -184,6 +184,7 @@ def _attach(db: Session, asset: MediaAsset, payload: dict) -> list[str | None] |
             return None  # the admin gave it another video meanwhile: the copy of the old one is not needed
         # A migrated video keeps the module's source (it was made with AI or uploaded before).
         replaced = _attach_video(module, asset, VIDEO_PURPOSES.get(purpose) or module.source)
+        replaced += drop_take(db, module, keep={asset.id})  # a recording it replaces: its camera and deck
         enqueue_captions(db, module, asset)
         return replaced
     if purpose == "course_cover" and asset.course_id:

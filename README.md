@@ -148,6 +148,12 @@ El entorno se detecta con `RAILWAY_ENVIRONMENT_NAME` (Railway lo define) o `ENVI
 
 HeyGen apaga su API v1/v2 el 31-oct-2026. En cada arranque, `legacy.migrate` copia al bucket privado los videos de la app anterior: los de HeyGen (mientras su API v1 responda) y los de sus buckets públicos (`course-videos`, `user-videos`). Luego los procesa como cualquier subida. Mientras queden videos de HeyGen sin terminar, vuelve a revisar cada 6 h. Los que ya no se pueden recuperar (los de `/uploads/…` y los de HeyGen después del apagado) quedan marcados en su módulo para volver a subirlos o producirlos, y el log `legacy_migration_pass` resume cada pasada.
 
+Para que la copia funcione antes del 31-oct:
+
+- `HEYGEN_API_KEY` configurada (sin ella el log `legacy_heygen_key_missing` avisa en cada pasada).
+- El límite de tamaño de archivo de Supabase Storage por encima del video más grande (p. ej. 2 GB); si no, el log `legacy_video_too_large` dice cuánto pesa.
+- Revisar `legacy_migration_pass` tras el deploy: `copied`/`processed` (bien), `waiting` (HeyGen aún no termina), `retrying`, `failed`, `lost`.
+
 ## Logs
 
 Todos los logs salen en JSON por stdout (un objeto por línea) con `ts`, `level`, `logger`, `message` (el nombre del evento) y campos estructurados; cada request lleva `x-request-id`. No se usa `print()`.

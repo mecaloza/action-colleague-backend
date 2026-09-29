@@ -80,10 +80,10 @@ def _require_voice() -> None:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "La narración no está configurada en el servidor (ELEVENLABS_API_KEY)")
 
 
-def _same_request(job: Job, payload: dict) -> Job:
+def _same_request(job: Job, payload: dict, busy_message: str = BUSY_WITH_OTHER_REQUEST) -> Job:
     """The job (maybe an active one returned by the dedupe key), or 409 if it was asked with other instructions."""
     if job.payload != payload:
-        raise HTTPException(status.HTTP_409_CONFLICT, BUSY_WITH_OTHER_REQUEST)
+        raise HTTPException(status.HTTP_409_CONFLICT, busy_message)
     return job
 
 
@@ -476,7 +476,8 @@ def compose_recording(
         db, "video.compose_recording", request, course_id=module.course_id, module_id=module.id,
         created_by=admin.id, dedupe_key=f"recording:{module.id}", commit=False,
     )
-    _same_request(job, request)  # another take while one is being combined: 409, never silently the old one
+    # Another take while one is being combined: 409, never silently the old one.
+    _same_request(job, request, "Todavía estamos combinando otra toma de este módulo; espera a que termine y vuelve a intentarlo.")
     if job.status == "queued":  # one already running keeps showing "generating"
         module.generation_status, module.generation_error = "queued", None
     db.commit()

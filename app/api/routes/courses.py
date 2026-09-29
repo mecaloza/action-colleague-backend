@@ -42,6 +42,7 @@ from app.services.learner_views import course_player_detail
 from app.services.media import MediaResolver, discard_assets
 from app.services.storage import StorageError, get_storage
 from app.worker.jobs import render as render_jobs
+from app.worker.jobs.recording import LEGACY_VIDEO_JOB
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["courses"], dependencies=[Depends(require_admin)])
@@ -86,6 +87,8 @@ def _drop_pending_jobs(db: Session, *conditions) -> tuple[list[str], list[str]]:
         if job_type == "media.process" and job_status == "queued":
             if (payload or {}).get("purpose") not in BOUND_PURPOSES:
                 continue
+            uploads.append((payload or {}).get("asset_id"))
+        elif job_type == LEGACY_VIDEO_JOB and job_status == "queued":  # the old video's copy, not processed yet
             uploads.append((payload or {}).get("asset_id"))
         elif job_type == "video.render" and job_status == "queued":  # finished ones already cleaned up
             files += render_jobs.leftover_paths(state)

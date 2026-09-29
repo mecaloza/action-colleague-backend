@@ -12,6 +12,7 @@ Recordings, captions and the previous app's media.
 
 import logging
 import tempfile
+import time
 import uuid
 from collections import Counter
 from collections.abc import Callable
@@ -21,7 +22,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 import httpx
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -47,8 +48,10 @@ LOST_VIDEO = "El video de la app anterior se perdió; súbelo o prodúcelo de nu
 WAIT_FOR_PROCESSING_SECONDS = 10  # before checking again whether an upload finished processing
 MAX_PROCESSING_WAIT_SECONDS = 3 * 3600  # an upload still not processed by then will not be
 LEGACY_RECHECK_SECONDS = 6 * 3600  # how often to look again for HeyGen videos not finished yet
-LEGACY_DOWNLOAD_TIMEOUT_SECONDS = 600
+LEGACY_DOWNLOAD_TIMEOUT_SECONDS = 600  # between reads
+LEGACY_DOWNLOAD_DEADLINE_SECONDS = 30 * 60  # for the whole file
 MAX_LEGACY_VIDEO_BYTES = 2 * 1024 * 1024 * 1024
+MAX_LEGACY_RETRIES = 3  # passes that process a failed copy again before telling the admin
 TRANSCRIBE_ATTEMPTS = 2  # a second try covers a transient provider error
 PUBLIC_PREFIX = "/storage/v1/object/public/"  # where Supabase serves the objects of a public bucket
 
@@ -229,6 +232,24 @@ def _composition_assets(db: Session, inputs: _RecordingInputs, made: _Compositio
     return video, poster
 
 
+def _takes_elsewhere(db: Session, module: Module) -> set[str]:
+    """The cameras and decks other modules of the course recorded with: they can combine them again."""
+    others = db.query(Module.storyboard).filter(Module.course_id == module.course_id, Module.id != module.id).all()
+    takes = [(storyboard or {}).get("recording") or {} for (storyboard,) in others]
+    return {asset_id for take in takes for asset_id in (take.get("recording_asset_id"), take.get("deck_asset_id")) if asset_id}
+
+
+def drop_take(db: Session, module: Module, keep: set[str]) -> list[str]:
+    """Another video replaces the module's recording: its camera and deck go, unless something still uses them."""
+    storyboard = dict(module.storyboard or {})
+    take = storyboard.pop("recording", None)
+    if not take:
+        return []
+    module.storyboard = storyboard
+    used = _takes_elsewhere(db, module) | keep
+    return [asset_id for asset_id in (take.get("recording_asset_id"), take.get("deck_asset_id")) if asset_id and asset_id not in used]
+
+
 def _attach_recording(ctx: JobContext, inputs: _RecordingInputs, made: _Composition | None) -> dict:
     """Make the recording (or its composition) the module's video, replacing the previous take."""
     payload = ctx.payload
@@ -258,6 +279,7 @@ def _attach_recording(ctx: JobContext, inputs: _RecordingInputs, made: _Composit
             keep.add(module.captions_asset_id)
         current = [module.video_asset_id, module.poster_asset_id, module.captions_asset_id]
         earlier = [previous.get("recording_asset_id"), previous.get("deck_asset_id")]
+        keep |= _takes_elsewhere(db, module)
         replaced = [asset_id for asset_id in current + earlier if asset_id and asset_id not in keep]
         module.video_asset_id, module.poster_asset_id = video_id, poster_id
         if not same_video:
@@ -294,9 +316,12 @@ def compose_recording(ctx: JobContext) -> dict | Reschedule:
 # ── Captions from speech ──────────────────────────────────────────────
 
 
-def _current_video(db: Session, module_id: int | None, asset_id: str) -> tuple[Module, MediaAsset] | None:
+def _current_video(
+    db: Session, module_id: int | None, asset_id: str, lock: bool = False
+) -> tuple[Module, MediaAsset] | None:
     """The module and its video asset, unless the module was deleted or now shows another video."""
-    module, asset = db.get(Module, module_id), db.get(MediaAsset, asset_id)
+    module = db.get(Module, module_id, with_for_update=True) if lock and module_id else db.get(Module, module_id)
+    asset = db.get(MediaAsset, asset_id)
     if module is None or asset is None or module.video_asset_id != asset_id:
         return None
     return module, asset
@@ -332,8 +357,9 @@ def transcribe(ctx: JobContext) -> dict:
         size = vtt.stat().st_size
     transcript = " ".join(word.text for word in timed)
     with open_session() as db:
-        current = _current_video(db, ctx.module_id, asset_id)
-        if current is None or not holds_job(db, ctx):
+        # Locked: a video uploaded right now must not end up with these captions.
+        current = _current_video(db, ctx.module_id, asset_id, lock=True) if holds_job(db, ctx) else None
+        if current is None:
             db.rollback()
             _delete_files([path], ctx.module_id)
             return {"skipped": "video replaced meanwhile"}
@@ -399,23 +425,39 @@ def _convert_legacy_evaluations(db: Session) -> int:
 
 
 def _download(url: str, dest: Path) -> None:
-    """A finished HeyGen video (a short-lived signed link) to a local file."""
-    written = 0
+    """A finished HeyGen video (a short-lived signed link) to a local file, whole or not at all."""
+    written, deadline = 0, time.monotonic() + LEGACY_DOWNLOAD_DEADLINE_SECONDS
     with httpx.stream("GET", url, follow_redirects=True, timeout=LEGACY_DOWNLOAD_TIMEOUT_SECONDS) as response:
         response.raise_for_status()
+        expected = response.headers.get("content-length", "")
         with dest.open("wb") as fh:
             for chunk in response.iter_bytes(1024 * 1024):
                 written += len(chunk)
                 if written > MAX_LEGACY_VIDEO_BYTES:
                     raise StorageError("El video de HeyGen es demasiado grande")
+                if time.monotonic() > deadline:
+                    raise StorageError("La descarga del video de HeyGen tardó demasiado")
                 fh.write(chunk)
+    if expected.isdigit() and written != int(expected):
+        raise StorageError("La descarga del video de HeyGen quedó incompleta")
 
 
 def _queue_legacy_video(db: Session, module: Module, dest: str) -> str:
     """Process the copied file like an upload; it replaces the module's video only if that is still the old one."""
     asset = db.query(MediaAsset).filter(MediaAsset.path == dest).order_by(MediaAsset.created_at.desc()).first()
-    if asset is not None and asset.status in ("ready", "failed"):
-        return "processed" if asset.status == "ready" else "failed"  # attached, or it could not be used
+    if asset is not None and asset.status == "ready":
+        return "processed"  # attached, or the module got another video meanwhile
+    if asset is not None and asset.status == "failed":
+        retries = (asset.meta or {}).get("legacy_retries", 0)
+        if retries >= MAX_LEGACY_RETRIES:
+            _mark_failed(db, module, f"No pudimos recuperar el video de la app anterior ({asset.error or 'error desconocido'}).")
+            return "failed"
+        # E.g. storage was down for a while: the copy is there, processing it again usually works.
+        asset.status, asset.error = "uploaded", None
+        asset.meta = {**(asset.meta or {}), "legacy_retries": retries + 1}
+        outcome = "retrying"
+    else:
+        outcome = "copied"
     if asset is None:
         asset = MediaAsset(
             kind="video", status="uploaded", bucket=get_storage().bucket, path=dest, mime_type="video/mp4",
@@ -429,24 +471,32 @@ def _queue_legacy_video(db: Session, module: Module, dest: str) -> str:
         course_id=module.course_id, module_id=module.id, dedupe_key=f"media:{asset.id}", commit=False,
     )
     db.commit()
-    return "copied"
+    return outcome
 
 
 def _legacy_folder(module: Module) -> str:
     return f"courses/{module.course_id}/modules/{module.id}/legacy"
 
 
-def _copy_from_heygen(db: Session, storage: Storage, module: Module, heygen_id: str) -> str:
+def _copy_from_heygen(db: Session, storage: Storage, module: Module, heygen_id: str, today) -> str:
     """Download a finished HeyGen video into the private bucket, while HeyGen's v1 API still answers."""
     dest = f"{_legacy_folder(module)}/heygen-{heygen_id}.mp4"
-    if not storage.size(dest):  # a previous pass may have copied it already
+    if not storage.size(dest):  # a previous pass may have copied it already (then it is processed, even later)
+        if today > HEYGEN_RETIRED_ON:
+            return _mark_lost(db, module)
         url = legacy_heygen.fresh_url(heygen_id)
         if not url:
             return "waiting"  # still rendering, or HeyGen did not answer: the next pass tries again
         with tempfile.TemporaryDirectory(prefix="legacy-") as tmp:
             local = Path(tmp) / "video.mp4"
             _download(url, local)
-            storage.upload_file(dest, local, "video/mp4")
+            try:
+                storage.upload_file(dest, local, "video/mp4")
+            except StorageError as exc:
+                if "(413)" in str(exc):  # bigger than the storage's upload limit: someone has to raise it
+                    size_mb = local.stat().st_size // (1024 * 1024)
+                    logger.error("legacy_video_too_large", extra={"module_id": module.id, "size_mb": size_mb})
+                raise
     return _queue_legacy_video(db, module, dest)
 
 
@@ -457,10 +507,25 @@ def _copy_from_bucket(db: Session, storage: Storage, module: Module, bucket: str
     return _queue_legacy_video(db, module, dest)
 
 
+def _mark_failed(db: Session, module: Module, message: str) -> None:
+    """Tell the admin on the module, unless it got a video or is being worked on meanwhile."""
+    db.execute(
+        update(Module)
+        .where(
+            Module.id == module.id,
+            Module.video_asset_id.is_(None),
+            Module.video_url == module.video_url,
+            Module.generation_status.notin_(("queued", "generating")),
+            or_(Module.generation_error.is_(None), Module.generation_error != message),
+        )
+        .values(generation_status="failed", generation_error=message)
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+
+
 def _mark_lost(db: Session, module: Module) -> str:
-    if module.generation_error != LOST_VIDEO:
-        module.generation_status, module.generation_error = "failed", LOST_VIDEO
-        db.commit()
+    _mark_failed(db, module, LOST_VIDEO)
     return "lost"
 
 
@@ -468,7 +533,7 @@ def _migrate_video(db: Session, storage: Storage, module: Module, today) -> str:
     url = module.video_url or ""
     heygen_id = legacy_heygen.video_id(url)
     if heygen_id:
-        return _copy_from_heygen(db, storage, module, heygen_id) if today <= HEYGEN_RETIRED_ON else _mark_lost(db, module)
+        return _copy_from_heygen(db, storage, module, heygen_id, today)
     if url.startswith("/uploads/"):  # the previous app kept these in its container: gone with it
         return _mark_lost(db, module)
     source = _public_object(url)
@@ -479,12 +544,16 @@ def _migrate_videos(db: Session) -> Counter:
     """Every module still on a video of the previous app, one at a time (a failure never stops the others)."""
     storage, today, outcomes = get_storage(), datetime.now(UTC).date(), Counter()
     modules = db.query(Module).filter(Module.video_asset_id.is_(None), Module.video_url.isnot(None), Module.video_url != "")
-    for module in modules.all():
+    pending = modules.all()
+    db.commit()  # no transaction stays open while HeyGen or storage answer
+    for module in pending:
         try:
             outcomes[_migrate_video(db, storage, module, today)] += 1
         except Exception as exc:  # StorageError, a HeyGen download...: the next pass tries again
             db.rollback()
-            logger.warning("legacy_video_failed", extra={"module_id": module.id, "error": str(exc)[:300]})
+            status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+            # Never the message itself: an HTTP error carries the signed download link.
+            logger.warning("legacy_video_failed", extra={"module_id": module.id, "error_type": type(exc).__name__, "status": status})
             outcomes["error"] += 1
     return outcomes
 
@@ -511,6 +580,8 @@ def migrate_legacy(ctx: JobContext) -> dict | Reschedule:
     )
     if videos["lost"]:
         logger.warning("legacy_videos_lost", extra={"modules": videos["lost"]})
-    if videos["waiting"] or videos["error"]:  # e.g. a HeyGen render not finished yet, or a network error
+    if videos["waiting"] and not get_settings().heygen_api_key:
+        logger.error("legacy_heygen_key_missing", extra={"modules": videos["waiting"]})  # they'll be lost on HeyGen's shutdown
+    if videos["waiting"] or videos["error"] or videos["retrying"]:  # e.g. a render not finished, a network error
         return Reschedule(LEGACY_RECHECK_SECONDS)
     return {"videos": dict(videos), "evaluations_converted": converted, "completions_dated": dated}

@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, status
@@ -44,12 +45,20 @@ async def validation_error(request: Request, exc: RequestValidationError) -> JSO
     return JSONResponse({"detail": errors}, status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
 
 
+logger = logging.getLogger(__name__)
+
+
 def schedule_maintenance() -> None:
     """Background upkeep that must run once per deploy (idempotent)."""
     with SessionLocal() as db:
         job = queue.enqueue(db, "legacy.migrate", dedupe_key="legacy-migrate", max_attempts=5)
         now = queue.utcnow()  # a pass waiting for its next recheck runs now: every deploy looks again
-        db.execute(update(Job).where(Job.id == job.id, Job.status == "queued", Job.run_after > now).values(run_after=now))
+        db.execute(
+            update(Job)
+            .where(Job.id == job.id, Job.status == "queued", Job.run_after > now)
+            .values(run_after=now)
+            .execution_options(synchronize_session=False)  # compared in the database, not in Python
+        )
         db.commit()
 
 
@@ -65,7 +74,10 @@ def start_worker() -> WorkerPool | None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_migrations()
-    schedule_maintenance()  # among others, copies the previous app's HeyGen videos before HeyGen retires them
+    try:
+        schedule_maintenance()  # among others, copies the previous app's HeyGen videos before HeyGen retires them
+    except Exception:  # upkeep never keeps the app from starting: the next deploy schedules it again
+        logger.exception("maintenance_not_scheduled")
     worker = start_worker()
     yield
     if worker:
