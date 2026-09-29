@@ -49,6 +49,13 @@ Reglas clave:
 - Cambiar la contraseña propia cierra todas las sesiones (el frontend vuelve a iniciar sesión con la nueva).
 - El colaborador nunca recibe las respuestas correctas. Las opciones llevan IDs opacos (HMAC) y la calificación ocurre en el servidor (`app/services/quiz.py`, la única implementación). La solución se muestra solo al aprobar: mostrada al agotar los intentos, bastaría con que el admin diera más intentos para aprobar sin saber. Antes de aprobar, cada intento dice qué preguntas estuvieron bien.
 
+## Medios y trabajos en segundo plano
+
+- **Subidas directas**: el navegador pide `POST /media/uploads` y sube el archivo directo a Storage (PUT firmado hasta 6 MB, TUS reanudable por encima), sin pasar por el API. Luego `POST /media/{id}/complete` lo manda a procesar.
+- **Procesamiento** (`media.process`): video a MP4 H.264/AAC de máximo 1080p, sin deformar (4:3 y vertical se mantienen) y con portada; texto de documentos (PDF, DOCX, PPTX, TXT); una imagen por página de presentaciones PDF; imágenes a JPEG.
+- **Cola** en Postgres (`jobs`) con *leases*: un trabajo solo se reintenta si su proceso dejó de renovarlo (deploys solapados seguros); los errores reintentan con espera creciente y un proceso caído cuenta como intento. Por defecto corre dentro del API; para separarlo: `WORKER_ENABLED=false` en el API y un servicio con `python -m app.worker`.
+- Los medios nuevos se sirven con **URLs firmadas** de corta duración (bucket privado). Supabase limita el tamaño por archivo: súbelo en *Storage → Settings* (p. ej. 2 GB) para videos largos.
+
 ## Migraciones
 
 La app aplica las migraciones al arrancar (`app.db.migrate`), dentro de una transacción con un lock para que dos contenedores no migren a la vez. También se pueden correr a mano:
@@ -86,7 +93,11 @@ Los tests de migraciones corren contra SQLite y contra un PostgreSQL 16 embebido
 | `LOG_LEVEL` | no | `INFO` por defecto. |
 | `CORS_ORIGINS` | no | Orígenes permitidos separados por coma. |
 | `CORS_ORIGIN_REGEX` | no | Regex adicional de orígenes (p. ej. previews de Vercel). |
-| `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` | para medios | Storage de Supabase (solo backend). |
+| `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` | en producción | Storage de Supabase (solo backend). Acepta las llaves nuevas `sb_secret_…`. |
+| `MEDIA_BUCKET` | no | Bucket **privado** de los medios (por defecto `course-media`; se crea solo). |
+| `STORAGE_BACKEND` | no | `auto` (Supabase si está configurado; si no, disco local en desarrollo), `supabase` o `local`. |
+| `LOCAL_STORAGE_DIR`, `PUBLIC_API_URL` | no | Solo desarrollo: carpeta de los archivos y URL pública del API para sus enlaces. |
+| `WORKER_ENABLED`, `WORKER_CONCURRENCY` | no | Trabajos en segundo plano dentro del API (por defecto sí, 2 a la vez). |
 | `OPENAI_API_KEY`, `OPENAI_MODEL` | para IA | Generación de cursos. |
 | `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | para voz | Narración. |
 | `HEYGEN_API_KEY` | para avatar | Presentador IA. |

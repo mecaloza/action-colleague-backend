@@ -7,6 +7,7 @@ plain URL in `video_url` (public Storage) or a `heygen://video/{id}` reference; 
 through a read-only fallback until the legacy media migration moves them to storage.
 """
 
+import logging
 import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +18,9 @@ from sqlalchemy.orm import Session
 from app.db.models import MediaAsset, Module
 from app.schemas.courses import MediaRef
 from app.services import legacy_heygen
+from app.services.storage import StorageError, get_storage
+
+logger = logging.getLogger(__name__)
 
 SIGNED_URL_SECONDS = 6 * 3600
 _LEGACY_CACHE_SECONDS = 20 * 60
@@ -63,9 +67,21 @@ def legacy_video_url(value: str | None) -> str | None:
     return cached[1] if cached else _remember(video_id, legacy_heygen.fresh_url(video_id))
 
 
+def sign_paths(paths: list[str], expires_in: int, **log_context) -> dict[str, str]:
+    """Signed download URLs by storage path, in one call. Storage errors leave media out, not the page."""
+    if not paths:
+        return {}
+    try:
+        return get_storage().signed_urls(paths, expires_in)
+    except StorageError as exc:
+        logger.warning("media_sign_failed", extra={**log_context, "error": str(exc)})
+        return {}
+
+
 def sign_assets(assets: list[MediaAsset], expires_in: int) -> dict[str, str]:
-    """Signed download URLs by asset id. Storage signing arrives with the storage service."""
-    return {}
+    """Signed download URLs by asset id."""
+    by_path = sign_paths([asset.path for asset in assets], expires_in, assets=len(assets))
+    return {asset.id: by_path[asset.path] for asset in assets if asset.path in by_path}
 
 
 def _asset_ids(module: Module) -> tuple[str | None, ...]:

@@ -2,6 +2,7 @@
 
 import os
 from functools import lru_cache
+from typing import Literal
 
 from dotenv import load_dotenv
 from pydantic import AliasChoices, Field, field_validator, model_validator
@@ -51,6 +52,17 @@ class Settings(BaseSettings):
     supabase_service_key: str = Field(
         "", validation_alias=AliasChoices("SUPABASE_SERVICE_KEY", "SUPABASE_SECRET_KEY", "SUPABASE_KEY"), repr=False
     )
+
+    # Media storage: a private Supabase bucket, or local files for development and tests.
+    storage_backend: Literal["auto", "supabase", "local"] = "auto"
+    media_bucket: str = "course-media"
+    local_storage_dir: str = "./.storage"
+    # Public URL of this API, used to build local-storage links (development only).
+    public_api_url: str = "http://localhost:8001/api/v1"
+
+    # Background jobs run inside the API process unless disabled (e.g. a separate worker service).
+    worker_enabled: bool = True
+    worker_concurrency: int = Field(2, ge=1, le=8)
 
     openai_api_key: str = Field("", repr=False)
     openai_model: str = "gpt-4o"

@@ -12,6 +12,7 @@ from app.api.routes import (
     courses,
     dashboard,
     learn,
+    media,
     participants,
     slides,
     users,
@@ -21,6 +22,7 @@ from app.core.config import get_settings
 from app.core.logging import RequestLogMiddleware, configure_logging
 from app.db.migrate import run_migrations
 from app.services.heygen_persist import start_background_sweeps
+from app.worker.runner import WorkerPool
 
 API_PREFIX = "/api/v1"
 ROUTERS = (
@@ -30,6 +32,7 @@ ROUTERS = (
     learn,
     users,
     dashboard,
+    media,
     # Previous app, replaced in the next releases (AI wizard, manual video upload, slides).
     course_wizard,
     videos,
@@ -43,12 +46,24 @@ async def validation_error(request: Request, exc: RequestValidationError) -> JSO
     return JSONResponse({"detail": errors}, status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
 
 
+def start_worker() -> WorkerPool | None:
+    settings = get_settings()
+    if not settings.worker_enabled:
+        return None
+    pool = WorkerPool(settings.worker_concurrency)
+    pool.start()
+    return pool
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_migrations()
     # HeyGen retires its v1/v2 API on 2026-10-31: copy finished videos to Storage now.
     start_background_sweeps()
+    worker = start_worker()
     yield
+    if worker:
+        worker.stop()  # running jobs finish or their lease expires and another worker retries them
 
 
 def create_app() -> FastAPI:
@@ -73,6 +88,7 @@ def create_app() -> FastAPI:
 
     for module in ROUTERS:
         app.include_router(module.router, prefix=API_PREFIX)
+    app.include_router(media.local_router, prefix=API_PREFIX)
 
     @app.get("/")
     def root():

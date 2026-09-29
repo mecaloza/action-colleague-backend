@@ -190,26 +190,16 @@ def _call_openai(system_prompt: str, user_prompt: str, json_mode: bool = True) -
 
 
 def _extract_text_from_pdf(file_path: str) -> str:
-    """Extract text from PDF. Falls back to empty string."""
+    """Extract text from PDF (same extractor as uploaded course materials). Falls back to empty string."""
+    from pathlib import Path
+
+    from app.services.media_processing import MediaError, extract_text
+
     try:
-        import fitz  # PyMuPDF
-        doc = fitz.open(file_path)
-        text = ""
-        for page in doc:
-            text += page.get_text()
-        doc.close()
-        return text[:15000]  # Limit
-    except ImportError:
-        # Fallback: try pdfplumber
-        try:
-            import pdfplumber
-            with pdfplumber.open(file_path) as pdf:
-                text = ""
-                for page in pdf.pages:
-                    text += (page.extract_text() or "") + "\n"
-            return text[:15000]
-        except ImportError:
-            return "[PDF text extraction not available - install PyMuPDF or pdfplumber]"
+        return extract_text(Path(file_path), "application/pdf", file_path)[:15000]
+    except (MediaError, OSError, ValueError) as exc:
+        logger.warning("pdf_text_extraction_failed", extra={"error": str(exc)[:300]})
+        return ""
 
 
 def _auto_generate_evaluation(module_title: str, content_text: str) -> list:
