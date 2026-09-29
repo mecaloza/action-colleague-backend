@@ -1,85 +1,11 @@
-from contextlib import asynccontextmanager
+"""Compatibility entrypoint: `uvicorn main:app` and `python main.py` keep working."""
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+import os
 
-from database import create_tables
-from routers import (
-    auth,
-    certificates,
-    communications,
-    course_wizard,
-    courses,
-    dashboards,
-    documents,
-    enrollments,
-    evaluations,
-    module_progress,
-    modules,
-    series_wizard,
-    slides,
-    users,
-    videos,
-)
-from utils.heygen_persist import start_background_sweeps
-from utils.json_logging import configure_logging
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    configure_logging()
-    create_tables()
-    # HeyGen retires its v1/v2 API on 2026-10-31: copy finished videos to Storage now.
-    start_background_sweeps()
-    yield
-
-
-app = FastAPI(
-    title="Action Colleague Backend",
-    description="LMS & HR document platform for Action Colleague",
-    version="1.0.0",
-    lifespan=lifespan,
-
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3001", "https://action-colleague.vercel.app", "https://action-colleague-mecalozas-projects.vercel.app"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-API_PREFIX = "/api/v1"
-
-app.include_router(auth.router, prefix=API_PREFIX)
-app.include_router(users.router, prefix=API_PREFIX)
-app.include_router(courses.router, prefix=API_PREFIX)
-app.include_router(course_wizard.router, prefix=API_PREFIX)
-app.include_router(modules.router, prefix=API_PREFIX)
-app.include_router(evaluations.router, prefix=API_PREFIX)
-app.include_router(enrollments.router, prefix=API_PREFIX)
-app.include_router(module_progress.router, prefix=API_PREFIX)
-app.include_router(certificates.router, prefix=API_PREFIX)
-app.include_router(documents.router, prefix=API_PREFIX)
-app.include_router(dashboards.router, prefix=API_PREFIX)
-app.include_router(series_wizard.router, prefix=API_PREFIX)
-app.include_router(communications.router, prefix=API_PREFIX)
-app.include_router(videos.router, prefix=API_PREFIX)
-app.include_router(slides.router, prefix=API_PREFIX)
-
-
-@app.get("/")
-def root():
-    return {"service": "Action Colleague Backend", "version": "1.0.0"}
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
+from app.main import app  # noqa: F401
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
+    # log_config=None: keep the JSON logging configured when the app was imported.
+    uvicorn.run("app.main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8001")), log_config=None)
