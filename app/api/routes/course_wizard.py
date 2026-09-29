@@ -29,7 +29,7 @@ from app.db.session import get_db
 from app.db.models import Course, Evaluation, Module, User
 from app.services.heygen_persist import start_background_persist
 
-router = APIRouter(prefix="/courses/ai", tags=["course-wizard"])
+router = APIRouter(prefix="/courses/ai", tags=["course-wizard"], dependencies=[Depends(require_admin)])
 logger = logging.getLogger(__name__)
 
 def _get_openai_key() -> str:

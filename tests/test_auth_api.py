@@ -23,7 +23,7 @@ def test_login_with_wrong_password_is_rejected(client, admin):
 def test_unknown_email_gets_the_same_error_as_a_wrong_password(client, admin):
     response = client.post("/api/v1/auth/login", json={"email": "nobody@test.dev", "password": TEST_PASSWORD})
     assert response.status_code == 401
-    assert response.json()["detail"] == "Invalid email or password"
+    assert response.json()["detail"] == "Correo o contraseña incorrectos"
 
 
 def test_deactivated_user_cannot_log_in(client, db, collaborator):
@@ -90,7 +90,7 @@ def test_protected_route_requires_token(client):
 
 
 def test_admin_only_route_rejects_collaborator(client, collaborator):
-    response = client.get("/api/v1/users/", headers=auth_headers(client, collaborator.email))
+    response = client.get("/api/v1/users", headers=auth_headers(client, collaborator.email))
     assert response.status_code == 403
 
 
@@ -113,7 +113,7 @@ def test_unhandled_errors_return_json_500_with_cors_headers(client):
         raise RuntimeError("kaboom")
 
     client.app.dependency_overrides[get_current_user] = boom  # the client fixture clears overrides on teardown
-    response = client.get("/api/v1/courses/", headers={"Origin": "http://localhost:3001"})
+    response = client.get("/api/v1/courses", headers={"Origin": "http://localhost:3001"})
     assert response.status_code == 500
     assert response.json()["detail"] == "Error interno del servidor"
     assert response.headers["access-control-allow-origin"] == "http://localhost:3001"

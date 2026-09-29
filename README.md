@@ -33,6 +33,20 @@ Tests:
 .venv/bin/python -m pytest -q
 ```
 
+## API (`/api/v1`)
+
+| Área | Rutas | Quién |
+|---|---|---|
+| Sesión | `/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/me` (GET y PATCH) | todos |
+| Biblioteca y editor | `/courses`, `/courses/{id}` (+ `publish`, `unpublish`, `archive`, `preview`), `/courses/{id}/modules`, `/modules/{id}`, `/modules/{id}/evaluation` | admin |
+| Participantes y resultados | `/courses/{id}/participants`, `/courses/{id}/participants/{user_id}/attempts`, `/courses/{id}/analytics` | admin |
+| Equipo y panel | `/users`, `/users/{id}/courses`, `/dashboard` | admin |
+| Aprender | `/learn/courses`, `/learn/courses/{id}`, `/learn/modules/{id}/quiz`, `/quiz/attempts`, `/complete`, `/position` | colaborador inscrito |
+
+Reglas clave:
+- Los módulos se desbloquean en orden. Un módulo con evaluación se completa aprobándola y uno sin evaluación, al marcarlo como visto.
+- El colaborador nunca recibe las respuestas correctas. Las opciones llevan IDs opacos (HMAC) y la calificación ocurre en el servidor (`app/services/quiz.py`, la única implementación). La solución se muestra solo al aprobar o al agotar los intentos.
+
 ## Migraciones
 
 La app aplica las migraciones al arrancar (`app.db.migrate`), dentro de una transacción con un lock para que dos contenedores no migren a la vez. También se pueden correr a mano:

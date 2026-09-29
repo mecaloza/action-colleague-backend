@@ -23,7 +23,8 @@ class Enrollment(Base):
 
     user = relationship("User", back_populates="enrollments", foreign_keys=[user_id])
     course = relationship("Course", back_populates="enrollments")
-    module_progress = relationship("ModuleProgress", back_populates="enrollment")
+    module_progress = relationship("ModuleProgress", back_populates="enrollment", cascade="all, delete-orphan")
+    attempts = relationship("EvaluationAttempt", back_populates="enrollment", cascade="all, delete-orphan")
 
 
 class ModuleProgress(Base):

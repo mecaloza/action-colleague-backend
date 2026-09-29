@@ -13,10 +13,10 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, require_admin
 from app.db.models import User
 
-router = APIRouter(prefix="/slides", tags=["slides"])
+router = APIRouter(prefix="/slides", tags=["slides"], dependencies=[Depends(require_admin)])
 
 # ── Schemas ──────────────────────────────────────────────────────────
 

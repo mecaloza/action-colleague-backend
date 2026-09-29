@@ -22,7 +22,7 @@ class Evaluation(Base):
     updated_at: Mapped[datetime] = updated_at_column()
 
     module = relationship("Module", back_populates="evaluation")
-    attempts = relationship("EvaluationAttempt", back_populates="evaluation")
+    attempts = relationship("EvaluationAttempt", back_populates="evaluation", cascade="all, delete-orphan")
 
     @property
     def questions(self) -> list:
@@ -51,5 +51,5 @@ class EvaluationAttempt(Base):
 
     evaluation = relationship("Evaluation", back_populates="attempts")
     user = relationship("User")
-    enrollment = relationship("Enrollment")
+    enrollment = relationship("Enrollment", back_populates="attempts")
     module = relationship("Module")
