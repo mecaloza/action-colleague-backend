@@ -1,5 +1,6 @@
 """Admin course management: library, detail, publishing, modules and evaluations."""
 
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
@@ -8,7 +9,18 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_admin
 from app.api.lookups import course_or_404, module_or_404
-from app.db.models import Course, Enrollment, Evaluation, EvaluationAttempt, Module, ModuleProgress, User, UserVideo
+from app.db.models import (
+    Course,
+    Enrollment,
+    Evaluation,
+    EvaluationAttempt,
+    Job,
+    MediaAsset,
+    Module,
+    ModuleProgress,
+    User,
+    UserVideo,
+)
 from app.schemas.courses import (
     CourseCreate,
     CourseDetail,
@@ -23,11 +35,13 @@ from app.schemas.courses import (
     ModuleUpdate,
 )
 from app.schemas.learn import LearnerCourseDetail
+from app.schemas.media import PURPOSES_NEEDING_MODULE
 from app.services import legacy_data, progress, quiz
 from app.services.course_views import ACTIVE_GENERATION, course_counts, course_detail, course_summary, module_admin
 from app.services.learner_views import course_player_detail
-from app.services.media import MediaResolver
+from app.services.media import MediaResolver, discard_assets
 
+logger = logging.getLogger(__name__)
 router = APIRouter(tags=["courses"], dependencies=[Depends(require_admin)])
 
 
@@ -43,6 +57,42 @@ def _detach_legacy_videos(db: Session, module_ids) -> None:
         update(UserVideo).where(UserVideo.module_id.in_(module_ids)).values(module_id=None),
         execution_options={"synchronize_session": False},
     )
+
+
+def _module_media(module: Module) -> list[str | None]:
+    return [module.video_asset_id, module.poster_asset_id, module.captions_asset_id, module.document_asset_id]
+
+
+BOUND_PURPOSES = (*PURPOSES_NEEDING_MODULE, "course_cover")  # uploads only their module or course can use
+
+
+def _drop_pending_jobs(db: Session, *conditions) -> list[str]:
+    """
+    Delete the jobs that would only work on deleted rows (running ones finish on their own and clean
+    up). Returns the uploads the queued ones were bringing to the module or course: nothing will use
+    them now. A queued course material keeps its job: that file is still wanted.
+    """
+    dropped, uploads = [], []
+    rows = db.query(Job.id, Job.type, Job.status, Job.payload).filter(*conditions, Job.status != "running")
+    for job_id, job_type, job_status, payload in rows:
+        if job_type == "media.process" and job_status == "queued":
+            if (payload or {}).get("purpose") not in BOUND_PURPOSES:
+                continue
+            uploads.append((payload or {}).get("asset_id"))
+        dropped.append(job_id)
+    if dropped:  # a job claimed since the query keeps running: it cleans up after itself
+        no_sync = {"synchronize_session": False}
+        db.execute(delete(Job).where(Job.id.in_(dropped), Job.status != "running"), execution_options=no_sync)
+    return uploads
+
+
+def _discard_quietly(db: Session, asset_ids: list[str | None]) -> None:
+    """The deletion is committed: leftover media only costs storage, never an error for the admin."""
+    try:
+        discard_assets(db, asset_ids)
+    except Exception:
+        db.rollback()
+        logger.exception("media_cleanup_after_delete_failed", extra={"assets": len([i for i in asset_ids if i])})
 
 
 def _purge_modules(db: Session, module_ids) -> None:
@@ -113,8 +163,10 @@ def update_course(course_id: int, payload: CourseUpdate, db: Session = Depends(g
 @router.delete("/courses/{course_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_course(course_id: int, db: Session = Depends(get_db)):
     """Deletes the course with its modules, evaluations and participants' results."""
-    course_or_404(db, course_id)
+    course = course_or_404(db, course_id)
     no_sync = {"synchronize_session": False}
+    media = [course.cover_asset_id, *(asset_id for module in course.modules for asset_id in _module_media(module))]
+    media += [asset_id for (asset_id,) in db.execute(select(MediaAsset.id).where(MediaAsset.course_id == course_id))]
     enrollment_ids = [row[0] for row in db.execute(select(Enrollment.id).where(Enrollment.course_id == course_id))]
     legacy_data.delete_certificates(db, enrollment_ids)
     _purge_modules(db, select(Module.id).where(Module.course_id == course_id))
@@ -123,7 +175,9 @@ def delete_course(course_id: int, db: Session = Depends(get_db)):
     db.execute(delete(Enrollment).where(Enrollment.course_id == course_id), execution_options=no_sync)
     db.execute(delete(Module).where(Module.course_id == course_id), execution_options=no_sync)
     db.execute(delete(Course).where(Course.id == course_id), execution_options=no_sync)
+    media += _drop_pending_jobs(db, Job.course_id == course_id)
     db.commit()
+    _discard_quietly(db, media)  # its videos, documents, cover and materials, in storage too
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -223,7 +277,9 @@ def delete_module(module_id: int, db: Session = Depends(get_db)):
             status.HTTP_409_CONFLICT,
             "Un curso publicado o archivado necesita al menos un módulo. Pásalo a borrador para quitar el último.",
         )
+    media = _module_media(module)
     _purge_modules(db, [module.id])
+    media += _drop_pending_jobs(db, Job.module_id == module.id)
     db.expire(module)  # its evaluation and progress were deleted in bulk
     db.delete(module)
     db.flush()
@@ -231,6 +287,7 @@ def delete_module(module_id: int, db: Session = Depends(get_db)):
     _renumber(course)
     progress.refresh_course_enrollments(db, course)
     db.commit()
+    _discard_quietly(db, media)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

@@ -4,6 +4,7 @@ import os
 # imported. Keys are blanked (not removed) so a developer's .env can't fill them back in.
 os.environ["DATABASE_URL"] = "sqlite://"
 os.environ["ENVIRONMENT"] = "test"
+os.environ["WORKER_ENABLED"] = "false"
 for key in (
     "HEYGEN_API_KEY",
     "OPENAI_API_KEY",
@@ -65,6 +66,7 @@ def client(session_factory, monkeypatch):
             yield session
 
     monkeypatch.setattr(main, "run_migrations", lambda: None)
+    monkeypatch.setattr(main, "start_worker", lambda: None)
     monkeypatch.setattr(main, "start_background_sweeps", lambda: None)
     main.app.dependency_overrides[get_db] = override_get_db
     with TestClient(main.app) as test_client:
@@ -155,3 +157,29 @@ class QueryCounter:
 
     def __exit__(self, *exc):
         self._active = False
+
+
+@pytest.fixture
+def storage(tmp_path, monkeypatch):
+    """Local storage in a temporary folder, with links the test client can follow."""
+    from app.core.config import get_settings
+    from app.services.storage import get_storage
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    monkeypatch.setattr(settings, "local_storage_dir", str(tmp_path / "storage"))
+    monkeypatch.setattr(settings, "public_api_url", "http://testserver/api/v1")
+    get_storage.cache_clear()
+    yield get_storage()
+    get_storage.cache_clear()
+
+
+@pytest.fixture
+def worker(session_factory, monkeypatch):
+    """Runs queued jobs inline against the test database."""
+    from app.db import session as db_session
+    from app.worker import jobs  # noqa: F401  (registers handlers)
+    from app.worker.runner import run_pending
+
+    monkeypatch.setattr(db_session, "SessionLocal", session_factory)
+    return run_pending
