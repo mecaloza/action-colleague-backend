@@ -6,9 +6,9 @@ import httpx
 import pytest
 from sqlalchemy import update
 
-from models import Course, Module
-from utils import heygen_persist
-from utils.heygen_persist import PersistConfig, persist_all_heygen_videos
+from app.db.models import Course, Module
+from app.services import heygen_persist
+from app.services.heygen_persist import PersistConfig, persist_all_heygen_videos
 
 CONFIG = PersistConfig(heygen_key="hg-key", supabase_url="https://sb.test", supabase_key="sb-key")
 PUBLIC_PREFIX = "https://sb.test/storage/v1/object/public/course-videos/modules"
@@ -265,14 +265,14 @@ def test_download_error_keeps_reference_and_hides_signed_url(db, caplog):
     assert outcomes == {"error": 1}
     db.refresh(module)
     assert module.video_url == "heygen://video/gone"
-    ours = [record for record in caplog.records if record.name.startswith("utils.")]
+    ours = [record for record in caplog.records if record.name.startswith("app.")]
     logged = [str(value) for record in ours for value in vars(record).values()]
     assert ours
     assert not any("Signature=" in value or "hg-key" in value or "sb-key" in value for value in logged)
 
 
 def test_logging_setup_silences_httpx_request_urls():
-    from utils.json_logging import configure_logging
+    from app.core.logging import configure_logging
 
     configure_logging()
 
@@ -344,7 +344,7 @@ def test_trigger_during_a_run_causes_one_more_pass(monkeypatch):
 def test_status_endpoint_triggers_a_copy_when_heygen_finishes(db, monkeypatch):
     import asyncio
 
-    from routers import course_wizard
+    from app.api.routes import course_wizard
 
     module = _module(db, "heygen://pending/done")
     triggered = []
