@@ -66,6 +66,8 @@ class Settings(BaseSettings):
 
     openai_api_key: str = Field("", repr=False)
     openai_model: str = "gpt-4o"
+    # Deterministic offline AI, voice and presenter (local development and e2e without API keys).
+    use_fake_providers: bool = False
     elevenlabs_api_key: str = Field("", repr=False)
     elevenlabs_voice_id: str = "onwK4e9ZLuTAKqWnGpdt"
     heygen_api_key: str = Field("", repr=False)
@@ -94,6 +96,8 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _validate_environment(self) -> "Settings":
         if self.is_deployed:
+            if self.use_fake_providers:
+                raise ValueError("USE_FAKE_PROVIDERS is only for local development")
             if not self.database_url.startswith("postgresql"):
                 raise ValueError("DATABASE_URL must point to Postgres outside local development")
             if len(self.jwt_secret) < _MIN_JWT_SECRET_LENGTH:

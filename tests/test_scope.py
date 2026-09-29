@@ -24,6 +24,7 @@ REMOVED_OPERATIONS = {
     ("post", "/api/v1/courses/{course_id}/generate"),
     ("get", "/api/v1/modules/"),
     ("post", "/api/v1/modules/"),
+    ("post", "/api/v1/slides/generate"),
 }
 
 

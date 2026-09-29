@@ -18,11 +18,17 @@ class MediaRef(BaseModel):
     height: int | None = None
 
 
+MAX_AUDIENCE_CHARS = 500
+
+
 class CourseSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     tone: str = Field(default="", max_length=200)
-    audience: str = Field(default="", max_length=500)
+    audience: str = Field(default="", max_length=MAX_AUDIENCE_CHARS)
+    # What the admin asked the AI studio for: kept so the studio can resume and regenerate.
+    brief: str = Field(default="", max_length=8000)
+    minutes: int = Field(default=20, ge=5, le=240)
     voice_id: str = Field(default="", max_length=100)
     voice_name: str = Field(default="", max_length=200)
     avatar_id: str = Field(default="", max_length=100)

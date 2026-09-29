@@ -180,7 +180,7 @@ def test_me_can_update_name_and_password(client, collaborator):
         ("get", "/api/v1/courses/ai/video-status/1"),
         ("post", "/api/v1/courses/ai/check-all-videos/1"),
         ("get", "/api/v1/videos/"),
-        ("post", "/api/v1/slides/generate"),
+        ("post", "/api/v1/slides/preview"),
     ],
 )
 def test_previous_app_tools_are_admin_only(client, collaborator, method, path):

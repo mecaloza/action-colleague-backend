@@ -56,6 +56,15 @@ Reglas clave:
 - **Cola** en Postgres (`jobs`) con *leases*: un trabajo solo se reintenta si su proceso dejó de renovarlo (deploys solapados seguros); los errores reintentan con espera creciente y un proceso caído cuenta como intento. Por defecto corre dentro del API; para separarlo: `WORKER_ENABLED=false` en el API y un servicio con `python -m app.worker` (sin healthcheck HTTP). Al apagarse (deploy), el proceso devuelve sus trabajos en curso a la cola sin gastarles un intento, y cada versión solo toma los tipos de trabajo que conoce.
 - Los medios nuevos se sirven con **URLs firmadas** de corta duración (bucket privado). Supabase limita el tamaño por archivo: súbelo en *Storage → Settings* (p. ej. 2 GB) para videos largos.
 
+## Estudio IA
+
+1. `POST /courses/{id}/outline/generate`: con el brief y los documentos subidos al curso, la IA propone título, objetivos y módulos (trabajo `ai.outline`).
+2. `PUT /courses/{id}/outline`: el admin aprueba (y edita) la propuesta y se crean los módulos.
+3. `POST /courses/{id}/draft`: por módulo, la IA escribe el guion en escenas (diapositiva + narración), un resumen de lectura y la evaluación (`ai.module_draft`). El guion se puede editar o regenerar con indicaciones.
+4. `POST /modules/{id}/evaluation/generate`: sugiere preguntas desde el contenido de cualquier módulo (también manual); se revisan antes de guardar.
+
+Las diapositivas se dibujan en el servidor a 1920×1080 (`app/services/slides`): siete layouts de marca, tipografías libres incluidas (OFL), texto que se ajusta solo y zona reservada para el presentador. `POST /slides/preview` devuelve exactamente la misma imagen que usará el video.
+
 ## Migraciones
 
 La app aplica las migraciones al arrancar (`app.db.migrate`), dentro de una transacción con un lock para que dos contenedores no migren a la vez. También se pueden correr a mano:
@@ -98,7 +107,8 @@ Los tests de migraciones corren contra SQLite y contra un PostgreSQL 16 embebido
 | `STORAGE_BACKEND` | no | `auto` (Supabase si está configurado; si no, disco local en desarrollo), `supabase` o `local`. |
 | `LOCAL_STORAGE_DIR`, `PUBLIC_API_URL` | no | Solo desarrollo: carpeta de los archivos y URL pública del API para sus enlaces. |
 | `WORKER_ENABLED`, `WORKER_CONCURRENCY` | no | Trabajos en segundo plano dentro del API (por defecto sí, 2 a la vez). |
-| `OPENAI_API_KEY`, `OPENAI_MODEL` | para IA | Generación de cursos. |
+| `OPENAI_API_KEY`, `OPENAI_MODEL` | para IA | Estudio IA (estructura, guiones y evaluaciones con salidas estructuradas). |
+| `USE_FAKE_PROVIDERS` | no | Solo desarrollo y e2e: IA, voz y presentador falsos y deterministas, sin llaves ni red. |
 | `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | para voz | Narración. |
 | `HEYGEN_API_KEY` | para avatar | Presentador IA. |
 
