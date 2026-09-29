@@ -201,13 +201,17 @@ def _media_failed(db: Session, job: Job, error: str) -> None:
             module.generation_status, module.generation_error = "failed", error
 
 
-def _start_processing(asset_id: str) -> AssetSnapshot | None:
-    """Mark the asset as processing; None if it was deleted after the upload."""
+def _start_processing(ctx: JobContext) -> AssetSnapshot | None:
+    """Mark the asset as processing, and the module waiting for it as generating; None if the asset was deleted."""
+    payload = ctx.payload
     with open_session() as db:
-        asset = db.get(MediaAsset, asset_id)
+        asset = db.get(MediaAsset, payload["asset_id"])
         if asset is None or asset.status == "ready":  # deleted, or a retry after the result was saved
             return None
         asset.status = "processing"
+        module = db.get(Module, payload["module_id"]) if payload.get("module_id") else None
+        if module is not None and payload.get("purpose") in VIDEO_PURPOSES and module.generation_status == "queued":
+            module.generation_status = "generating"  # the editor shows "Procesando" instead of "En cola"
         snapshot = AssetSnapshot.of(asset)
         db.commit()
         return snapshot
@@ -283,7 +287,7 @@ def _finish_processing(ctx: JobContext, snapshot: AssetSnapshot, changes: dict) 
 @handler("media.process", on_failure=_media_failed)
 def process_media(ctx: JobContext) -> dict:
     asset_id = ctx.payload["asset_id"]
-    snapshot = _start_processing(asset_id)
+    snapshot = _start_processing(ctx)
     if snapshot is None:
         return {"skipped": "asset deleted or already processed"}
     changes = _process_file(ctx, snapshot)

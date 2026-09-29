@@ -114,6 +114,30 @@ def test_uploaded_video_becomes_the_modules_web_video(
 
 
 @needs_ffmpeg
+def test_the_module_shows_its_video_is_being_processed(
+    client, db, admin_headers, module, storage, worker, tmp_path, monkeypatch
+):
+    from app.worker.jobs import media as media_job
+
+    seen = []
+    process_file = media_job._process_file
+
+    def spy(ctx, asset):
+        db.expire_all()
+        seen.append(db.get(Module, module.id).generation_status)
+        return process_file(ctx, asset)
+
+    monkeypatch.setattr(media_job, "_process_file", spy)
+    asset = _upload(client, admin_headers, _make_video(tmp_path / "clase.mp4", 640, 360), "video/mp4", "video", module.course_id)
+    client.post(f"/api/v1/media/{asset['id']}/complete", headers=admin_headers, json={"module_id": module.id, "purpose": "module_video"})
+
+    assert worker() == 1
+    assert seen == ["generating"]  # "Procesando" in the editor while FFmpeg runs, not "En cola"
+    db.expire_all()
+    assert db.get(Module, module.id).generation_status == "completed"
+
+
+@needs_ffmpeg
 def test_video_without_audio_is_accepted(client, admin_headers, module, storage, worker, tmp_path):
     source = _make_video(tmp_path / "mudo.mp4", 640, 360, audio=False)
     asset = _upload(client, admin_headers, source, "video/mp4", "video", module.course_id)
