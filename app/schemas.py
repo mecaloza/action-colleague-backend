@@ -1,5 +1,5 @@
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, field_validator
 
@@ -32,24 +32,6 @@ class RefreshRequest(BaseModel):
     refresh_token: str
 
 
-class RegisterRequest(BaseModel):
-    name: str
-    email: str
-    password: str
-    role: str = "collaborator"
-    position: str = ""
-    department: str = ""
-    preferred_language: str = "es"
-    reports_to: Optional[int] = None
-
-    @field_validator("preferred_language")
-    @classmethod
-    def validate_preferred_language(cls, value: str) -> str:
-        if value not in VALID_LANGUAGES:
-            raise ValueError("preferred_language must be one of: es, en, pt")
-        return value
-
-
 # ── User ──────────────────────────────────────────────────────────────
 class UserBase(BaseModel):
     name: str
@@ -68,22 +50,22 @@ class UserBase(BaseModel):
         return value
 
 
+Role = Literal["admin", "collaborator"]
+
+
 class UserCreate(UserBase):
+    role: Role = "collaborator"
     password: str
-    reports_to: Optional[int] = None
-    permissions: List[str] = []
 
 
 class UserUpdate(BaseModel):
     name: Optional[str] = None
     email: Optional[str] = None
-    role: Optional[str] = None
+    role: Optional[Role] = None
     position: Optional[str] = None
     department: Optional[str] = None
     preferred_language: str = "es"
     hire_date: Optional[date] = None
-    reports_to: Optional[int] = None
-    permissions: Optional[List[str]] = None
     is_active: Optional[bool] = None
     password: Optional[str] = None
 
@@ -97,56 +79,8 @@ class UserUpdate(BaseModel):
 
 class UserOut(UserBase):
     id: int
-    reports_to: Optional[int] = None
-    permissions: List[str] = []
     is_active: bool = True
     created_at: Optional[datetime] = None
-
-    model_config = {"from_attributes": True}
-
-
-class PermissionsUpdate(BaseModel):
-    permissions: List[str]
-
-
-class RoleUpdate(BaseModel):
-    role: str
-
-
-class UserProfile(BaseModel):
-    id: int
-    name: str
-    email: str
-    role: str
-    position: str = ""
-    department: str = ""
-    preferred_language: str = "es"
-    hire_date: Optional[date] = None
-    reports_to: Optional[int] = None
-    permissions: List[str] = []
-    is_active: bool = True
-    created_at: Optional[datetime] = None
-    manager: Optional[UserOut] = None
-    direct_reports: List[UserOut] = []
-
-    model_config = {"from_attributes": True}
-
-    @field_validator("preferred_language")
-    @classmethod
-    def validate_preferred_language(cls, value: str) -> str:
-        if value not in VALID_LANGUAGES:
-            raise ValueError("preferred_language must be one of: es, en, pt")
-        return value
-
-
-class OrgChartNode(BaseModel):
-    id: int
-    name: str
-    email: str
-    position: str
-    department: str
-    role: str
-    children: List["OrgChartNode"] = []
 
     model_config = {"from_attributes": True}
 
@@ -318,22 +252,6 @@ class EvaluationResult(BaseModel):
     next_module_unlocked: bool
 
 
-# ── Evaluation Attempts ──────────────────────────────────────────────
-class EvaluationAttemptOut(BaseModel):
-    id: int
-    evaluation_id: int
-    user_id: int
-    enrollment_id: int
-    module_id: int
-    answers: List[Any] = []
-    score: Optional[float] = None
-    passed: bool = False
-    attempt_number: int = 1
-    created_at: Optional[datetime] = None
-
-    model_config = {"from_attributes": True}
-
-
 # ── Evaluation Analytics ─────────────────────────────────────────────
 class QuestionAnalytics(BaseModel):
     question_index: int
@@ -377,60 +295,6 @@ class CourseResponsesResponse(BaseModel):
     responses: List[UserResponseSummary] = []
 
 
-# ── Certificate ───────────────────────────────────────────────────────
-class CertificateBase(BaseModel):
-    enrollment_id: int
-    pdf_url: str = ""
-
-
-class CertificateCreate(CertificateBase):
-    pass
-
-
-class CertificateOut(CertificateBase):
-    id: int
-    issued_at: Optional[datetime] = None
-
-    model_config = {"from_attributes": True}
-
-
-# ── Document ──────────────────────────────────────────────────────────
-class DocumentBase(BaseModel):
-    user_id: int
-    type: str
-    pdf_url: str = ""
-    template_data: Dict[str, Any] = {}
-
-
-class DocumentCreate(BaseModel):
-    user_id: int
-    type: str = "labor_letter"
-    template_data: Dict[str, Any] = {}
-
-
-class DocumentOut(BaseModel):
-    id: int
-    user_id: int
-    type: str
-    pdf_url: str
-    template_data: Dict[str, Any] = {}
-    generated_at: Optional[datetime] = None
-
-    model_config = {"from_attributes": True}
-
-
-# ── AI Generate ───────────────────────────────────────────────────────
-class CourseGenerateRequest(BaseModel):
-    topic: str = ""
-    num_modules: int = 3
-
-
-class CourseGenerateResponse(BaseModel):
-    message: str
-    course_id: int
-    modules_created: int
-
-
 # ── Dashboard ─────────────────────────────────────────────────────────
 class AdminDashboard(BaseModel):
     total_users: int
@@ -439,136 +303,6 @@ class AdminDashboard(BaseModel):
     completed_enrollments: int
     active_enrollments: int
     total_certificates: int
-
-
-class CollaboratorDashboard(BaseModel):
-    user_id: int
-    enrollments: List[EnrollmentOut] = []
-    completed_courses: int
-    in_progress_courses: int
-    certificates: int
-
-
-# ── Micro-Series (Sora Video Generation) ─────────────────────────────
-
-
-class SceneBase(BaseModel):
-    order: int = 0
-    sora_prompt: str = ""
-    narration_text: str = ""
-    duration_seconds: int = 8
-
-
-class SceneCreate(SceneBase):
-    episode_id: int
-
-
-class SceneResponse(SceneBase):
-    id: int
-    episode_id: int
-    video_url: str = ""
-    audio_url: str = ""
-    sora_video_id: str = ""
-    status: str = "draft"
-    created_at: Optional[datetime] = None
-
-    model_config = {"from_attributes": True}
-
-
-class EpisodeBase(BaseModel):
-    title: str
-    synopsis: str = ""
-    order: int = 0
-
-
-class EpisodeCreate(EpisodeBase):
-    series_id: int
-
-
-class EpisodeResponse(EpisodeBase):
-    id: int
-    series_id: int
-    final_video_url: str = ""
-    duration_seconds: int = 0
-    status: str = "draft"
-    scenes: List[SceneResponse] = []
-    created_at: Optional[datetime] = None
-
-    model_config = {"from_attributes": True}
-
-
-class SeriesBase(BaseModel):
-    title: str
-    description: str = ""
-    category: str = "custom"
-
-
-class SeriesCreate(SeriesBase):
-    created_by: Optional[int] = None
-
-
-class SeriesResponse(SeriesBase):
-    id: int
-    thumbnail_url: str = ""
-    status: str = "draft"
-    created_by: Optional[int] = None
-    episodes: List[EpisodeResponse] = []
-    created_at: Optional[datetime] = None
-
-    model_config = {"from_attributes": True}
-
-
-class SeriesListItem(SeriesBase):
-    id: int
-    thumbnail_url: str = ""
-    status: str = "draft"
-    created_by: Optional[int] = None
-    created_at: Optional[datetime] = None
-
-    model_config = {"from_attributes": True}
-
-
-class SeriesGenerateRequest(BaseModel):
-    title: str
-    description: str = ""
-    category: str = "custom"
-    case_description: str = ""
-    num_episodes: int = 3
-
-
-# ── Communications ───────────────────────────────────────────────────
-
-
-class CommunicationCreate(BaseModel):
-    title: str
-    message: str = ""
-    image_url: str = ""
-    generated: bool = False
-    prompt_used: str = ""
-    created_by: Optional[int] = None
-
-
-class CommunicationResponse(BaseModel):
-    id: int
-    title: str
-    message: str = ""
-    image_url: str = ""
-    generated: bool = False
-    prompt_used: str = ""
-    created_by: Optional[int] = None
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-
-    model_config = {"from_attributes": True}
-
-
-class ImageGenerateRequest(BaseModel):
-    prompt: str
-
-
-class ImageGenerateResponse(BaseModel):
-    image_url: str
-    prompt_used: str
 
 
 # ── User Videos (Manual Course Creation) ──────────────────────────────

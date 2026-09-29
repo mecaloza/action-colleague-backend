@@ -2,8 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.db.models import Certificate, Course, Enrollment, User
-from app.schemas import AdminDashboard, CollaboratorDashboard, EnrollmentOut
+from app.db.models import Course, Enrollment, User
+from app.schemas import AdminDashboard
 
 router = APIRouter(prefix="/dashboards", tags=["dashboards"])
 
@@ -15,14 +15,13 @@ def admin_dashboard(db: Session = Depends(get_db)):
     total_enrollments = db.query(Enrollment).count()
     completed = db.query(Enrollment).filter(Enrollment.status == "completed").count()
     active = db.query(Enrollment).filter(Enrollment.status == "in_progress").count()
-    total_certs = db.query(Certificate).count()
     return AdminDashboard(
         total_users=total_users,
         total_courses=total_courses,
         total_enrollments=total_enrollments,
         completed_enrollments=completed,
         active_enrollments=active,
-        total_certificates=total_certs,
+        total_certificates=completed,  # legacy field: one "certificate" per completed course
     )
 
 
@@ -35,7 +34,6 @@ def collaborator_dashboard(user_id: int, db: Session = Depends(get_db)):
     enrollments = db.query(Enrollment).filter(Enrollment.user_id == user_id).all()
     completed = sum(1 for e in enrollments if e.status == "completed")
     in_progress = sum(1 for e in enrollments if e.status == "in_progress")
-    certs = db.query(Certificate).join(Enrollment).filter(Enrollment.user_id == user_id).count()
 
     # Build enriched enrollments with course info
     enriched = []
@@ -67,7 +65,7 @@ def collaborator_dashboard(user_id: int, db: Session = Depends(get_db)):
         "enrollments": enriched,
         "completed_courses": completed,
         "in_progress_courses": in_progress,
-        "certificates": certs,
+        "certificates": completed,  # legacy field: same as completed_courses
         "total_hours": total_hours,
         "recent_activity": [],
     }

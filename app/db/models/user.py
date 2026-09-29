@@ -1,5 +1,3 @@
-import json
-
 from sqlalchemy import Boolean, Column, Date, DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import relationship
 
@@ -17,23 +15,14 @@ class User(Base):
     position = Column(String(200), default="")
     department = Column(String(200), default="")
     preferred_language = Column(String(5), default="es")
+    # Legacy org-chart and permissions data: kept in the database, no longer exposed by the API.
     reports_to = Column(Integer, ForeignKey("users.id"), nullable=True)
     permissions_json = Column(Text, default="[]")
     is_active = Column(Boolean, default=True)
     hire_date = Column(Date, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
 
-    manager = relationship("User", remote_side="User.id", backref="direct_reports")
     enrollments = relationship("Enrollment", back_populates="user")
-    documents = relationship("Document", back_populates="user")
-
-    @property
-    def permissions(self) -> list:
-        return json.loads(self.permissions_json) if self.permissions_json else []
-
-    @permissions.setter
-    def permissions(self, value: list):
-        self.permissions_json = json.dumps(value)
 
 
 class RefreshToken(Base):
