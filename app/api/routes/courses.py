@@ -42,6 +42,7 @@ from app.services.learner_views import course_player_detail
 from app.services.media import MediaResolver, discard_assets
 from app.services.storage import StorageError, get_storage
 from app.worker.jobs import render as render_jobs
+from app.worker.jobs.recording import LEGACY_VIDEO_JOB
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["courses"], dependencies=[Depends(require_admin)])
@@ -62,7 +63,12 @@ def _detach_legacy_videos(db: Session, module_ids) -> None:
 
 
 def _module_media(module: Module) -> list[str | None]:
-    return [module.video_asset_id, module.poster_asset_id, module.captions_asset_id, module.document_asset_id]
+    """What the module shows, plus the camera and deck of its recording (they can be combined again)."""
+    take = (module.storyboard or {}).get("recording") or {}
+    return [
+        module.video_asset_id, module.poster_asset_id, module.captions_asset_id, module.document_asset_id,
+        take.get("recording_asset_id"), take.get("deck_asset_id"),
+    ]
 
 
 BOUND_PURPOSES = (*PURPOSES_NEEDING_MODULE, "course_cover")  # uploads only their module or course can use
@@ -81,6 +87,8 @@ def _drop_pending_jobs(db: Session, *conditions) -> tuple[list[str], list[str]]:
         if job_type == "media.process" and job_status == "queued":
             if (payload or {}).get("purpose") not in BOUND_PURPOSES:
                 continue
+            uploads.append((payload or {}).get("asset_id"))
+        elif job_type == LEGACY_VIDEO_JOB and job_status == "queued":  # the old video's copy, not processed yet
             uploads.append((payload or {}).get("asset_id"))
         elif job_type == "video.render" and job_status == "queued":  # finished ones already cleaned up
             files += render_jobs.leftover_paths(state)

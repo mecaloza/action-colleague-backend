@@ -245,8 +245,8 @@ def test_two_uploads_for_one_module_finishing_together_leave_no_orphan(pg, stora
 
     attach, attaching = media_jobs._attach, threading.Event()
 
-    def slow_attach(db, asset, purpose, module_id):
-        replaced = attach(db, asset, purpose, module_id)
+    def slow_attach(db, asset, payload):
+        replaced = attach(db, asset, payload)
         if asset.id == uploads["a"]:
             attaching.set()
             time.sleep(0.5)  # "b" finishes meanwhile

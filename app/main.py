@@ -1,14 +1,15 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import update
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from app.api.routes import (
     auth,
-    course_wizard,
     courses,
     dashboard,
     learn,
@@ -16,12 +17,13 @@ from app.api.routes import (
     participants,
     studio,
     users,
-    videos,
 )
 from app.core.config import get_settings
 from app.core.logging import RequestLogMiddleware, configure_logging
 from app.db.migrate import run_migrations
-from app.services.heygen_persist import start_background_sweeps
+from app.db.models import Job
+from app.db.session import SessionLocal
+from app.worker import queue
 from app.worker.runner import WorkerPool
 
 API_PREFIX = "/api/v1"
@@ -34,9 +36,6 @@ ROUTERS = (
     dashboard,
     media,
     studio,
-    # Previous app, replaced in the next releases (AI wizard and manual video upload).
-    course_wizard,
-    videos,
 )
 
 
@@ -44,6 +43,23 @@ async def validation_error(request: Request, exc: RequestValidationError) -> JSO
     """422 with where and what is wrong, never echoing the values sent (passwords, answers)."""
     errors = [{"loc": list(error.get("loc", ())), "msg": error.get("msg", ""), "type": error.get("type", "")} for error in exc.errors()]
     return JSONResponse({"detail": errors}, status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+
+
+logger = logging.getLogger(__name__)
+
+
+def schedule_maintenance() -> None:
+    """Background upkeep that must run once per deploy (idempotent)."""
+    with SessionLocal() as db:
+        job = queue.enqueue(db, "legacy.migrate", dedupe_key="legacy-migrate", max_attempts=5)
+        now = queue.utcnow()  # a pass waiting for its next recheck runs now: every deploy looks again
+        db.execute(
+            update(Job)
+            .where(Job.id == job.id, Job.status == "queued", Job.run_after > now)
+            .values(run_after=now)
+            .execution_options(synchronize_session=False)  # compared in the database, not in Python
+        )
+        db.commit()
 
 
 def start_worker() -> WorkerPool | None:
@@ -58,8 +74,10 @@ def start_worker() -> WorkerPool | None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_migrations()
-    # HeyGen retires its v1/v2 API on 2026-10-31: copy finished videos to Storage now.
-    start_background_sweeps()
+    try:
+        schedule_maintenance()  # among others, copies the previous app's HeyGen videos before HeyGen retires them
+    except Exception:  # upkeep never keeps the app from starting: the next deploy schedules it again
+        logger.exception("maintenance_not_scheduled")
     worker = start_worker()
     yield
     if worker:

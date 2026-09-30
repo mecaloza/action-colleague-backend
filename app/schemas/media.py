@@ -43,6 +43,7 @@ class MediaAssetOut(BaseModel):
     url: str | None = None
     error: str | None = None
     pages: list[str] = []
+    page_count: int | None = None  # of a deck: more than `pages` when some links could not be signed
     text_chars: int | None = None
     created_at: UtcDatetime | None = None
 

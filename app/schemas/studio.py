@@ -2,7 +2,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, StringConstraints
 
-from app.schemas.courses import MAX_AUDIENCE_CHARS
+from app.schemas.courses import MAX_AUDIENCE_CHARS, MAX_MODULES, ModuleCount
 from app.services.ai.designer import MAX_NARRATION_CHARS, MAX_STORYBOARD_SCENES, CourseOutline, OutlineModule
 from app.services.slides.spec import Slide
 
@@ -15,6 +15,7 @@ __all__ = [
     "DraftRequest",
     "OutlineGenerate",
     "QuizGenerate",
+    "RecordingCompose",
     "RenderRequest",
     "SlidePreview",
     "Storyboard",
@@ -23,7 +24,6 @@ __all__ = [
     "VoiceOut",
 ]
 
-MAX_MODULES = 12  # per course, both when asking the AI for a structure and when approving one
 MAX_TITLE_CHARS = 300  # size of the course and module title columns
 MAX_OUTLINE_ITEMS = 10  # objectives / key points per list
 
@@ -36,7 +36,7 @@ class OutlineGenerate(BaseModel):
     audience: str = Field(default="", max_length=MAX_AUDIENCE_CHARS)
     tone: str = Field(default="", max_length=200)
     minutes: int = Field(default=20, ge=5, le=240)
-    modules: int | None = Field(default=None, ge=1, le=MAX_MODULES)
+    modules: ModuleCount = None
     feedback: str = Field(default="", max_length=4000)
 
 
@@ -122,6 +122,17 @@ class RenderRequest(BaseModel):
     avatar_name: str | None = Field(default=None, max_length=200)
     presenter: bool | None = None
     theme: Literal["dark", "light"] | None = None
+
+
+class TimelinePoint(BaseModel):
+    at: float = Field(ge=0, le=6 * 3600)  # seconds into the recording (up to 6 hours)
+    slide: int = Field(ge=0, le=500)  # deck page index
+
+
+class RecordingCompose(BaseModel):
+    recording_asset_id: str = Field(min_length=1, max_length=36)
+    deck_asset_id: str | None = Field(default=None, max_length=36)  # without a deck the recording is the video
+    timeline: list[TimelinePoint] = Field(default_factory=list, max_length=2000)  # slide changes
 
 
 class Capabilities(BaseModel):

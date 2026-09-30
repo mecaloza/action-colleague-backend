@@ -6,6 +6,7 @@ media.process: turn an uploaded file into something the platform can use, then a
 - deck: one image per PDF page (recording studio) + extracted text.
 - image: resized JPEG.
 Then, depending on the purpose, it becomes a module's video or document, or a course's cover.
+A module's new video also gets its captions queued.
 """
 
 import logging
@@ -20,6 +21,7 @@ from app.schemas.media import PURPOSES_NEEDING_MODULE, VIDEO_PURPOSES
 from app.services import media_processing as mp
 from app.services.media import discard_assets
 from app.services.storage import StorageError, get_storage
+from app.worker.jobs.recording import LEGACY_VIDEO, LEGACY_VIDEO_JOB, drop_take, enqueue_captions
 from app.worker.runner import JobCancelled, JobContext, JobError, handler, holds_job, open_session
 
 logger = logging.getLogger(__name__)
@@ -96,7 +98,7 @@ def _process_video(ctx: JobContext, asset: AssetSnapshot, source: Path, work: Pa
         "duration_seconds": round(info.duration, 2),
         "width": info.width,
         "height": info.height,
-        "meta": {"poster_asset_id": poster_id},
+        "meta": {"poster_asset_id": poster_id, "has_audio": info.audio_codec is not None},
     }
 
 
@@ -164,19 +166,27 @@ def _attach_document(module: Module, asset: MediaAsset) -> list[str | None]:
     return replaced
 
 
-def _attach(db: Session, asset: MediaAsset, purpose: str | None, module_id: int | None) -> list[str | None] | None:
+def _attach(db: Session, asset: MediaAsset, payload: dict) -> list[str | None] | None:
     """
     Make the processed asset a module's video or document, or a course's cover. Returns what it
-    replaced, or None when that module or course was deleted meanwhile. The row is locked: two uploads
-    for one module finishing together must each see what the other attached.
+    replaced, or None when that module or course was deleted (or, for a migrated video, got another
+    video) meanwhile. The row is locked: two uploads for one module finishing together must each see
+    what the other attached.
     """
-    if purpose in PURPOSES_NEEDING_MODULE:
+    purpose, module_id = payload.get("purpose"), payload.get("module_id")
+    if purpose in PURPOSES_NEEDING_MODULE or purpose == LEGACY_VIDEO:
         module = db.get(Module, module_id, with_for_update=True) if module_id else None
         if module is None:
             return None
         if purpose == "module_document":
             return _attach_document(module, asset)
-        return _attach_video(module, asset, VIDEO_PURPOSES[purpose])
+        if purpose == LEGACY_VIDEO and (module.video_asset_id or module.video_url != payload.get("legacy_url")):
+            return None  # the admin gave it another video meanwhile: the copy of the old one is not needed
+        # A migrated video keeps the module's source (it was made with AI or uploaded before).
+        replaced = _attach_video(module, asset, VIDEO_PURPOSES.get(purpose) or module.source)
+        replaced += drop_take(db, module, keep={asset.id})  # a recording it replaces: its camera and deck
+        enqueue_captions(db, module, asset)
+        return replaced
     if purpose == "course_cover" and asset.course_id:
         course = db.get(Course, asset.course_id, with_for_update=True)
         if course is None:
@@ -194,10 +204,9 @@ def _media_failed(db: Session, job: Job, error: str) -> None:
     if asset:
         asset.status, asset.error = "failed", error
     module_id = payload.get("module_id")
-    if module_id and payload.get("purpose") in VIDEO_PURPOSES:
-        module = db.get(Module, module_id)
-        if module:
-            module.generation_status, module.generation_error = "failed", error
+    module = db.get(Module, module_id) if module_id and payload.get("purpose") in VIDEO_PURPOSES else None
+    if module:  # a migrated video that fails leaves the module as it was: its old video still plays
+        module.generation_status, module.generation_error = "failed", error
 
 
 def _start_processing(ctx: JobContext) -> AssetSnapshot | None:
@@ -261,7 +270,7 @@ def _finish_processing(ctx: JobContext, snapshot: AssetSnapshot, changes: dict) 
             if column != "meta":
                 setattr(asset, column, value)
         asset.meta, asset.status, asset.error = {**(asset.meta or {}), **new_meta}, "ready", None
-        replaced = _attach(db, asset, purpose, ctx.payload.get("module_id"))
+        replaced = _attach(db, asset, ctx.payload)
         db.commit()
         logger.info("media_processed", extra={"asset_id": asset_id, "kind": asset.kind, "purpose": purpose})
         orphaned = replaced is None
@@ -274,6 +283,7 @@ def _finish_processing(ctx: JobContext, snapshot: AssetSnapshot, changes: dict) 
         return {"skipped": "module or course deleted"} if orphaned else {"asset_id": asset_id}
 
 
+@handler(LEGACY_VIDEO_JOB, on_failure=_media_failed)  # a type of its own: see LEGACY_VIDEO_JOB
 @handler("media.process", on_failure=_media_failed)
 def process_media(ctx: JobContext) -> dict:
     asset_id = ctx.payload["asset_id"]

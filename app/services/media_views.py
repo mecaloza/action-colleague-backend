@@ -31,6 +31,7 @@ def asset_out(db: Session, asset: MediaAsset, signed: dict[str, str] | None = No
         url=signed.get(asset.path),
         error=asset.error,
         pages=[signed[path] for path in page_paths if path in signed],
+        page_count=len(page_paths) if page_paths else None,
         text_chars=meta.get("text_chars"),
         created_at=asset.created_at,
     )

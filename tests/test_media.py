@@ -95,7 +95,7 @@ def test_uploaded_video_becomes_the_modules_web_video(
     assert done.status_code == 200 and done.json()["status"] == "uploaded"
     assert client.get(f"/api/v1/courses/{module.course_id}", headers=admin_headers).json()["modules"][0]["generation_status"] == "queued"
 
-    assert worker() == 1
+    assert worker() >= 1  # processing (then the captions job)
 
     course = client.get(f"/api/v1/courses/{module.course_id}", headers=admin_headers).json()
     [detail] = course["modules"]
@@ -131,7 +131,7 @@ def test_the_module_shows_its_video_is_being_processed(
     asset = _upload(client, admin_headers, _make_video(tmp_path / "clase.mp4", 640, 360), "video/mp4", "video", module.course_id)
     client.post(f"/api/v1/media/{asset['id']}/complete", headers=admin_headers, json={"module_id": module.id, "purpose": "module_video"})
 
-    assert worker() == 1
+    assert worker() == 2  # the video, then its captions
     assert seen == ["generating"]  # "Procesando" in the editor while FFmpeg runs, not "En cola"
     db.expire_all()
     assert db.get(Module, module.id).generation_status == "completed"

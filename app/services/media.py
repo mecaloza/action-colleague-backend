@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
 from sqlalchemy import or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 
 from app.db.models import Course, MediaAsset, Module
 from app.schemas.courses import MediaRef
@@ -100,6 +100,9 @@ def discard_assets(db: Session, asset_ids: Iterable[str | None]) -> None:
     after. Storage failures are logged, not raised: an orphaned file costs little, a failed edit more.
     """
     wanted = {asset_id for asset_id in asset_ids if asset_id}
+    if wanted:  # a video's (or recording's) poster is an asset of its own: it goes with it
+        metas = db.query(MediaAsset.meta).filter(MediaAsset.id.in_(wanted)).all()
+        wanted |= {poster for (meta,) in metas if (poster := (meta or {}).get("poster_asset_id"))}
     # Rows locked before the check (in id order: two cleanups can't deadlock), so nothing can start
     # pointing at them in between; ON DELETE SET NULL would silently undo that new link.
     assets = (
@@ -140,7 +143,12 @@ class MediaResolver:
         ids = {asset_id for module in modules for asset_id in _asset_ids(module) if asset_id}
         ids.update(asset_id for asset_id in extra_asset_ids if asset_id)
         if ids:
-            assets = self.db.query(MediaAsset).filter(MediaAsset.id.in_(ids), MediaAsset.status == "ready").all()
+            assets = (
+                self.db.query(MediaAsset)
+                .options(defer(MediaAsset.meta))  # a video's transcript lives there: no page needs it
+                .filter(MediaAsset.id.in_(ids), MediaAsset.status == "ready")
+                .all()
+            )
             self._assets = {asset.id: asset for asset in assets}
             self._urls = sign_assets(list(self._assets.values()), SIGNED_URL_SECONDS)
         return self

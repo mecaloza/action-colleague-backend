@@ -173,19 +173,10 @@ def test_me_can_update_name_and_password(client, collaborator):
     assert client.post("/api/v1/auth/login", json={"email": collaborator.email, "password": "otra-clave-9"}).status_code == 200
 
 
-@pytest.mark.parametrize(
-    ("method", "path"),
-    [
-        ("get", "/api/v1/courses/ai/voices"),
-        ("get", "/api/v1/courses/ai/video-status/1"),
-        ("post", "/api/v1/courses/ai/check-all-videos/1"),
-        ("get", "/api/v1/videos/"),
-        ("post", "/api/v1/slides/preview"),
-    ],
-)
-def test_previous_app_tools_are_admin_only(client, collaborator, method, path):
-    response = getattr(client, method)(path, headers=auth_headers(client, collaborator.email))
-    assert response.status_code == 403
+def test_studio_tools_are_admin_only(client, collaborator):
+    headers = auth_headers(client, collaborator.email)
+    assert client.post("/api/v1/slides/preview", headers=headers, json={"slide": {"layout": "cover"}}).status_code == 403
+    assert client.get("/api/v1/studio/voices", headers=headers).status_code == 403
 
 
 def test_preview_shows_every_module_unlocked(client, admin_headers):
@@ -280,6 +271,17 @@ def test_partial_settings_keep_the_rest(client, admin_headers):
 
     assert settings["audience"] == "Operarios"
     assert settings["tone"] == "cercano" and settings["voice_id"] == "v1" and settings["presenter"] is False
+
+
+def test_the_requested_module_count_is_kept_with_the_course(client, admin_headers):
+    course = _create_course(client, admin_headers)
+    url = f"/api/v1/courses/{course['id']}"
+    assert course["settings"]["modules"] is None  # the AI chooses unless the brief asked for a number
+
+    assert client.patch(url, headers=admin_headers, json={"settings": {"modules": 4}}).json()["settings"]["modules"] == 4
+    assert client.patch(url, headers=admin_headers, json={"settings": {"tone": "cercano"}}).json()["settings"]["modules"] == 4
+    assert client.patch(url, headers=admin_headers, json={"settings": {"modules": None}}).json()["settings"]["modules"] is None
+    assert client.patch(url, headers=admin_headers, json={"settings": {"modules": 13}}).status_code == 422
 
 
 def test_invalid_questions_get_a_readable_reason(client, admin_headers):

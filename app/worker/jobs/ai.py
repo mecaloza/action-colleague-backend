@@ -78,6 +78,7 @@ def generate_outline(ctx: JobContext) -> dict:
             "audience": (request.audience or outline.audience).strip()[:MAX_AUDIENCE_CHARS],
             "tone": request.tone,
             "minutes": request.minutes,
+            "modules": request.modules,
         }
         db.commit()
     return {"outline": outline.model_dump()}

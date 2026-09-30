@@ -11,7 +11,8 @@ app/
   api/deps.py      sesión de BD y usuario autenticado
   api/routes/      endpoints bajo /api/v1
   db/              modelos, sesión y migraciones (migrate.py)
-  services/        integraciones (almacenamiento, IA, video)
+  services/        integraciones (almacenamiento, IA, diapositivas, video)
+  worker/          cola de trabajos en Postgres y sus handlers (python -m app.worker)
 alembic/           migraciones del esquema (Alembic)
 scripts/           utilidades de desarrollo (seed local)
 tests/             pytest
@@ -42,6 +43,8 @@ Tests:
 | Participantes y resultados | `/courses/{id}/participants`, `/courses/{id}/participants/{user_id}/attempts`, `/courses/{id}/analytics` | admin |
 | Equipo y panel | `/users`, `/users/{id}/courses`, `/dashboard` | admin |
 | Aprender | `/learn/courses`, `/learn/courses/{id}`, `/learn/modules/{id}/quiz`, `/quiz/attempts`, `/complete`, `/position` | colaborador inscrito |
+| Medios y trabajos | `/media/uploads`, `/media/{id}/complete`, `/media/{id}`, `/courses/{id}/cover`, `/courses/{id}/materials`, `/jobs` | admin |
+| Estudio IA y video | `/courses/{id}/outline` (+ `generate`), `/courses/{id}/draft`, `/modules/{id}/storyboard`, `/slides/preview`, `/studio/*`, `/courses/{id}/render`, `/modules/{id}/render`, `/modules/{id}/recording`, `/modules/{id}/transcribe` | admin |
 
 Reglas clave:
 - Los módulos se desbloquean en orden. Un módulo con evaluación se completa aprobándola y uno sin evaluación, al marcarlo como visto.
@@ -72,6 +75,20 @@ Las diapositivas se dibujan en el servidor a 1920×1080 (`app/services/slides`):
 1. **Narración**: ElevenLabs por escena con tiempos por carácter (la voz elegida o clonada). Las duraciones salen del audio real, unido a nivel de muestra con pausas, y normalizado (`loudnorm`); de los tiempos salen los subtítulos WebVTT.
 2. **Presentador**: HeyGen v3 anima el avatar con **esa misma narración**, en cuadrado 720p. El trabajo se reprograma mientras HeyGen trabaja (no ocupa un worker) y, si HeyGen falla o no está configurado, el video sale igual sin presentador y con un aviso.
 3. **Composición** (FFmpeg): diapositivas de marca a 1920×1080 con transiciones, burbuja circular con aro naranja (recorte cuadrado, nunca estirado), H.264/AAC con `+faststart`, portada y subtítulos. Todo va a Storage privado y reemplaza el video anterior del módulo.
+
+## Grabación y subtítulos
+
+- `POST /modules/{id}/recording` (`video.compose_recording`): une la grabación de cámara del admin con su presentación en PDF. Las diapositivas van a pantalla completa y cambian en el segundo exacto en que se cambiaron al grabar (`timeline: [{at, slide}]`), con la cámara en la burbuja del presentador, sin deformar. Sin presentación, la grabación procesada es el video del módulo. El trabajo espera a que ambas subidas terminen de procesarse.
+- **Subtítulos automáticos** (`media.transcribe`): cada video nuevo de un módulo (subido, grabado o migrado) se transcribe con ElevenLabs Scribe; salen subtítulos WebVTT y una transcripción que la IA usa para sugerir la evaluación del módulo. `POST /modules/{id}/transcribe` lo repite a mano. Sin `ELEVENLABS_API_KEY` no se generan.
+
+## Medios de la app anterior
+
+Cada arranque encola `legacy.migrate` (idempotente, una sola copia activa):
+
+- Convierte las evaluaciones antiguas (`questions_json`) al formato canónico (`spec`).
+- Pone fecha de finalización a los cursos completados antes de que existiera (la del último módulo completado).
+- Copia al bucket privado los videos que la app anterior dejó en buckets públicos del proyecto y los procesa como cualquier subida (portada, duración, subtítulos). El archivo original no se toca.
+- Los videos que siguen en HeyGen esperan a que el copiado de abajo los pase a Storage; el trabajo lo vuelve a revisar cada 6 h hasta el apagado de la API de HeyGen.
 
 ## Migraciones
 
@@ -106,7 +123,7 @@ Los tests de migraciones corren contra SQLite y contra un PostgreSQL 16 embebido
 |---|---|---|
 | `DATABASE_URL` | en producción | Postgres de Supabase (pooler). En local, SQLite. |
 | `JWT_SECRET` (o `SECRET_KEY`) | en producción | Mínimo 32 caracteres. La app no arranca en producción sin ella. |
-| `ACCESS_TOKEN_MINUTES` | no | Vida del access token (por defecto 7 días, como antes). |
+| `ACCESS_TOKEN_MINUTES` | no | Vida del access token en minutos (60 por defecto; el frontend lo renueva solo con el refresh token de 30 días). |
 | `LOG_LEVEL` | no | `INFO` por defecto. |
 | `CORS_ORIGINS` | no | Orígenes permitidos separados por coma. |
 | `CORS_ORIGIN_REGEX` | no | Regex adicional de orígenes (p. ej. previews de Vercel). |
@@ -117,7 +134,7 @@ Los tests de migraciones corren contra SQLite y contra un PostgreSQL 16 embebido
 | `WORKER_ENABLED`, `WORKER_CONCURRENCY` | no | Trabajos en segundo plano dentro del API (por defecto sí, 2 a la vez). |
 | `OPENAI_API_KEY`, `OPENAI_MODEL` | para IA | Estudio IA (estructura, guiones y evaluaciones con salidas estructuradas). |
 | `USE_FAKE_PROVIDERS` | no | Solo desarrollo y e2e: IA, voz y presentador falsos y deterministas, sin llaves ni red. |
-| `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL` | para voz | Narración (voz por defecto y modelo `eleven_multilingual_v2`). |
+| `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL` | para voz | Narración (voz por defecto y modelo `eleven_multilingual_v2`) y subtítulos automáticos (Scribe). |
 | `HEYGEN_API_KEY`, `HEYGEN_ENGINE` | para presentador | Presentador IA con la API v3 (`avatar_iii` por costo; `avatar_iv`/`avatar_v` más naturales). Sin llave, los videos salen sin presentador. |
 
 El entorno se detecta con `RAILWAY_ENVIRONMENT_NAME` (Railway lo define) o `ENVIRONMENT`.
@@ -129,11 +146,13 @@ El entorno se detecta con `RAILWAY_ENVIRONMENT_NAME` (Railway lo define) o `ENVI
 
 ## Videos de HeyGen
 
-HeyGen apaga su API v1/v2 el 31-oct-2026. Al arrancar (y cada 30 min) la app copia a Storage los videos que aún apuntan a HeyGen. Pasada manual:
+HeyGen apaga su API v1/v2 el 31-oct-2026. En cada arranque, `legacy.migrate` copia al bucket privado los videos de la app anterior: los de HeyGen (mientras su API v1 responda) y los de sus buckets públicos (`course-videos`, `user-videos`). Luego los procesa como cualquier subida. Mientras queden videos de HeyGen sin terminar, vuelve a revisar cada 6 h. Los que ya no se pueden recuperar (los de `/uploads/…` y los de HeyGen después del apagado) quedan marcados en su módulo para volver a subirlos o producirlos, y el log `legacy_migration_pass` resume cada pasada.
 
-```bash
-.venv/bin/python -m app.services.heygen_persist
-```
+Para que la copia funcione antes del 31-oct:
+
+- `HEYGEN_API_KEY` configurada (sin ella el log `legacy_heygen_key_missing` avisa en cada pasada).
+- El límite de tamaño de archivo de Supabase Storage por encima del video más grande (p. ej. 2 GB); si no, el log `legacy_video_too_large` dice cuánto pesa.
+- Revisar `legacy_migration_pass` tras el deploy: `copied`/`processed` (bien), `waiting` (HeyGen aún no termina), `retrying`, `failed`, `lost`.
 
 ## Logs
 

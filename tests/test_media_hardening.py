@@ -144,13 +144,6 @@ def test_local_upload_cannot_replace_a_checked_file(client, db, admin_headers, s
     assert client.put(url, content=b"x" * 5_000_000).status_code == 409
 
 
-def test_wizard_pdf_extraction_falls_back_to_empty(tmp_path):
-    from app.api.routes.course_wizard import _extract_text_from_pdf
-    bad = tmp_path / "roto.pdf"
-    bad.write_bytes(b"%PDF-1.4\n" + b"\x00garbage" * 50)
-    assert _extract_text_from_pdf(str(bad)) == ""
-
-
 def test_encoder_timeout_fails_at_once_with_a_clear_message(client, db, admin_headers, module, storage, worker, tmp_path, monkeypatch):
     from app.services import media_processing as mp
     source = _make_video(tmp_path / "largo.webm", 1280, 720, seconds=4)
@@ -327,7 +320,7 @@ def test_deleting_a_module_or_a_course_deletes_its_media(client, db, admin_heade
     worker()
     db.expire_all()
     files = [storage.file_path(asset.path) for asset in db.query(MediaAsset).all()]
-    assert len(files) == 3 and all(path.exists() for path in files)  # video, its poster and the guide
+    assert len(files) == 4 and all(path.exists() for path in files)  # video, poster, captions and the guide
 
     client.post(f"/api/v1/courses/{course_id}/modules", headers=admin_headers, json={"title": "Otro"})
     assert client.delete(f"/api/v1/modules/{module_id}", headers=admin_headers).status_code == 204
