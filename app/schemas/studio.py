@@ -2,7 +2,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, StringConstraints
 
-from app.schemas.courses import MAX_AUDIENCE_CHARS, MAX_MODULES
+from app.schemas.courses import MAX_AUDIENCE_CHARS, MAX_MODULES, ModuleCount
 from app.services.ai.designer import MAX_NARRATION_CHARS, MAX_STORYBOARD_SCENES, CourseOutline, OutlineModule
 from app.services.slides.spec import Slide
 
@@ -36,7 +36,7 @@ class OutlineGenerate(BaseModel):
     audience: str = Field(default="", max_length=MAX_AUDIENCE_CHARS)
     tone: str = Field(default="", max_length=200)
     minutes: int = Field(default=20, ge=5, le=240)
-    modules: int | None = Field(default=None, ge=1, le=MAX_MODULES)
+    modules: ModuleCount = None
     feedback: str = Field(default="", max_length=4000)
 
 

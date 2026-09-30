@@ -66,11 +66,22 @@ def test_the_brief_is_kept_to_resume_the_studio(client, admin_headers, ai_course
     saved = client.patch(url, headers=admin_headers, json={"settings": {"brief": "Seguridad en planta", "minutes": 30}})
     assert saved.json()["settings"]["brief"] == "Seguridad en planta" and saved.json()["settings"]["minutes"] == 30
 
-    _outline(client, admin_headers, ai_course.id, brief="Seguridad con el casco", minutes=15, tone="Cercano")
+    client.patch(url, headers=admin_headers, json={"settings": {"modules": 5}})  # e.g. a newer ask the API turned down
+    _outline(client, admin_headers, ai_course.id, brief="Seguridad con el casco", minutes=15, tone="Cercano", modules=2)
     worker()
 
     settings = client.get(url, headers=admin_headers).json()["settings"]
     assert (settings["brief"], settings["minutes"], settings["tone"]) == ("Seguridad con el casco", 15, "Cercano")
+    assert settings["modules"] == 2  # the brief shown is the one the proposal was made from
+
+
+def test_the_module_count_gives_way_to_changes_that_ask_for_another():
+    kwargs = {"brief": "Casco", "audience": "", "tone": "", "minutes": 20, "materials": ""}
+
+    assert "Exactamente 4 módulos." in designer.outline_prompt(target_modules=4, **kwargs)
+    with_changes = designer.outline_prompt(target_modules=4, feedback="Agrega un módulo de primeros auxilios", **kwargs)
+    assert "Exactamente 4 módulos, salvo que los cambios pedidos indiquen otra cantidad." in with_changes
+    assert "Entre 3 y 6 módulos" in designer.outline_prompt(target_modules=None, feedback="Más ejemplos", **kwargs)
 
 
 def test_approving_the_outline_creates_the_modules_and_drafts_them(client, db, admin_headers, ai_course, worker):

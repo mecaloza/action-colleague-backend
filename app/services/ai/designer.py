@@ -157,9 +157,12 @@ def outline_prompt(
     previous: CourseOutline | None = None,
 ) -> str:
     feedback_block = _feedback_block(feedback, "PROPUESTA", previous.model_dump_json(indent=1) if previous else "")
-    modules_rule = (
-        f"Exactamente {target_modules} módulos." if target_modules else "Entre 3 y 6 módulos, según la extensión del material."
-    )
+    if not target_modules:
+        modules_rule = "Entre 3 y 6 módulos, según la extensión del material."
+    elif feedback.strip():  # the changes asked for may add or drop modules: they win over the brief's count
+        modules_rule = f"Exactamente {target_modules} módulos, salvo que los cambios pedidos indiquen otra cantidad."
+    else:
+        modules_rule = f"Exactamente {target_modules} módulos."
     return f"""Propón la estructura de un curso.
 
 BRIEF DEL ADMINISTRADOR:
