@@ -59,7 +59,7 @@ class FakeLLM:
         )
 
     def _scene(self, layout: str, title: str, narration: str, **fields) -> designer.SceneDraft:
-        base = {"subtitle": "", "points": [], "stat_value": "", "stat_label": "", "quote_author": "",
+        base = {"subtitle": "", "points": [], "icons": [], "icon": "", "stat_value": "", "stat_label": "", "quote_author": "",
                 "left_heading": "", "left_points": [], "right_heading": "", "right_points": []}
         return designer.SceneDraft(layout=layout, title=title, narration=narration, **{**base, **fields})
 
@@ -71,7 +71,8 @@ class FakeLLM:
             self._scene("cover", title, f"En este módulo vas a aprender {title.lower()}.",
                         subtitle="Lo esencial en pocos minutos"),
             self._scene("bullets", "Lo más importante", "Empecemos por las ideas clave.",
-                        points=["Primera idea clave", "Segunda idea clave", "Tercera idea clave"]),
+                        points=["Primera idea clave", "Segunda idea clave", "Tercera idea clave"],
+                        icons=["lightbulb", "target", "shield-check"]),
             self._scene("comparison", "Así sí, así no", "Veamos la diferencia.",
                         left_heading="Correcto", left_points=["Hacerlo con cuidado"],
                         right_heading="Incorrecto", right_points=["Hacerlo con prisa"]),

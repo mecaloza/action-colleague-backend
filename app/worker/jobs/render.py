@@ -1,5 +1,5 @@
 """
-video.render: storyboard -> narrated, captioned MP4 with the AI presenter in a bubble.
+video.render: storyboard -> narrated, captioned, animated MP4 with the AI presenter.
 
 Phases (the state is saved between them, so a restart or a wait resumes where it left off):
   1. narrate   — ElevenLabs speech per scene, with character timings; then the master narration
@@ -7,8 +7,9 @@ Phases (the state is saved between them, so a restart or a wait resumes where it
   2. presenter — HeyGen animates an avatar with that same narration. The job reschedules itself
                  while HeyGen works instead of holding a worker. Any presenter failure only
                  drops the bubble: the video is still produced, with a warning for the admin.
-  3. compose   — branded slides + narration + bubble -> MP4, poster and WebVTT; attached to the
-                 module, replacing its previous video.
+  3. compose   — branded slides revealed point by point as the narration reaches them, with the
+                 presenter large on the cover and the closing and in a bubble in between -> MP4,
+                 poster and WebVTT; attached to the module, replacing its previous video.
 
 The first run freezes what it renders (scenes, voice, presenter and look) in the state, so a retry
 or a wait never mixes two voices or pairs slides with another script's audio. Only the worker that
@@ -22,7 +23,7 @@ import logging
 import tempfile
 import time
 import uuid
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 
 import httpx
@@ -34,10 +35,11 @@ from app.db.models import Job, MediaAsset, Module
 from app.services import studio
 from app.services.course_views import ACTIVE_GENERATION
 from app.services.media import SIGNED_URL_SECONDS, discard_assets
+from app.services.slides.render import beat_count, is_hero
 from app.services.slides.render import render as render_slide
 from app.services.slides.spec import Slide, SlideContext
 from app.services.storage import StorageError, get_storage
-from app.services.video import captions, compose
+from app.services.video import captions, compose, motion
 from app.services.video.avatar import MAX_ASSET_BYTES, AvatarError, AvatarProvider, get_avatar_provider
 from app.services.video.voice import VoiceError, get_voice_provider
 from app.worker.runner import JobCancelled, JobContext, JobError, Reschedule, handler, holds_job, open_session
@@ -51,6 +53,7 @@ MAX_PRESENTER_ERRORS = 5
 PRESENTER_BACKGROUND = "#1D1D1D"
 MAX_LOG_ERROR_CHARS = 800  # of an FFmpeg error kept in the log line
 MEDIA_ERROR = "No pudimos procesar el audio o el video. Intenta de nuevo; si sigue fallando, revisa el guion."
+FRAMES_PER_PROGRESS = 100  # animation frames drawn between two progress reports
 INTERMEDIATE_KEYS = ("master_path", "captions_path", "avatar_path", "narration_mp3_path")
 
 
@@ -206,6 +209,11 @@ def _caption_words(scene: dict, alignment: dict | None, start: float, length: fl
     return captions.words_from_text(scene["narration"], start, start + length)
 
 
+def _beats(scene: dict, words: list[captions.TimedWord], start: float, length: float) -> list[float]:
+    """When each part of the scene's slide appears (see `motion.beat_times`)."""
+    return motion.beat_times(Slide.model_validate(scene["slide"]), words, start, length)
+
+
 def _narrate(ctx: JobContext, render: RenderInput, work: Path) -> None:
     _speak_scenes(ctx, render, work)
 
@@ -216,10 +224,12 @@ def _narrate(ctx: JobContext, render: RenderInput, work: Path) -> None:
     ]
     narration = compose.build_narration(scene_audio, work)
 
-    words = []
+    words, beats = [], []
     for index, scene in enumerate(render.scenes):
         alignment = done[str(index)]["alignment"]
-        words += _caption_words(scene, alignment, narration.starts[index], narration.lengths[index])
+        scene_words = _caption_words(scene, alignment, narration.starts[index], narration.lengths[index])
+        words += scene_words
+        beats.append(_beats(scene, scene_words, narration.starts[index], narration.lengths[index]))
     vtt = work / "captions.vtt"
     vtt.write_text(captions.to_vtt(words), encoding="utf-8")
 
@@ -233,6 +243,7 @@ def _narrate(ctx: JobContext, render: RenderInput, work: Path) -> None:
         starts=narration.starts,
         lengths=narration.lengths,
         total=narration.total,
+        beats=beats,
     )
     for scene in done.values():
         scene.pop("alignment", None)  # only the captions needed it: keep the saved state small
@@ -378,31 +389,67 @@ class _Composition:
     presenter: bool  # whether the video carries the presenter bubble
 
 
-def _draw_slides(render: RenderInput, work: Path, presenter: bool) -> list[Path]:
-    """One PNG per scene; with a presenter, the layouts leave its corner free."""
-    paths = []
+def _hero_scenes(render: RenderInput, presenter: bool) -> list[bool]:
+    """The scenes where the presenter is large: the opening cover and the closing slide."""
+    total = len(render.scenes)
+    return [
+        is_hero(Slide.model_validate(scene["slide"]), index + 1, total, presenter)
+        for index, scene in enumerate(render.scenes)
+    ]
+
+
+def _draw_scenes(ctx: JobContext, render: RenderInput, work: Path, presenter: bool) -> list[motion.Scene]:
+    """Each scene's slide drawn beat by beat; with a presenter, the layouts leave its place free."""
+    narration_starts, lengths = ctx.state["starts"], ctx.state["lengths"]
+    saved_beats = ctx.state.get("beats")  # a render narrated before beats existed spreads them evenly
+    hero = _hero_scenes(render, presenter)
+    scenes = []
     for index, scene in enumerate(render.scenes):
+        slide = Slide.model_validate(scene["slide"])
         context = SlideContext(
             course_title=render.course_title, module_label=render.module_label, index=index + 1,
-            total=len(render.scenes), theme=render.theme, presenter=presenter,
+            total=len(render.scenes), theme=render.theme, presenter=presenter and not hero[index], hero=hero[index],
         )
-        path = work / f"slide_{index:02d}.png"
-        render_slide(Slide.model_validate(scene["slide"]), context).save(path)
-        paths.append(path)
-    return paths
+        images = []
+        for shown in range(1, beat_count(slide) + 1):
+            path = work / f"slide_{index:02d}_{shown:02d}.png"
+            render_slide(slide, replace(context, reveal=shown)).save(path)
+            images.append(path)
+        start = narration_starts[index]
+        times = saved_beats[index] if saved_beats else _beats(scene, [], start, lengths[index])
+        scenes.append(motion.Scene(images, start, times[: len(images) - 1], push=index not in (0, len(render.scenes) - 1)))
+    return scenes
 
 
 def _compose(ctx: JobContext, render: RenderInput, work: Path, with_presenter: bool = True) -> _Composition:
-    """Slides + narration + presenter bubble -> video, poster and captions files."""
+    """Animated slides + narration + presenter -> video, poster and captions files."""
     avatar_path = ctx.state.get("avatar_path") if with_presenter else None
     ctx.progress(75, "Dibujando las diapositivas")
-    slides = _draw_slides(render, work, presenter=bool(avatar_path))
+    scenes = _draw_scenes(ctx, render, work, presenter=bool(avatar_path))
     avatar = _local_copy(work, "presenter.mp4", avatar_path) if avatar_path else None
 
     ctx.progress(82, "Componiendo el video")
     video, poster = work / "video.mp4", work / "poster.jpg"
-    duration = compose.compose_video(slides, _narration_from_state(ctx, work), avatar, video, work)
-    poster_size = compose.poster(slides[0], poster)
+    hero = _hero_scenes(render, avatar is not None)
+    frames = 0
+
+    def on_frame() -> None:  # drawing the animation takes a while: keep reporting (a cancel is seen there)
+        nonlocal frames
+        frames += 1
+        if frames % FRAMES_PER_PROGRESS == 0:
+            ctx.progress(82, "Componiendo el video")
+
+    duration = compose.compose_video(
+        scenes, _narration_from_state(ctx, work), avatar, video, work, hero=hero, on_frame=on_frame
+    )
+    # The poster has no presenter: the first slide as it is drawn without one.
+    first = render.scenes[0]
+    still = work / "poster_slide.png"
+    render_slide(Slide.model_validate(first["slide"]), SlideContext(
+        course_title=render.course_title, module_label=render.module_label, index=1, total=len(render.scenes),
+        theme=render.theme,
+    )).save(still)
+    poster_size = compose.poster(still, poster)
     vtt = _local_copy(work, "captions.vtt", ctx.state["captions_path"])
     return _Composition(video, poster, poster_size, vtt, duration, presenter=avatar is not None)
 

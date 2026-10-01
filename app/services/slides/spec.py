@@ -3,7 +3,9 @@
 from dataclasses import dataclass
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, BeforeValidator, Field, StringConstraints, model_validator
+
+from app.services.slides.icons import ICONS, IconName, NoIcon
 
 Layout = Literal["cover", "bullets", "statement", "stat", "steps", "comparison", "closing"]
 
@@ -19,6 +21,15 @@ MAX_LIST_ITEMS = 10  # points kept per list (only the first MAX_POINTS / MAX_COL
 
 SlideText = Annotated[str, StringConstraints(max_length=MAX_TEXT_CHARS)]
 SlideLabel = Annotated[str, StringConstraints(max_length=MAX_LABEL_CHARS)]
+SlideIcon = IconName | NoIcon  # "" draws the layout's plain marker (the AI's schema: one of the catalog)
+
+
+def _known_icon(name: object) -> object:
+    """An icon no longer in the catalog (or a typo) is drawn as none, instead of breaking a saved script."""
+    return name if not isinstance(name, str) or name in ICONS else ""
+
+
+StoredIcon = Annotated[SlideIcon, BeforeValidator(_known_icon)]
 
 
 class ComparisonColumn(BaseModel):
@@ -32,16 +43,31 @@ class Slide(BaseModel):
     title: SlideText = ""
     subtitle: SlideText = ""
     points: list[SlideText] = Field(default_factory=list, max_length=MAX_LIST_ITEMS)  # bullets / steps / takeaways
+    icons: list[StoredIcon] = Field(default_factory=list, max_length=MAX_LIST_ITEMS)  # one per point, same order
+    icon: StoredIcon = ""  # the statement's or the stat's icon
     stat_value: SlideLabel = ""
     stat_label: SlideText = ""
     quote_author: SlideLabel = ""
     left: ComparisonColumn = Field(default_factory=ComparisonColumn)
     right: ComparisonColumn = Field(default_factory=ComparisonColumn)
 
+    @model_validator(mode="after")
+    def _icons_follow_points(self) -> "Slide":
+        del self.icons[len(self.points):]  # an icon without its point is never drawn
+        return self
+
 
 def visible_points(points: list[str], limit: int) -> list[str]:
     """The non-blank points a layout shows: the first `limit` of them."""
     return [point for point in points if point.strip()][:limit]
+
+
+def visible_items(slide: "Slide", limit: int) -> list[tuple[str, str]]:
+    """The points a layout shows, each with its own icon ("" if none): paired before blank points are dropped."""
+    icons = slide.icons
+    return [
+        (point, icons[index] if index < len(icons) else "") for index, point in enumerate(slide.points) if point.strip()
+    ][:limit]
 
 
 @dataclass(frozen=True)
@@ -52,3 +78,5 @@ class SlideContext:
     total: int = 1
     theme: str = "dark"
     presenter: bool = False  # reserve the bottom-right corner for the presenter bubble
+    hero: bool = False  # the presenter is shown large on the right (cover and closing): text keeps to the left
+    reveal: int | None = None  # beats shown (see `render.beat_count`); None shows the whole slide
