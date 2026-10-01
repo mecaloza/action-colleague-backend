@@ -395,10 +395,10 @@ def test_a_presenter_clip_ffmpeg_cannot_use_drops_only_the_bubble(
 ):
     compose_video = compose.compose_video
 
-    def no_presenter_please(slides, narration, avatar, output, work):
+    def no_presenter_please(scenes, narration, avatar, output, work, **options):
         if avatar is not None:
             raise compose.ComposeError("FFmpeg falló: presenter.mp4: Invalid data found when processing input")
-        return compose_video(slides, narration, avatar, output, work)
+        return compose_video(scenes, narration, avatar, output, work, **options)
 
     monkeypatch.setattr(compose, "compose_video", no_presenter_please)
     _start_render(client, admin_headers, ai_module)
@@ -428,3 +428,23 @@ def test_a_copy_left_by_a_failed_publish_is_deleted_by_the_next_run(
 
     assert failed and db.query(Job).one().status == "succeeded"
     assert len(list((storage.root / storage.bucket).rglob("video.mp4"))) == 1  # only the published one
+
+
+def test_a_render_narrated_before_beats_existed_still_produces_the_video(
+    client, db, admin_headers, ai_module, storage, worker, monkeypatch
+):
+    from app.worker.jobs import render as render_job
+
+    narrate = render_job._narrate
+
+    def narrate_like_the_previous_release(ctx, render, work):
+        narrate(ctx, render, work)
+        ctx.state.pop("beats")  # its saved state has no beat timings
+
+    monkeypatch.setattr(render_job, "_narrate", narrate_like_the_previous_release)
+    _start_render(client, admin_headers, ai_module)
+    _run_until_done(db, worker)
+
+    db.expire_all()
+    module = db.get(Module, ai_module.id)
+    assert module.generation_status == "completed" and module.video_asset_id

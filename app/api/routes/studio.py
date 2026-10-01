@@ -40,7 +40,7 @@ from app.services import studio
 from app.services.course_views import ACTIVE_GENERATION, course_detail
 from app.services.media_views import job_out
 from app.services.progress import ordered_modules, refresh_course_enrollments
-from app.services.slides.render import render_png
+from app.services.slides.render import is_hero, render_png
 from app.services.slides.spec import SlideContext
 from app.services.storage import StorageError, get_storage
 from app.services.video.avatar import AvatarError, get_avatar_provider
@@ -303,7 +303,9 @@ PREVIEW_WAIT_SECONDS = 15
 @router.post("/slides/preview", response_class=Response)
 def preview_slide(payload: SlidePreview):
     """The slide exactly as the video will show it (960x540 PNG)."""
-    context = SlideContext(**payload.context.model_dump())
+    asked = payload.context
+    hero = is_hero(payload.slide, asked.index, asked.total, asked.presenter)  # as the video will show it
+    context = SlideContext(**{**asked.model_dump(), "presenter": asked.presenter and not hero, "hero": hero})
     if not _PREVIEW_SLOTS.acquire(timeout=PREVIEW_WAIT_SECONDS):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Hay muchas vistas previas en curso; intenta de nuevo.")
     try:

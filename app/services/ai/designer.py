@@ -21,8 +21,10 @@ from app.services.slides.spec import (
     ComparisonColumn,
     Layout,
     Slide,
+    SlideIcon,
     visible_points,
 )
+from app.services.slides.icons import ICONS
 
 LANGUAGE_NAMES = {"es": "español latinoamericano", "en": "English", "pt": "português do Brasil"}
 WORDS_PER_MINUTE = 150  # narration pace
@@ -58,6 +60,8 @@ class SceneDraft(BaseModel):
     title: str
     subtitle: str
     points: list[str]
+    icons: list[SlideIcon]  # one per point
+    icon: SlideIcon  # statement / stat
     stat_value: str
     stat_label: str
     quote_author: str
@@ -214,6 +218,11 @@ ESCENAS ({scenes} aprox.). Cada escena es una diapositiva + lo que el presentado
   la narración explica.
 - narration: 40-110 palabras, natural, en segunda persona, sin leer literalmente la diapositiva, sin
   marcas como [pausa] ni emojis. Debe fluir de una escena a la siguiente.
+- Los points aparecen en pantalla uno a uno cuando la narración los menciona: nómbralos en el mismo orden,
+  usando sus palabras clave.
+- icons (solo "bullets" y "closing"): un ícono por cada point, en el mismo orden, que represente esa idea;
+  icon: el de "statement" o "stat".
+  Usa solo nombres de esta lista ("" si ninguno encaja): {", ".join(ICONS)}.
 - Deja vacíos ("" o []) los campos que el layout no usa.
 
 reading_summary: resumen en Markdown para leer (5-10 líneas, con viñetas).
@@ -253,17 +262,27 @@ def _points(points: list[str], limit: int) -> list[str]:
     return [_clip(point, MAX_TEXT_CHARS) for point in visible_points(points, limit)]
 
 
+def _points_with_icons(points: list[str], icons: list[str], limit: int) -> tuple[list[str], list[str]]:
+    """The points a layout shows, each with its icon (blank points and their icons dropped)."""
+    padded = [*icons, *[""] * len(points)]
+    kept = [(point, padded[index]) for index, point in enumerate(points) if point.strip()][:limit]
+    return [_clip(point, MAX_TEXT_CHARS) for point, _ in kept], [icon for _, icon in kept]
+
+
 def _column(heading: str, points: list[str]) -> ComparisonColumn:
     return ComparisonColumn(heading=_clip(heading, MAX_LABEL_CHARS), points=_points(points, MAX_COLUMN_POINTS))
 
 
 def to_slide(scene: SceneDraft) -> Slide:
     """The model's scene as a slide, cut to the slide's limits (the model does not always respect them)."""
+    points, icons = _points_with_icons(scene.points, scene.icons, MAX_POINTS)
     return Slide(
         layout=scene.layout,
         title=_clip(scene.title, MAX_TEXT_CHARS),
         subtitle=_clip(scene.subtitle, MAX_TEXT_CHARS),
-        points=_points(scene.points, MAX_POINTS),
+        points=points,
+        icons=icons if scene.layout in ("bullets", "closing") and any(icons) else [],
+        icon=scene.icon if scene.layout in ("statement", "stat") else "",
         stat_value=_clip(scene.stat_value, MAX_LABEL_CHARS),
         stat_label=_clip(scene.stat_label, MAX_TEXT_CHARS),
         quote_author=_clip(scene.quote_author, MAX_LABEL_CHARS),

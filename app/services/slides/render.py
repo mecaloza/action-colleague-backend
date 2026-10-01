@@ -13,13 +13,20 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-from app.services.slides.spec import MAX_COLUMN_POINTS, MAX_POINTS, Slide, SlideContext, visible_points
+from app.services.slides.icons import ICON_FONT, ICONS
+from app.services.slides.spec import MAX_COLUMN_POINTS, MAX_POINTS, Slide, SlideContext, visible_items, visible_points
 
 WIDTH, HEIGHT = 1920, 1080
 MARGIN_X, MARGIN_TOP, MARGIN_BOTTOM = 120, 96, 96
 # Presenter bubble (bottom-right). Keep in sync with the video composer.
 BUBBLE_SIZE, BUBBLE_MARGIN = 340, 64
 BUBBLE_BOX = (WIDTH - BUBBLE_MARGIN - BUBBLE_SIZE, HEIGHT - BUBBLE_MARGIN - BUBBLE_SIZE, WIDTH - BUBBLE_MARGIN, HEIGHT - BUBBLE_MARGIN)
+# The presenter shown large on the cover and the closing slide (right side). Keep in sync with the video composer.
+HERO_SIZE = 600
+HERO_BOX = (WIDTH - MARGIN_X - HERO_SIZE, (HEIGHT - HERO_SIZE) // 2 + 30, WIDTH - MARGIN_X, (HEIGHT + HERO_SIZE) // 2 + 30)
+HERO_TEXT_RIGHT = HERO_BOX[0] - 90
+ICON_BADGE = 76  # the rounded square an item's icon sits in
+MAX_ITEM_STEP = 150  # the most a list item is placed below the previous one
 
 FONTS_DIR = Path(__file__).resolve().parent / "fonts"  # SIL Open Font License (see the OFL files)
 DISPLAY_FONT = FONTS_DIR / "InterTight.ttf"
@@ -224,6 +231,35 @@ def diamond(
     )
 
 
+def shown(ctx: SlideContext, beat: int) -> bool:
+    """Whether beat `beat` of the slide is on screen (a video reveals them one by one; previews show all)."""
+    return ctx.reveal is None or beat < ctx.reveal
+
+
+def draw_icon(draw: ImageDraw.ImageDraw, name: str, cx: float, cy: float, size: int, fill: Color) -> bool:
+    """The named icon centered on (cx, cy); False (nothing drawn) for an unknown or empty name."""
+    code = ICONS.get(name)
+    if code is None:
+        return False
+    fnt = font(ICON_FONT, size, 400)
+    draw.text((cx, cy), chr(code), font=fnt, fill=fill, anchor="mm")
+    return True
+
+
+def icon_badge(draw: ImageDraw.ImageDraw, name: str, x: float, cy: float, theme: Theme) -> bool:
+    """An item's icon in a rounded square whose left edge is `x`, vertically centered on `cy`."""
+    if name not in ICONS:
+        return False
+    half = ICON_BADGE / 2
+    draw.rounded_rectangle([x, cy - half, x + ICON_BADGE, cy + half], radius=14, outline=theme.accent, width=3)
+    return draw_icon(draw, name, x + half, cy, 42, theme.accent)
+
+
+def is_hero(slide: Slide, index: int, total: int, presenter: bool) -> bool:
+    """Whether the presenter is shown large on this slide: an opening cover or a final closing slide."""
+    return presenter and ((index == 1 and slide.layout == "cover") or (index == total and slide.layout == "closing"))
+
+
 # ── Frame (background, header, footer) ────────────────────────────────
 
 
@@ -246,7 +282,8 @@ def _frame(ctx: SlideContext, theme: Theme) -> tuple[Image.Image, ImageDraw.Imag
     """Background, corner motif, header label and page counter; returns the image and its drawing handle."""
     image = _background(theme)
     draw = ImageDraw.Draw(image)
-    _diamonds(draw, theme)
+    if not ctx.hero:  # the large presenter takes that side
+        _diamonds(draw, theme)
 
     label_font = font(BODY_FONT, 24, 700)
     header_y = MARGIN_TOP - 44
@@ -271,7 +308,9 @@ def _content_box(top: int) -> tuple[int, int, int, int]:
 
 
 def _text_right_limit(ctx: SlideContext, y_bottom: int, default_right: int) -> int:
-    """Right edge for a block whose bottom is y_bottom: stay clear of the presenter bubble."""
+    """Right edge for a block whose bottom is y_bottom: stay clear of the presenter (bubble or large)."""
+    if ctx.hero:
+        return min(default_right, HERO_TEXT_RIGHT)
     if ctx.presenter and y_bottom > BUBBLE_BOX[1] - 40:
         return min(default_right, BUBBLE_BOX[0] - 60)
     return default_right
@@ -282,11 +321,13 @@ def _text_right_limit(ctx: SlideContext, y_bottom: int, default_right: int) -> i
 
 def _cover(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageDraw) -> None:
     left, top, right, bottom = _content_box(300)
-    right = min(right, WIDTH - 420)
+    right = _text_right_limit(ctx, top, min(right, WIDTH - 420))
     draw.rectangle([left, top - 60, left + 120, top - 50], fill=theme.accent)
     title = fit(draw, slide.title, DISPLAY_FONT, 600, right - left, 420, 150, 84, leading=1.0, max_lines=3)
-    y = draw_lines(draw, title, left, top, theme.text) + 36
-    if slide.subtitle:
+    y = title.height + top + 36
+    if shown(ctx, 1):
+        draw_lines(draw, title, left, top, theme.text)
+    if slide.subtitle and shown(ctx, 2):
         sub_right = _text_right_limit(ctx, bottom, right)
         subtitle = fit(draw, slide.subtitle, BODY_FONT, 400, sub_right - left, bottom - y, 46, 30, max_lines=3)
         draw_lines(draw, subtitle, left, y, theme.muted)
@@ -294,9 +335,10 @@ def _cover(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageD
 
 def _numbered_list(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageDraw, top: int) -> None:
     left, _, right, bottom = _content_box(top)
-    points = visible_points(slide.points, MAX_POINTS)
-    if not points:
+    items = visible_items(slide, MAX_POINTS)
+    if not items:
         return
+    points, icons = [point for point, _ in items], [icon for _, icon in items]
     gap = 28
     per_item = (bottom - top - gap * (len(points) - 1)) // len(points)
     prefix_font = font(DISPLAY_FONT, 44, 600)
@@ -304,13 +346,25 @@ def _numbered_list(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDra
     text_left = left + 44 + prefix_w
     # The presenter bubble narrows the lowest items; size every item for the narrowest width.
     width = _text_right_limit(ctx, bottom, right) - text_left
-    fitted_items = fit_all(draw, points, BODY_FONT, 500, width, per_item, 46, 30, max_lines=3)
+    with_icons = any(icon in ICONS for icon in icons)
+    if with_icons:  # the icon badge takes the marker's place
+        text_left = left + ICON_BADGE + 36
+        width = _text_right_limit(ctx, bottom, right) - text_left
+    fitted_items = fit_all(draw, points, BODY_FONT, 500, width, per_item, 52, 30, max_lines=3)
     y = top
     for number, fitted in enumerate(fitted_items, start=1):
-        diamond(draw, left + 12, y + fitted.line_height / 2, 12, theme.accent)
-        draw.text((left + 44, y + (fitted.line_height - 44) / 2 - 4), f"{number}.", font=prefix_font, fill=theme.accent)
-        draw_lines(draw, fitted, text_left, y, theme.text)
-        y += max(fitted.height, per_item // 2) + gap
+        if shown(ctx, number):
+            middle = y + fitted.line_height / 2
+            if not (with_icons and icon_badge(draw, icons[number - 1], left, middle, theme)):
+                if with_icons:  # a point without an icon keeps the column aligned with a plain marker
+                    diamond(draw, left + ICON_BADGE / 2, middle, 12, theme.accent)
+                else:
+                    diamond(draw, left + 12, middle, 12, theme.accent)
+                    draw.text((left + 44, y + (fitted.line_height - 44) / 2 - 4), f"{number}.", font=prefix_font,
+                              fill=theme.accent)
+            draw_lines(draw, fitted, text_left, y, theme.text)
+        # Spread over the area (up to MAX_ITEM_STEP apart), so a short list doesn't bunch up under the title.
+        y += max(fitted.height + gap, min(per_item + gap, MAX_ITEM_STEP), ICON_BADGE + gap if with_icons else 0)
 
 
 def _title_block(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageDraw, max_lines: int = 2) -> int:
@@ -337,12 +391,14 @@ def _steps(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageD
     width = _text_right_limit(ctx, bottom, right) - (left + 100)
     fitted_steps = fit_all(draw, steps, BODY_FONT, 500, width, per_item - 12, 44, 28, max_lines=2)
     for index, fitted in enumerate(fitted_steps):
+        if not shown(ctx, index + 1):
+            continue
         y = top + index * per_item
         cx, cy = left + 34, y + 30
         draw.ellipse([cx - 30, cy - 30, cx + 30, cy + 30], outline=theme.accent, width=3)
         label = f"{index + 1:02d}"
         draw.text((cx - text_width(draw, label, number_font) / 2, cy - 26), label, font=number_font, fill=theme.accent)
-        if index < len(steps) - 1:
+        if index < len(steps) - 1 and shown(ctx, index + 2):  # the line leads to the next step once it is there
             draw.line([(cx, cy + 34), (cx, y + per_item - 4)], fill=theme.line, width=3)
         draw_lines(draw, fitted, left + 100, y + 30 - fitted.line_height // 2, theme.text)
 
@@ -352,18 +408,26 @@ def _statement(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.Im
     right = _text_right_limit(ctx, bottom, min(right, WIDTH - 360))
     text_left = left + 48  # room for the pull-quote bar
     statement = fit(draw, slide.title, DISPLAY_FONT, 500, right - text_left, 470, 96, 52, leading=1.08, max_lines=5)
-    y = draw_lines(draw, statement, text_left, top + 20, theme.text)
-    draw.rectangle([left, top + 28, left + 10, y - 12], fill=theme.accent)
-    if slide.quote_author:
+    y = top + 20 + statement.height
+    if shown(ctx, 1):
+        draw_icon(draw, slide.icon, left + 44, top - 70, 88, theme.accent)
+        draw_lines(draw, statement, text_left, top + 20, theme.text)
+        draw.rectangle([left, top + 28, left + 10, y - 12], fill=theme.accent)
+    if slide.quote_author and shown(ctx, 2):
         draw_tracked(draw, slide.quote_author.upper()[:60], (text_left, y + 30), font(BODY_FONT, 26, 700), theme.muted, 3)
 
 
 def _stat(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageDraw) -> None:
     left, top, right, bottom = _content_box(230)
     value = fit(draw, slide.stat_value, DISPLAY_FONT, 700, min(right, 1500) - left, 330, 300, 120, leading=1.0, max_lines=1)
-    y = draw_lines(draw, value, left - 6, top, theme.accent) + 10
+    if shown(ctx, 1):
+        draw_icon(draw, slide.icon, left + 44, top - 60, 80, theme.accent)
+        draw_lines(draw, value, left - 6, top, theme.accent)
+    y = top + value.height + 10
     label_right = _text_right_limit(ctx, y + 170, right)  # a two-line label can reach the presenter bubble
     label = fit(draw, slide.stat_label or slide.title, DISPLAY_FONT, 600, label_right - left, 170, 72, 44, max_lines=2)
+    if not shown(ctx, 2):
+        return
     y = draw_lines(draw, label, left, y, theme.text) + 20
     if slide.subtitle:
         sub_right = _text_right_limit(ctx, bottom, right)
@@ -395,9 +459,11 @@ def _comparison(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.I
         y = draw_lines(draw, heading, x, top, color)
         draw.rectangle([x, y + 8, x + 60, y + 14], fill=color)
         y = list_top
-        for item in items:
-            diamond(draw, x + 10, y + item.line_height / 2, 9, color)
-            draw_lines(draw, item, x + 40, y, theme.text)
+        first_beat = 1 + (len(left_points) if column_index else 0)  # the left column's items come first
+        for offset, item in enumerate(items):
+            if shown(ctx, first_beat + offset):
+                diamond(draw, x + 10, y + item.line_height / 2, 9, color)
+                draw_lines(draw, item, x + 40, y, theme.text)
             y += max(item.height + 22, per_item // 2)
     mid_x = left + column_width + gutter // 2
     draw.line([(mid_x, top), (mid_x, bottom)], fill=theme.line, width=2)
@@ -417,6 +483,21 @@ LAYOUTS = {
     "comparison": _comparison,
     "closing": _closing,
 }
+
+
+def beat_count(slide: Slide) -> int:
+    """How many beats the slide reveals one after the other in a video (the first is the slide's frame)."""
+    if slide.layout in ("bullets", "steps", "closing"):
+        return 1 + len(visible_points(slide.points, MAX_POINTS))
+    if slide.layout == "comparison":
+        return 1 + len(visible_points(slide.left.points, MAX_COLUMN_POINTS)) + len(
+            visible_points(slide.right.points, MAX_COLUMN_POINTS)
+        )
+    if slide.layout == "cover":
+        return 2 + bool(slide.subtitle.strip())
+    if slide.layout == "statement":
+        return 2 + bool(slide.quote_author.strip())
+    return 3  # stat: frame, value, label
 
 
 def render(slide: Slide, ctx: SlideContext) -> Image.Image:

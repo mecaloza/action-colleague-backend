@@ -1,11 +1,11 @@
 """
-Video composition with FFmpeg: slide timeline + narration + optional presenter bubble.
+Video composition with FFmpeg: animated slide timeline + narration + optional presenter.
 
 Timing model (all from decoded sample counts, never from metadata):
   narration i starts at s_i = LEAD_IN + sum(a_j + GAP for j < i)
-  slide i is fully visible from s_i and cross-fades in during [s_i - FADE, s_i]
-  xfade shortens the chain by FADE per transition, so every segment except the first is FADE
-  seconds longer than its visible time; the offsets are simply s_i - FADE.
+  slide i arrives during [s_i - TRANSITION, s_i] and reveals its beats as the narration reaches them
+  (see `motion`); the frames are one concat input, so memory stays flat however long the video.
+The presenter is a round bubble in the corner, and large on the right during the cover and the closing.
 """
 
 import subprocess
@@ -15,13 +15,14 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-from app.services.slides.render import BUBBLE_MARGIN, HEIGHT, WIDTH
+from app.services.slides.render import BUBBLE_MARGIN, HERO_BOX, HERO_SIZE, HEIGHT, WIDTH
 from app.services.slides.render import BUBBLE_SIZE as BUBBLE  # the bottom-right corner the slides leave free
+from app.services.video import motion
 
 FPS = 30
 SAMPLE_RATE = 48000
 CHANNELS, SAMPLE_WIDTH = 1, 2  # the narration is mono, 16-bit (2 bytes per sample)
-LEAD_IN, GAP, TAIL, FADE = 0.4, 0.7, 1.0, 0.4
+LEAD_IN, GAP, TAIL = 0.4, 0.7, 1.0
 RING = 6  # thickness of the presenter bubble's ring, in pixels
 SUPERSAMPLE = 4  # the bubble's circles are drawn this many times larger, then shrunk to smooth their edge
 PRESENTER_HOLD_SECONDS = 5  # a presenter clip shorter than the narration freezes on its last frame this long
@@ -117,39 +118,42 @@ def to_mp3(src: Path, dest: Path) -> Path:
     return dest
 
 
-def _circle(dest: Path, mode: str, background: int | tuple[int, ...], **style) -> Path:
-    """A BUBBLE x BUBBLE image filled by a circle, drawn SUPERSAMPLE times larger and shrunk (anti-aliased)."""
-    size = BUBBLE * SUPERSAMPLE
+def _circle(dest: Path, mode: str, background: int | tuple[int, ...], diameter: int = BUBBLE, **style) -> Path:
+    """A square image filled by a circle, drawn SUPERSAMPLE times larger and shrunk (anti-aliased)."""
+    size = diameter * SUPERSAMPLE
     image = Image.new(mode, (size, size), background)
     ImageDraw.Draw(image).ellipse([0, 0, size - 1, size - 1], **style)
-    image.resize((BUBBLE, BUBBLE), Image.LANCZOS).save(dest)
+    image.resize((diameter, diameter), Image.LANCZOS).save(dest)
     return dest
 
 
-def _bubble_assets(work: Path) -> tuple[Path, Path]:
+def _bubble_assets(work: Path, diameter: int = BUBBLE, ring: int = RING) -> tuple[Path, Path]:
     """The presenter bubble's circular alpha mask and its orange ring."""
-    mask = _circle(work / "bubble_mask.png", "L", 0, fill=255)
-    ring = _circle(work / "bubble_ring.png", "RGBA", (0, 0, 0, 0), outline=ACCENT + (255,), width=RING * SUPERSAMPLE)
-    return mask, ring
+    mask = _circle(work / f"bubble_mask_{diameter}.png", "L", 0, diameter, fill=255)
+    outline = _circle(work / f"bubble_ring_{diameter}.png", "RGBA", (0, 0, 0, 0), diameter,
+                      outline=ACCENT + (255,), width=ring * SUPERSAMPLE)
+    return mask, outline
 
 
-def _slide_durations(narration: Narration) -> list[float]:
-    """Length of each slide's clip: up to the next slide's start (the last one, to the end), plus its FADE."""
-    starts = narration.starts
-    ends = [*starts[1:], narration.total]
-    return [ends[0], *(end - start + FADE for start, end in zip(starts[1:], ends[1:]))]
+def _enable(intervals: list[tuple[float, float]]) -> str:
+    """An FFmpeg `enable` expression true during any of the intervals (seconds)."""
+    return "+".join(f"between(t,{start:.3f},{end:.3f})" for start, end in intervals) or "0"
 
 
-def _slide_filters(starts: list[float]) -> tuple[list[str], str]:
-    """Every slide scaled to the frame and chained with cross-fades. Returns the filters and the chain's last label."""
-    filters = [
-        f"[{i}:v]scale={WIDTH}:{HEIGHT},setsar=1,fps={FPS},format=yuv420p,settb=AVTB[v{i}]" for i in range(len(starts))
-    ]
-    last = "v0"
-    for i in range(1, len(starts)):
-        filters.append(f"[{last}][v{i}]xfade=transition=fade:duration={FADE}:offset={starts[i] - FADE:.3f}[x{i}]")
-        last = f"x{i}"
-    return filters, last
+def hero_intervals(scenes: list[motion.Scene], hero: list[bool], total: float) -> list[tuple[float, float]]:
+    """When the presenter is large: only while its scene is fully on screen (the transitions show the bubble,
+    so the large presenter never covers the next slide sliding in)."""
+    ends = [scene.start - motion.TRANSITION_SECONDS for scene in scenes[1:]] + [total]
+    intervals: list[tuple[float, float]] = []
+    for index, is_hero in enumerate(hero):
+        if not is_hero:
+            continue
+        start = 0.0 if index == 0 else scenes[index].start
+        if intervals and abs(intervals[-1][1] - start) < 1e-6:
+            intervals[-1] = (intervals[-1][0], ends[index])
+        else:
+            intervals.append((start, ends[index]))
+    return intervals
 
 
 def _bubble_inputs(avatar: Path, mask: Path, ring: Path, duration: float) -> list[str]:
@@ -166,18 +170,35 @@ def _bubble_filters(background: str, first_input: int, duration: float, keep_tim
     time instead of being moved to zero (a video that starts after its audio would lose the lip sync).
     """
     avatar, mask, ring = first_input, first_input + 1, first_input + 2
-    x, y = WIDTH - BUBBLE - BUBBLE_MARGIN, HEIGHT - BUBBLE - BUBBLE_MARGIN
     timing = f"fps={FPS}:start_time=0" if keep_timing else f"setpts=PTS-STARTPTS,fps={FPS}"
     return [
-        # Square crop from the centre, then scaled: never stretched. The last frame holds if short.
-        f"[{avatar}:v]{timing},crop='min(iw,ih)':'min(iw,ih)',"
-        f"scale={BUBBLE}:{BUBBLE},tpad=stop_mode=clone:stop_duration={PRESENTER_HOLD_SECONDS},"
-        f"trim=duration={duration:.3f},format=rgba[av]",
-        f"[{mask}:v]fps={FPS},format=gray[mask]",
-        "[av][mask]alphamerge[bubble]",
-        f"[{background}][bubble]overlay=x={x}:y={y}:eof_action=pass[withbubble]",
-        f"[{ring}:v]fps={FPS},format=rgba[ring]",
-        f"[withbubble][ring]overlay=x={x}:y={y}:eof_action=pass,format=yuv420p[vout]",
+        f"[{avatar}:v]{timing},crop='min(iw,ih)':'min(iw,ih)'[avsquare]",
+        *_circle_overlay(background, "avsquare", mask, ring, BUBBLE, _bubble_xy(), duration, "withbubble"),
+        "[withbubble]format=yuv420p[vout]",
+    ]
+
+
+def _bubble_xy() -> tuple[int, int]:
+    return WIDTH - BUBBLE - BUBBLE_MARGIN, HEIGHT - BUBBLE - BUBBLE_MARGIN
+
+
+def _circle_overlay(
+    background: str, square: str, mask: int, ring: int, size: int, xy: tuple[int, int], duration: float, out: str,
+    enable: str | None = None,
+) -> list[str]:
+    """The `square` presenter stream as a ringed circle of `size` at `xy` over `background` (only while `enable`)."""
+    x, y = xy
+    when = f":enable='{enable}'" if enable else ""
+    tag = f"{out}_"
+    return [
+        # Scaled from a centered square: never stretched. The last frame holds if the clip is short.
+        f"[{square}]scale={size}:{size},tpad=stop_mode=clone:stop_duration={PRESENTER_HOLD_SECONDS},"
+        f"trim=duration={duration:.3f},format=rgba[{tag}av]",
+        f"[{mask}:v]fps={FPS},format=gray[{tag}mask]",
+        f"[{tag}av][{tag}mask]alphamerge[{tag}circle]",
+        f"[{background}][{tag}circle]overlay=x={x}:y={y}:eof_action=pass{when}[{tag}with]",
+        f"[{ring}:v]fps={FPS},format=rgba[{tag}ring]",
+        f"[{tag}with][{tag}ring]overlay=x={x}:y={y}:eof_action=pass{when}[{out}]",
     ]
 
 
@@ -190,26 +211,49 @@ def _encode_options(duration: float) -> list[str]:
     ]
 
 
-def compose_video(slides: list[Path], narration: Narration, avatar: Path | None, output: Path, work: Path) -> float:
-    """1920x1080 H.264/AAC MP4 (+faststart). Returns its duration in seconds."""
-    if len(slides) != len(narration.starts):
+def compose_video(
+    scenes: list[motion.Scene | Path], narration: Narration, avatar: Path | None, output: Path, work: Path,
+    hero: list[bool] | None = None, on_frame=None,
+) -> float:
+    """1920x1080 H.264/AAC MP4 (+faststart). Returns its duration in seconds.
+
+    `scenes`: each scene's images by beat (a plain image is a scene without beats). `hero`: the scenes where the
+    presenter is shown large instead of in the bubble (their slides keep that side free).
+    """
+    if len(scenes) != len(narration.starts):
         raise ComposeError("Cada escena necesita su diapositiva y su narración")
     total = narration.total
-    cmd = [*FFMPEG]
-    for slide, duration in zip(slides, _slide_durations(narration)):
-        cmd += ["-loop", "1", "-framerate", str(FPS), "-t", f"{duration:.3f}", "-i", str(slide)]
-    audio_index = len(slides)
-    cmd += ["-i", str(narration.audio)]
+    timed = [
+        scene if isinstance(scene, motion.Scene) else motion.Scene([scene], start, [])
+        for scene, start in zip(scenes, narration.starts)
+    ]
+    frames = work / "frames"
+    frames.mkdir(exist_ok=True)
+    listing = motion.write_concat(motion.timeline(timed, total, frames, on_frame), work / "slides.ffconcat")
 
-    filters, last = _slide_filters(narration.starts)
+    cmd = [*FFMPEG, "-f", "concat", "-safe", "0", "-i", str(listing), "-i", str(narration.audio)]
+    filters = [f"[0:v]scale={WIDTH}:{HEIGHT},setsar=1,fps={FPS},format=yuv420p[slides]"]
     if avatar is None:
-        filters.append(f"[{last}]null[vout]")
+        filters.append("[slides]null[vout]")
     else:
+        big = hero_intervals(timed, hero or [False] * len(timed), total)
         mask, ring = _bubble_assets(work)
-        cmd += _bubble_inputs(avatar, mask, ring, total)
-        filters += _bubble_filters(last, audio_index + 1, total)
+        still = ["-loop", "1", "-t", f"{total:.3f}"]
+        cmd += _bubble_inputs(avatar, mask, ring, total)  # inputs 2, 3, 4
+        filters.append(f"[2:v]setpts=PTS-STARTPTS,fps={FPS},crop='min(iw,ih)':'min(iw,ih)',split=2[sq_small][sq_big]")
+        if big:
+            hero_mask, hero_ring = _bubble_assets(work, HERO_SIZE, RING + 2)
+            cmd += [*still, "-i", str(hero_mask), *still, "-i", str(hero_ring)]  # inputs 5, 6
+            filters += _circle_overlay("slides", "sq_big", 5, 6, HERO_SIZE, HERO_BOX[:2], total, "withhero", _enable(big))
+            filters += _circle_overlay(
+                "withhero", "sq_small", 3, 4, BUBBLE, _bubble_xy(), total, "withbubble", f"not({_enable(big)})"
+            )
+        else:
+            filters.append("[sq_big]nullsink")
+            filters += _circle_overlay("slides", "sq_small", 3, 4, BUBBLE, _bubble_xy(), total, "withbubble")
+        filters.append("[withbubble]format=yuv420p[vout]")
 
-    cmd += ["-filter_complex", ";".join(filters), "-map", "[vout]", "-map", f"{audio_index}:a"]
+    cmd += ["-filter_complex", ";".join(filters), "-map", "[vout]", "-map", "1:a"]
     cmd += [*_encode_options(total), str(output)]
     run(cmd)
     return total
