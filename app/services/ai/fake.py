@@ -60,6 +60,7 @@ class FakeLLM:
 
     def _scene(self, layout: str, title: str, narration: str, **fields) -> designer.SceneDraft:
         base = {"subtitle": "", "points": [], "icons": [], "icon": "", "stat_value": "", "stat_label": "", "quote_author": "",
+                "visual_kind": "none", "visual_query": "", "visual_prompt": "",
                 "left_heading": "", "left_points": [], "right_heading": "", "right_points": []}
         return designer.SceneDraft(layout=layout, title=title, narration=narration, **{**base, **fields})
 
@@ -69,10 +70,11 @@ class FakeLLM:
         include_quiz = "lista vacía" not in prompt
         scenes = [
             self._scene("cover", title, f"En este módulo vas a aprender {title.lower()}.",
-                        subtitle="Lo esencial en pocos minutos"),
+                        subtitle="Lo esencial en pocos minutos", visual_kind="stock", visual_query="truck highway"),
             self._scene("bullets", "Lo más importante", "Empecemos por las ideas clave.",
                         points=["Primera idea clave", "Segunda idea clave", "Tercera idea clave"],
-                        icons=["lightbulb", "target", "shield-check"]),
+                        icons=["lightbulb", "target", "shield-check"], visual_kind="clip",
+                        visual_prompt="Air slowly escaping from a truck tire valve"),
             self._scene("comparison", "Así sí, así no", "Veamos la diferencia.",
                         left_heading="Correcto", left_points=["Hacerlo con cuidado"],
                         right_heading="Incorrecto", right_points=["Hacerlo con prisa"]),

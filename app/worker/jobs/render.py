@@ -27,6 +27,7 @@ from dataclasses import MISSING, asdict, dataclass, fields, replace
 from pathlib import Path
 
 import httpx
+from PIL import Image, UnidentifiedImageError
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -41,12 +42,16 @@ from app.services.slides.spec import Slide, SlideContext
 from app.services.storage import StorageError, get_storage
 from app.services.video import captions, compose, motion
 from app.services.video.avatar import MAX_ASSET_BYTES, AvatarError, AvatarProvider, get_avatar_provider
+from app.services.video.visuals import VisualError, VisualRequest, cache_path, get_visuals
 from app.services.video.voice import VoiceError, get_voice_provider
 from app.worker.runner import JobCancelled, JobContext, JobError, Reschedule, handler, holds_job, open_session
 
 logger = logging.getLogger(__name__)
 
 PRESENTER_POLL_SECONDS = 30
+VISUAL_POLL_SECONDS = 20
+MAX_VISUAL_WAIT_SECONDS = 15 * 60  # an animated clip that takes longer is left out (the scene keeps its slide)
+VISUAL_MIME = {".mp4": "video/mp4", ".png": "image/png"}
 MAX_PRESENTER_WAIT_SECONDS = 45 * 60  # at least: a long narration gets PRESENTER_WAIT_FACTOR times its length
 PRESENTER_WAIT_FACTOR = 3
 MAX_PRESENTER_ERRORS = 5
@@ -73,6 +78,7 @@ class RenderInput:
     co_avatar_id: str = ""  # a second presenter takes every other scene, with co_voice_id
     co_voice_id: str = ""
     avatar_engine: str = ""  # "" = the server's HeyGen engine
+    animation: str = ""  # "high": every visual is an animated clip
 
 
 class _Skip(Exception):
@@ -142,6 +148,7 @@ def _read_input(module: Module, choices: dict) -> RenderInput:
         co_avatar_id=options.get("co_avatar_id") or "",
         co_voice_id=options.get("co_voice_id") or "",
         avatar_engine=options.get("avatar_engine") or "",
+        animation=options.get("animation") or "",
     )
 
 
@@ -280,7 +287,138 @@ def _narration_from_state(ctx: JobContext, work: Path) -> compose.Narration:
     return compose.Narration(master, ctx.state["starts"], ctx.state["lengths"], ctx.state["total"])
 
 
-# ── 2. Presenter ──────────────────────────────────────────────────────
+# ── 2. Visuals ──────────────────────────────────────────────────────
+
+
+FALLBACKS = {"clip": ("clip", "image", "stock"), "image": ("image", "stock"), "stock": ("stock", "image")}
+MAX_VISUAL_RETRIES = 6  # a busy provider (rate limit) is asked again this many times, then the next kind is tried
+
+
+def _visual_options(render: RenderInput) -> dict[int, list[VisualRequest]]:
+    """For each scene with a visual, what to try in order: its kind, then cheaper ones this server offers
+    (a clip falls back to an image, then to stock; an image to stock). Clips are capped per module here, where
+    they are paid for, whatever the script asks."""
+    settings = get_settings()
+    clips_left = settings.max_clips_high if render.animation == "high" else settings.max_clips_per_module
+    available = get_visuals().available()
+    options = {}
+    for index, scene in enumerate(render.scenes):
+        visual = scene.get("visual") or {}
+        kind, query, prompt = visual.get("kind") or "none", visual.get("query") or "", visual.get("prompt") or ""
+        if render.animation == "high" and kind != "none":  # the course pays for animation everywhere
+            kind = "clip"
+        if not prompt.strip() and query.strip():  # keywords alone make a poor prompt: add what the slide says
+            title = ((scene.get("slide") or {}).get("title") or "").strip()
+            prompt = f"{title}. {query}" if title else query
+        chain = [kind for kind in FALLBACKS.get(kind, ()) if kind != "clip" or clips_left > 0]
+        tries = [
+            VisualRequest(candidate, query, prompt)
+            for candidate in chain
+            if candidate in available and (query if candidate == "stock" else prompt).strip()
+        ]
+        if tries:
+            options[index] = tries
+            clips_left -= tries[0].kind == "clip"
+    return options
+
+
+def _visual_requests(render: RenderInput) -> dict[int, VisualRequest]:
+    """The first choice of every scene with a visual."""
+    return {index: tries[0] for index, tries in _visual_options(render).items()}
+
+
+def _cached_visual(render: RenderInput, request: VisualRequest) -> str | None:
+    """A file a previous render already got for the same request (stock may have been a photo)."""
+    storage = get_storage()
+    base = cache_path(render.course_id, request).rsplit(".", 1)[0]
+    for extension in (request.extension, "png" if request.extension == "mp4" else "mp4"):
+        path = f"{base}.{extension}"
+        if storage.size(path):
+            return path
+    return None
+
+
+def _fetch(ctx: JobContext, request: VisualRequest, entry: dict, local_name: Path) -> Path | None:
+    """One try at a visual: the file, or None while an animated clip is still being made."""
+    provider = get_visuals()
+    prompt = request.prompt or request.query
+    if request.kind == "clip":
+        if not entry.get("operation"):
+            entry.update(operation=provider.start_clip(prompt), started_at=time.time())
+            ctx.progress(49, "Animando los conceptos clave")  # saved: a retry follows the same clip
+            return None
+        status = provider.clip_status(entry["operation"])
+        if not status.done:
+            if time.time() - entry["started_at"] > MAX_VISUAL_WAIT_SECONDS:
+                raise VisualError("El clip animado tardó demasiado.")
+            return None
+        if status.error or not status.uri:
+            raise VisualError(status.error or "Veo no devolvió el clip.")
+        return provider.download_clip(status.uri, local_name)
+    if request.kind == "image":
+        return provider.image(prompt, local_name)
+    return provider.stock(request.query, local_name)
+
+
+def _check_visual(path: Path) -> None:
+    """A downloaded visual FFmpeg can use: a picture that opens, or a video with a length (else VisualError)."""
+    if path.suffix == ".png":
+        try:
+            with Image.open(path) as image:
+                image.verify()
+        except (UnidentifiedImageError, OSError) as exc:
+            raise VisualError("La imagen no se pudo leer.") from exc
+    elif not compose.clip_seconds(path) > 0:
+        raise VisualError("El video no se pudo leer.")
+
+
+def _get_visual(
+    ctx: JobContext, render: RenderInput, work: Path, index: int, tries: list[VisualRequest]
+) -> bool:
+    """Advance one scene's visual: True when settled (in storage, or none could be had), False while waiting."""
+    entry = ctx.state["visuals"].setdefault(str(index), {})
+    while not entry.get("path") and entry.get("try", 0) < len(tries):
+        request = tries[entry.get("try", 0)]
+        cached = _cached_visual(render, request)
+        if cached:
+            entry["path"] = cached
+            break
+        if entry.get("retry_at", 0) > time.time():
+            return False
+        try:
+            local = _fetch(ctx, request, entry, work / f"visual_{index:02d}")
+            if local is not None:
+                _check_visual(local)
+        except VisualError as exc:
+            retries = entry.get("retries", 0) + 1
+            if exc.retryable and retries <= MAX_VISUAL_RETRIES:
+                entry.update(retries=retries, retry_at=time.time() + VISUAL_POLL_SECONDS * retries)
+                return False
+            logger.warning("visual_skipped", extra={"module_id": ctx.module_id, "scene": index, "kind": request.kind,
+                                                    "reason": str(exc)[:200]})
+            for key in ("operation", "started_at", "retries", "retry_at"):
+                entry.pop(key, None)
+            entry["try"] = entry.get("try", 0) + 1  # the next, cheaper kind
+            continue
+        if local is None:
+            return False
+        path = f"{cache_path(render.course_id, request).rsplit('.', 1)[0]}{local.suffix}"
+        get_storage().upload_file(path, local, VISUAL_MIME[local.suffix])
+        entry["path"] = path
+    return True
+
+
+def _visuals(ctx: JobContext, render: RenderInput, work: Path) -> Reschedule | None:
+    """Get every scene's visual. Returns Reschedule while a clip is being made or a busy provider must wait."""
+    ctx.state.setdefault("visuals", {})
+    done = [_get_visual(ctx, render, work, index, tries) for index, tries in _visual_options(render).items()]
+    if not all(done):
+        ctx.progress(49, "Animando los conceptos clave")
+        return Reschedule(VISUAL_POLL_SECONDS)
+    return None
+
+
+# ── 3. Presenter ──────────────────────────────────────────────────────
 
 
 def _drop_presenter(ctx: JobContext, reason: str) -> None:
@@ -447,7 +585,7 @@ def _presenter(ctx: JobContext, render: RenderInput, work: Path) -> Reschedule |
         return None
 
 
-# ── 3. Composition ────────────────────────────────────────────────────
+# ── 4. Composition ────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
@@ -480,34 +618,56 @@ def _hero_scenes(render: RenderInput, presenter: bool) -> list[bool]:
     ]
 
 
-def _draw_scenes(ctx: JobContext, render: RenderInput, work: Path, presenter: bool) -> list[motion.Scene]:
+def _draw_scenes(
+    ctx: JobContext, render: RenderInput, work: Path, presenter: bool, visuals: bool = True
+) -> list[motion.Scene]:
     """Each scene's slide drawn beat by beat; with a presenter, the layouts leave its place free."""
     narration_starts, lengths = ctx.state["starts"], ctx.state["lengths"]
     saved_beats = ctx.state.get("beats")  # a render narrated before beats existed spreads them evenly
     hero = _hero_scenes(render, presenter)
+    backdrops = _backdrops(ctx, render, work) if visuals else {}
+    mode = "RGBA" if backdrops else "RGB"  # one pixel format for every image of the video (see motion.image_mode)
     scenes = []
     for index, scene in enumerate(render.scenes):
         slide = Slide.model_validate(scene["slide"])
         context = SlideContext(
             course_title=render.course_title, module_label=render.module_label, index=index + 1,
             total=len(render.scenes), theme=render.theme, presenter=presenter and not hero[index], hero=hero[index],
+            backdrop=index in backdrops,
         )
         images = []
         for shown in range(1, beat_count(slide) + 1):
             path = work / f"slide_{index:02d}_{shown:02d}.png"
-            render_slide(slide, replace(context, reveal=shown)).save(path)
+            render_slide(slide, replace(context, reveal=shown)).convert(mode).save(path)
             images.append(path)
         start = narration_starts[index]
         times = saved_beats[index] if saved_beats else _beats(scene, [], start, lengths[index])
-        scenes.append(motion.Scene(images, start, times[: len(images) - 1], push=index not in (0, len(render.scenes) - 1)))
+        # Into or out of a backdrop the slides fade, in step with the backdrops' cross-fade (a push would slide
+        # the text away from the picture it belongs to).
+        plain = index not in backdrops and index - 1 not in backdrops
+        scenes.append(motion.Scene(
+            images, start, times[: len(images) - 1], push=plain and index not in (0, len(render.scenes) - 1),
+            backdrop=backdrops.get(index),
+        ))
     return scenes
 
 
-def _compose(ctx: JobContext, render: RenderInput, work: Path, with_presenter: bool = True) -> _Composition:
+def _backdrops(ctx: JobContext, render: RenderInput, work: Path) -> dict[int, Path]:
+    """The scenes' visuals the visuals phase got, as local files (none for a render from before visuals)."""
+    found = {}
+    for key, entry in (ctx.state.get("visuals") or {}).items():
+        if entry.get("path"):
+            found[int(key)] = _local_copy(work, f"backdrop_{int(key):02d}{Path(entry['path']).suffix}", entry["path"])
+    return found
+
+
+def _compose(
+    ctx: JobContext, render: RenderInput, work: Path, with_presenter: bool = True, with_visuals: bool = True
+) -> _Composition:
     """Animated slides + narration + presenter -> video, poster and captions files."""
     avatar_path = ctx.state.get("avatar_path") if with_presenter else None
     ctx.progress(75, "Dibujando las diapositivas")
-    scenes = _draw_scenes(ctx, render, work, presenter=bool(avatar_path))
+    scenes = _draw_scenes(ctx, render, work, presenter=bool(avatar_path), visuals=with_visuals)
     avatar = _local_copy(work, "presenter.mp4", avatar_path) if avatar_path else None
 
     ctx.progress(82, "Componiendo el video")
@@ -621,8 +781,14 @@ def render_module(ctx: JobContext) -> dict | Reschedule:
         try:
             if ctx.state.get("phase", "narrate") == "narrate":
                 _narrate(ctx, render, work)
-                _plan_presenter(ctx, render)
+                ctx.state["phase"] = "visuals"
                 ctx.progress(48, "Narración lista")
+            if ctx.state["phase"] == "visuals":
+                waiting = _visuals(ctx, render, work)
+                if waiting is not None:
+                    return waiting
+                _plan_presenter(ctx, render)
+                ctx.progress(50, "Visuales listos")
             if ctx.state["phase"] == "presenter":
                 waiting = _presenter(ctx, render, work)
                 if waiting is not None:
@@ -635,12 +801,26 @@ def render_module(ctx: JobContext) -> dict | Reschedule:
 
 
 def _compose_video(ctx: JobContext, render: RenderInput, work: Path) -> _Composition:
-    """The video with its presenter; if FFmpeg can't use the presenter's clip, the same video without it."""
-    try:
-        return _compose(ctx, render, work)
-    except compose.ComposeError as exc:
-        if not ctx.state.get("avatar_path"):
-            raise
-        logger.warning("compose_with_presenter_failed", extra={"module_id": ctx.module_id, "error": str(exc)[:MAX_LOG_ERROR_CHARS]})
-        ctx.state["warning"] = "No pudimos usar el video del presentador. El video se produjo sin presentador."
-        return _compose(ctx, render, work, with_presenter=False)
+    """The video with its presenter and visuals; if FFmpeg can't use the visuals, then the presenter's clip,
+    the same video without them (with a warning for the admin)."""
+    has_visuals = any(entry.get("path") for entry in (ctx.state.get("visuals") or {}).values())
+    attempts = [(True, True)]
+    if has_visuals:
+        attempts.append((True, False))
+    if ctx.state.get("avatar_path"):
+        attempts.append((False, False))
+    for number, (presenter, visuals) in enumerate(attempts):
+        try:
+            return _compose(ctx, render, work, with_presenter=presenter, with_visuals=visuals)
+        except compose.ComposeError as exc:
+            if number == len(attempts) - 1:
+                raise
+            logger.warning("compose_fallback", extra={"module_id": ctx.module_id, "presenter": presenter,
+                                                      "visuals": visuals, "error": str(exc)[:MAX_LOG_ERROR_CHARS]})
+            next_presenter, next_visuals = attempts[number + 1]
+            ctx.state["warning"] = (
+                "No pudimos usar el video del presentador. El video se produjo sin presentador."
+                if not next_presenter
+                else "No pudimos usar las imágenes de fondo. El video se produjo con el diseño de marca."
+            )
+    raise AssertionError("unreachable")

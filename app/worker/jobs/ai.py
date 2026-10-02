@@ -12,6 +12,7 @@ from contextlib import contextmanager
 
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.db.models import Course, Evaluation, Job, Module
 from app.schemas.courses import MAX_AUDIENCE_CHARS
 from app.schemas.studio import OutlineGenerate, QuizGenerate
@@ -121,7 +122,7 @@ def draft_module(ctx: JobContext) -> dict:
             get_llm(), outline, entry, number,
             language=language, tone=tone, materials=materials, feedback=feedback, previous_scenes=previous_scenes,
         )
-    scenes = designer.to_scenes(draft.scenes)
+    scenes = designer.to_scenes(draft.scenes, get_settings().max_clips_per_module)
     if not scenes:
         raise JobError("La IA no produjo un guion utilizable. Intenta de nuevo.")
     questions = designer.to_questions(draft.quiz) if entry.include_quiz else []

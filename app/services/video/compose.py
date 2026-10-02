@@ -130,7 +130,7 @@ def cut_audio(master: Path, segments: list[tuple[float, float]], dest: Path) -> 
     return dest
 
 
-def _clip_seconds(path: Path) -> float:
+def clip_seconds(path: Path) -> float:
     """A video's length as its container states it (0 when it doesn't)."""
     try:
         out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
@@ -146,7 +146,7 @@ def presenter_track(clips: list[Path], speakers: list[int], segments: list[tuple
     Presenter p's clip holds its scenes' stretches back to back (see `cut_audio`): scene i is taken from its
     speaker's clip where that stretch lies, so the lips stay on the narration. Squares at 720 px, no audio."""
     cursors = [0.0] * len(clips)
-    lengths = [_clip_seconds(clip) for clip in clips]
+    lengths = [clip_seconds(clip) for clip in clips]
     cmd, parts = [*FFMPEG], []
     for n, (speaker, (start, end)) in enumerate(zip(speakers, segments)):
         length = end - start
@@ -281,31 +281,92 @@ def compose_video(
     listing = motion.write_concat(motion.timeline(timed, total, frames, on_frame), work / "slides.ffconcat")
 
     cmd = [*FFMPEG, "-f", "concat", "-safe", "0", "-i", str(listing), "-i", str(narration.audio)]
-    filters = [f"[0:v]scale={WIDTH}:{HEIGHT},setsar=1,fps={FPS},format=yuv420p[slides]"]
+    if any(scene.backdrop for scene in timed):
+        # The slides (transparent where a backdrop shows) go over the scenes' videos and images.
+        cmd += ["-i", str(backdrop_track(timed, total, work))]
+        filters = [
+            f"[2:v]fps={FPS},setsar=1,format=yuv420p[backdrops]",
+            f"[0:v]scale={WIDTH}:{HEIGHT},setsar=1,fps={FPS},format=rgba[fore]",
+            "[backdrops][fore]overlay=0:0:eof_action=pass,format=yuv420p[slides]",
+        ]
+        first_presenter = 3
+    else:
+        filters = [f"[0:v]scale={WIDTH}:{HEIGHT},setsar=1,fps={FPS},format=yuv420p[slides]"]
+        first_presenter = 2
     if avatar is None:
         filters.append("[slides]null[vout]")
     else:
         big = hero_intervals(timed, hero or [False] * len(timed), total)
         mask, ring = _bubble_assets(work)
         still = ["-loop", "1", "-t", f"{total:.3f}"]
-        cmd += _bubble_inputs(avatar, mask, ring, total)  # inputs 2, 3, 4
-        filters.append(f"[2:v]setpts=PTS-STARTPTS,fps={FPS},crop='min(iw,ih)':'min(iw,ih)',split=2[sq_small][sq_big]")
+        clip, mask_in, ring_in = first_presenter, first_presenter + 1, first_presenter + 2
+        cmd += _bubble_inputs(avatar, mask, ring, total)
+        filters.append(
+            f"[{clip}:v]setpts=PTS-STARTPTS,fps={FPS},crop='min(iw,ih)':'min(iw,ih)',split=2[sq_small][sq_big]"
+        )
         if big:
             hero_mask, hero_ring = _bubble_assets(work, HERO_SIZE, RING + 2)
-            cmd += [*still, "-i", str(hero_mask), *still, "-i", str(hero_ring)]  # inputs 5, 6
-            filters += _circle_overlay("slides", "sq_big", 5, 6, HERO_SIZE, HERO_BOX[:2], total, "withhero", _enable(big))
+            cmd += [*still, "-i", str(hero_mask), *still, "-i", str(hero_ring)]
+            hero_mask_in, hero_ring_in = first_presenter + 3, first_presenter + 4
             filters += _circle_overlay(
-                "withhero", "sq_small", 3, 4, BUBBLE, _bubble_xy(), total, "withbubble", f"not({_enable(big)})"
+                "slides", "sq_big", hero_mask_in, hero_ring_in, HERO_SIZE, HERO_BOX[:2], total, "withhero", _enable(big)
+            )
+            filters += _circle_overlay(
+                "withhero", "sq_small", mask_in, ring_in, BUBBLE, _bubble_xy(), total, "withbubble", f"not({_enable(big)})"
             )
         else:
             filters.append("[sq_big]nullsink")
-            filters += _circle_overlay("slides", "sq_small", 3, 4, BUBBLE, _bubble_xy(), total, "withbubble")
+            filters += _circle_overlay("slides", "sq_small", mask_in, ring_in, BUBBLE, _bubble_xy(), total, "withbubble")
         filters.append("[withbubble]format=yuv420p[vout]")
 
     cmd += ["-filter_complex", ";".join(filters), "-map", "[vout]", "-map", "1:a"]
     cmd += [*_encode_options(total), str(output)]
     run(cmd)
     return total
+
+
+BACKDROP_ZOOM = 0.12  # an image grows this much over its scene: a slow push-in, so it never sits still
+
+
+def _backdrop_inputs(source: Path | None, seconds: float) -> tuple[list[str], str]:
+    """FFmpeg input args and the filter that make one scene's backdrop exactly `seconds` long at 1920x1080."""
+    frames = max(1, round(seconds * FPS))
+    cover = f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT},setsar=1"
+    if source is None:
+        return ["-f", "lavfi", "-t", f"{seconds:.3f}", "-i", f"color=c=black:s={WIDTH}x{HEIGHT}:r={FPS}"], "setsar=1"
+    if source.suffix.lower() == ".png":
+        # Upscaled first: zoompan steps in whole pixels, which would make a slow zoom shake at 1080p.
+        zoom = (f"scale={WIDTH * 2}:{HEIGHT * 2}:force_original_aspect_ratio=increase,crop={WIDTH * 2}:{HEIGHT * 2},"
+                f"zoompan=z='1+{BACKDROP_ZOOM}*on/{frames}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+                f":s={WIDTH}x{HEIGHT}:fps={FPS},setsar=1")
+        return ["-loop", "1", "-framerate", str(FPS), "-t", f"{seconds:.3f}", "-i", str(source)], zoom
+    # A video shorter than its scene loops.
+    return ["-stream_loop", "-1", "-t", f"{seconds:.3f}", "-i", str(source)], f"{cover},fps={FPS}"
+
+
+def backdrop_track(scenes: list[motion.Scene], total: float, work: Path) -> Path:
+    """Every scene's backdrop (black where it has none) end to end, cross-fading exactly while the slides do.
+
+    Scene i shows from its transition a_i = start_i - TRANSITION (a_0 = 0) to the next one's; each piece runs
+    TRANSITION longer so that xfade at offset a_i blends it into the next."""
+    fade = motion.TRANSITION_SECONDS
+    arrivals = [0.0, *(max(0.0, scene.start - fade) for scene in scenes[1:])]
+    ends = [*arrivals[1:], total]
+    cmd, parts = [*FFMPEG], []
+    for n, (scene, start, end) in enumerate(zip(scenes, arrivals, ends)):
+        seconds = (end - start) + (fade if n < len(scenes) - 1 else 0)
+        args, chain = _backdrop_inputs(scene.backdrop, seconds)
+        cmd += args
+        parts.append(f"[{n}:v]{chain},format=yuv420p,settb=AVTB,trim=duration={seconds:.3f},setpts=PTS-STARTPTS[b{n}]")
+    last = "b0"
+    for n in range(1, len(scenes)):
+        parts.append(f"[{last}][b{n}]xfade=transition=fade:duration={fade}:offset={arrivals[n]:.3f}[x{n}]")
+        last = f"x{n}"
+    dest = work / "backdrops.mp4"
+    run([*cmd, "-filter_complex", ";".join(parts), "-map", f"[{last}]", "-t", f"{total:.3f}", "-an",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p", "-r", str(FPS), str(dest)],
+        timeout=max(FFMPEG_TIMEOUT_SECONDS, int(total * 4)))
+    return dest
 
 
 def poster(slide: Path, dest: Path) -> tuple[int, int]:

@@ -201,8 +201,17 @@ def delete_course(course_id: int, db: Session = Depends(get_db)):
     uploads, files = _drop_pending_jobs(db, Job.course_id == course_id)
     db.commit()
     _discard_quietly(db, media + uploads)  # its videos, documents, cover and materials, in storage too
-    _delete_files_quietly(files)
+    _delete_files_quietly(files + _cached_visuals(course_id))
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+def _cached_visuals(course_id: int) -> list[str]:
+    """The stock videos, images and clips its videos were made with (made from its content: they go too)."""
+    try:
+        return get_storage().list_folder(f"courses/{course_id}/visuals")
+    except StorageError as exc:
+        logger.warning("visuals_listing_failed", extra={"course_id": course_id, "error": str(exc)[:300]})
+        return []
 
 
 def _publish_problems(db: Session, course: Course) -> list[dict]:

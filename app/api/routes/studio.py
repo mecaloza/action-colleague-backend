@@ -44,6 +44,7 @@ from app.services.slides.render import is_hero, render_png
 from app.services.slides.spec import SlideContext
 from app.services.storage import StorageError, get_storage
 from app.services.video.avatar import AvatarError, get_avatar_provider
+from app.services.video.visuals import get_visuals
 from app.services.video.voice import VoiceError, get_voice_provider
 from app.worker import queue
 from app.worker.jobs.recording import enqueue_transcription, voice_available
@@ -61,7 +62,9 @@ SAMPLE_EXTENSIONS = {
     "audio/webm": ".webm", "video/webm": ".webm", "video/mp4": ".mp4",
 }
 # The course settings a render is made with.
-RENDER_CHOICES = ("voice_id", "avatar_id", "co_avatar_id", "co_voice_id", "avatar_engine", "presenter", "theme")
+RENDER_CHOICES = (
+    "voice_id", "avatar_id", "co_avatar_id", "co_voice_id", "avatar_engine", "animation", "presenter", "theme",
+)
 USABLE_UPLOADS = ("uploaded", "processing", "ready")  # pending: never confirmed; failed: unusable
 CATALOG_CACHE_SECONDS = 10 * 60
 
@@ -104,6 +107,8 @@ def capabilities():
         voice=voice_available(),
         avatar=get_avatar_provider() is not None,
         storage=_storage_available(),
+        visuals=sorted(get_visuals().available()),
+        max_clips=get_settings().max_clips_per_module,
     )
 
 

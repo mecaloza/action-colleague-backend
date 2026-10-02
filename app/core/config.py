@@ -73,6 +73,13 @@ class Settings(BaseSettings):
     heygen_api_key: str = Field("", repr=False)
     # HeyGen v3 avatar engine: avatar_iii is the most affordable; avatar_iv / avatar_v look more natural.
     heygen_engine: str = "avatar_iii"
+    # Scene visuals: stock video (Pixabay), generated images (OpenAI) and short animated clips (Google Veo).
+    pixabay_api_key: str = Field("", repr=False)
+    openai_image_model: str = "gpt-image-2"
+    gemini_api_key: str = Field("", repr=False)
+    veo_model: str = "veo-3.1-lite-generate-preview"
+    max_clips_per_module: int = Field(2, ge=0, le=10)  # the costly kind: the rest of the scenes use stock or images
+    max_clips_high: int = Field(12, ge=0, le=40)  # per module with animation "high" (every visual a clip)
 
     @field_validator("database_url")
     @classmethod

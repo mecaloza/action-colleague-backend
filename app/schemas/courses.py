@@ -45,6 +45,8 @@ class CourseSettings(BaseModel):
     co_voice_name: str = Field(default="", max_length=200)
     # HeyGen engine for the presenters: "" uses the server's default; Avatar IV is more natural and costs more.
     avatar_engine: AvatarEngine = ""
+    # "high": every scene with a visual is an animated clip (costs more); "" = stock, images and a few clips.
+    animation: Literal["", "high"] = ""
     presenter: bool = True
     theme: Literal["dark", "light"] = "dark"
 

@@ -49,7 +49,11 @@ class Storage(Protocol):
     def size(self, path: str) -> int | None: ...
     def signed_urls(self, paths: list[str], expires_in: int) -> dict[str, str]: ...
     def delete(self, paths: list[str]) -> None: ...
+    def list_folder(self, folder: str) -> list[str]: ...
     def copy_from(self, source_bucket: str, source_path: str, dest_path: str) -> None: ...
+
+
+LIST_PAGE_SIZE = 1000
 
 
 class StorageError(RuntimeError):
@@ -181,6 +185,20 @@ class SupabaseStorage:
                 headers=self.headers, json={"prefixes": paths},
             )
 
+    def list_folder(self, folder: str) -> list[str]:
+        """The files directly inside `folder` (e.g. a course's cached visuals), as full paths."""
+        folder = folder.strip("/")
+        paths: list[str] = []
+        while True:
+            response = self._send(
+                "POST", f"{self.base}/object/list/{self.bucket}", "listar archivos", headers=self.headers,
+                json={"prefix": folder, "limit": LIST_PAGE_SIZE, "offset": len(paths)},
+            )
+            names = [item["name"] for item in response.json() if item.get("id")]  # folders have no id
+            paths += [f"{folder}/{name}" for name in names]
+            if len(names) < LIST_PAGE_SIZE:
+                return paths
+
     def copy_from(self, source_bucket: str, source_path: str, dest_path: str) -> None:
         """Server-side copy from another bucket of the project (no download)."""
         self.ensure_bucket()
@@ -256,6 +274,12 @@ class LocalStorage:
     def delete(self, paths: list[str]) -> None:
         for path in paths:
             self.file_path(path).unlink(missing_ok=True)
+
+    def list_folder(self, folder: str) -> list[str]:
+        directory = self.file_path(folder.strip("/"))
+        if not directory.is_dir():
+            return []
+        return [f"{folder.strip('/')}/{entry.name}" for entry in sorted(directory.iterdir()) if entry.is_file()]
 
     def copy_from(self, source_bucket: str, source_path: str, dest_path: str) -> None:
         source = LocalStorage(self.root, source_bucket, self.public_api_url).file_path(source_path)
