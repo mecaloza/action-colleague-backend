@@ -94,6 +94,9 @@ class SlidePreviewContext(BaseModel):
 class SlidePreview(BaseModel):
     slide: Slide
     context: SlidePreviewContext = Field(default_factory=SlidePreviewContext)
+    # The scene's visual, to show the infographic or image already made for it (its course keeps them).
+    visual: SceneVisual | None = None
+    course_id: int | None = Field(default=None, ge=1)
 
 
 class VoiceOut(BaseModel):
@@ -156,5 +159,6 @@ class Capabilities(BaseModel):
     voice: bool
     avatar: bool
     storage: bool
-    visuals: list[Literal["stock", "image", "clip"]] = Field(default_factory=list)  # the kinds of scene visual offered
+    # The kinds of scene visual offered.
+    visuals: list[Literal["stock", "image", "clip", "infographic"]] = Field(default_factory=list)
     max_clips: int = 0  # animated clips per module (standard animation)

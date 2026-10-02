@@ -61,6 +61,7 @@ class FakeLLM:
     def _scene(self, layout: str, title: str, narration: str, **fields) -> designer.SceneDraft:
         base = {"subtitle": "", "points": [], "icons": [], "icon": "", "stat_value": "", "stat_label": "", "quote_author": "",
                 "visual_kind": "none", "visual_query": "", "visual_prompt": "",
+                "chart_labels": [], "chart_values": [], "chart_unit": "",
                 "left_heading": "", "left_points": [], "right_heading": "", "right_points": []}
         return designer.SceneDraft(layout=layout, title=title, narration=narration, **{**base, **fields})
 
@@ -73,8 +74,12 @@ class FakeLLM:
                         subtitle="Lo esencial en pocos minutos", visual_kind="stock", visual_query="truck highway"),
             self._scene("bullets", "Lo más importante", "Empecemos por las ideas clave.",
                         points=["Primera idea clave", "Segunda idea clave", "Tercera idea clave"],
-                        icons=["lightbulb", "target", "shield-check"], visual_kind="clip",
-                        visual_prompt="Air slowly escaping from a truck tire valve"),
+                        icons=["lightbulb", "target", "shield-check"]),
+            self._scene("visual", "Cómo se desgasta según la presión", "Mira las tres huellas de la infografía.",
+                        visual_kind="infographic",
+                        visual_prompt="Infografía: «Presión y desgaste». Tres huellas: baja, correcta y alta presión."),
+            self._scene("case", "Caso: una flota de reparto", "Veamos un caso real.",
+                        points=["Situación de la flota", "Lo que se encontró", "Lo que se hizo", "Lo que mejoró"]),
             self._scene("comparison", "Así sí, así no", "Veamos la diferencia.",
                         left_heading="Correcto", left_points=["Hacerlo con cuidado"],
                         right_heading="Incorrecto", right_points=["Hacerlo con prisa"]),

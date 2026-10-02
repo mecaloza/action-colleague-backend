@@ -18,7 +18,7 @@ from pathlib import Path
 from PIL import Image, ImageChops
 
 from app.services.slides.render import HEIGHT, WIDTH
-from app.services.slides.spec import MAX_COLUMN_POINTS, MAX_POINTS, Slide, visible_points
+from app.services.slides.spec import CASE_PARTS, MAX_COLUMN_POINTS, MAX_POINTS, Slide, chart_bars, visible_points
 from app.services.video.captions import TimedWord
 
 FPS = 30
@@ -67,6 +67,15 @@ def beat_texts(slide: Slide) -> list[str]:
         return [slide.title] + ([slide.subtitle] if slide.subtitle.strip() else [])
     if slide.layout == "statement":
         return [slide.title] + ([slide.quote_author] if slide.quote_author.strip() else [])
+    if slide.layout == "chart":
+        return [label for label, _ in chart_bars(slide)]
+    if slide.layout == "calculation":
+        steps = visible_points(slide.points, MAX_POINTS)
+        return steps + ([f"{slide.stat_value} {slide.stat_label}"] if slide.stat_value.strip() else [])
+    if slide.layout == "case":  # the narration names each part ("la solución…"): its heading is a keyword too
+        return [f"{heading} {part}" for heading, part in zip(CASE_PARTS, slide.points[: len(CASE_PARTS)])]
+    if slide.layout == "visual":
+        return []  # the infographic is there from the start
     return [slide.stat_value, slide.stat_label or slide.title]  # stat
 
 
@@ -165,6 +174,7 @@ class Scene:
     beat_times: list[float]  # when beats 1.. appear; one per image after the first
     push: bool = True  # enters by pushing the previous scene (else it fades in)
     backdrop: Path | None = None  # a video or image behind its (then transparent) slides
+    fit: str = "cover"  # "contain": the whole picture shows (an infographic), on the brand's dark background
 
 
 Segment = tuple[Path, int]  # an image and the frames it stays on screen

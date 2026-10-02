@@ -6,15 +6,24 @@ can never overflow, overlap the presenter bubble, or be distorted (always render
 video resolution).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
 
 from app.services.slides.icons import ICON_FONT, ICONS
-from app.services.slides.spec import MAX_COLUMN_POINTS, MAX_POINTS, Slide, SlideContext, visible_items, visible_points
+from app.services.slides.spec import (
+    CASE_PARTS,
+    MAX_COLUMN_POINTS,
+    MAX_POINTS,
+    Slide,
+    SlideContext,
+    chart_bars,
+    visible_items,
+    visible_points,
+)
 
 WIDTH, HEIGHT = 1920, 1080
 MARGIN_X, MARGIN_TOP, MARGIN_BOTTOM = 120, 96, 96
@@ -167,14 +176,19 @@ def fit(
     max_lines: int,
     leading: float = 1.15,
 ) -> FittedText:
-    """Largest font size (stepping down) whose wrapped text fits the box; truncates as a last resort."""
-    for size in range(max_size, min_size - 1, -2):
-        fnt = font(path, size, weight)
-        line_height = round(size * leading)
-        lines_that_fit = min(max_lines, max_height // line_height)
-        lines = wrap(draw, text, fnt, max_width, max_lines=lines_that_fit)
-        if len(lines) <= lines_that_fit:
-            return FittedText(fnt, lines, line_height)
+    """Largest font size (stepping down) whose wrapped text fits the box with every word whole; then one that fits
+    cutting a long word; truncates as a last resort."""
+    words = text.split()
+    for whole_words in (True, False):
+        for size in range(max_size, min_size - 1, -2):
+            fnt = font(path, size, weight)
+            if whole_words and any(text_width(draw, word, fnt) > max_width for word in words):
+                continue  # "comercializació-n": a smaller size first
+            line_height = round(size * leading)
+            lines_that_fit = min(max_lines, max_height // line_height)
+            lines = wrap(draw, text, fnt, max_width, max_lines=lines_that_fit)
+            if len(lines) <= lines_that_fit:
+                return FittedText(fnt, lines, line_height)
 
     fnt = font(path, min_size, weight)
     line_height = round(min_size * leading)
@@ -265,10 +279,10 @@ def is_hero(slide: Slide, index: int, total: int, presenter: bool) -> bool:
 # ── Frame (background, header, footer) ────────────────────────────────
 
 
-def _scrim() -> Image.Image:
+def _scrim(full: bool = True) -> Image.Image:
     """Transparent, darkened where the text goes (left and bottom): a backdrop shows through, the text reads."""
     across = Image.linear_gradient("L").rotate(90, expand=True).resize((WIDTH, HEIGHT))  # 255 left -> 0 right
-    alpha = across.point(lambda value: round(SCRIM_RIGHT + (SCRIM_LEFT - SCRIM_RIGHT) * value / 255))
+    alpha = across.point(lambda value: round(SCRIM_RIGHT + (SCRIM_LEFT - SCRIM_RIGHT) * value / 255) if full else 0)
     # The header and footer rows read over any picture: the top and bottom edges darken too.
     down = Image.linear_gradient("L").resize((WIDTH, HEIGHT))  # 0 top -> 255 bottom
     edges = down.point(lambda value: round(SCRIM_EDGE * max(0, 1 - value / 60, (value - 215) / 40)))
@@ -297,7 +311,7 @@ def _frame(ctx: SlideContext, theme: Theme) -> tuple[Image.Image, ImageDraw.Imag
     """Background, corner motif, header label and page counter; returns the image and its drawing handle.
 
     Over a backdrop (a photo or video behind) the slide is RGBA: transparent but for a dark scrim and its text."""
-    image = _scrim() if ctx.backdrop else _background(theme)
+    image = _scrim(full=not ctx.picture_only) if ctx.backdrop else _background(theme)
     draw = ImageDraw.Draw(image)
     if not ctx.hero and not ctx.backdrop:  # the large presenter (or the photo) takes that side
         _diamonds(draw, theme)
@@ -305,6 +319,8 @@ def _frame(ctx: SlideContext, theme: Theme) -> tuple[Image.Image, ImageDraw.Imag
     label_font = font(BODY_FONT, 24, 700)
     header_y = MARGIN_TOP - 44
     label = " · ".join(part for part in (ctx.module_label.upper(), ctx.course_title.upper()) if part)
+    if ctx.picture_only:  # an infographic fills the frame, its own title at the top: no header or counter over it
+        return image, draw
     if label:
         diamond(draw, MARGIN_X + 9, header_y + 14, 9, theme.accent)
         draw_tracked(draw, label[:70], (MARGIN_X + 32, header_y), label_font, theme.muted, 3)
@@ -491,6 +507,99 @@ def _closing(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.Imag
     _numbered_list(slide, ctx, theme, draw, top)
 
 
+def _number(value: float) -> str:
+    """A chart value as people read it in Spanish: 120000 -> 120 000, 0.054 -> 0,054."""
+    text = f"{value:,.3f}".rstrip("0").rstrip(".") if value % 1 else f"{value:,.0f}"
+    return text.replace(",", " ").replace(".", ",")
+
+
+def _chart(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageDraw) -> None:
+    """Horizontal bars with their exact values; the largest in the accent color. One bar per beat."""
+    top = _title_block(slide, ctx, theme, draw)
+    left, _, right, bottom = _content_box(top)
+    right = _text_right_limit(ctx, bottom, right)
+    bars = chart_bars(slide)
+    if not bars:
+        return
+    label_width = 420
+    gap = 26
+    row = min(130, (bottom - top - gap * (len(bars) - 1)) // len(bars))
+    labels = fit_all(draw, [label for label, _ in bars], BODY_FONT, 600, label_width - 30, row, 40, 24, max_lines=2)
+    biggest = max(abs(value) for _, value in bars) or 1
+    value_font = font(DISPLAY_FONT, min(52, row - 30), 700)
+    unit = f" {slide.chart_unit}" if slide.chart_unit.strip() else ""
+    for index, ((_, value), label) in enumerate(zip(bars, labels)):
+        if not shown(ctx, index + 1):
+            continue
+        y = top + index * (row + gap)
+        draw_lines(draw, label, left, y + (row - label.height) // 2, theme.text)
+        bar_left = left + label_width
+        text = _number(value) + unit
+        room = right - bar_left - text_width(draw, text, value_font) - 30
+        length = max(8, round(room * abs(value) / biggest))
+        color = theme.accent if abs(value) == biggest else theme.muted
+        draw.rectangle([bar_left, y + row * 0.18, bar_left + length, y + row * 0.82], fill=color)
+        draw.text((bar_left + length + 20, y + row / 2), text, font=value_font, fill=theme.text, anchor="lm")
+
+
+def _calculation(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageDraw) -> None:
+    """A worked example: each step on its own line, then the result, large. One beat per step and the result."""
+    top = _title_block(slide, ctx, theme, draw)
+    left, _, right, bottom = _content_box(top)
+    right = _text_right_limit(ctx, bottom, right)
+    steps = visible_points(slide.points, MAX_POINTS)
+    result_height = 190 if slide.stat_value.strip() else 0
+    per_step = min(96, (bottom - top - result_height) // max(1, len(steps)))
+    fitted = fit_all(draw, steps, BODY_FONT, 500, right - left - 60, per_step, 42, 26, max_lines=2)
+    y = top
+    for index, item in enumerate(fitted):
+        if shown(ctx, index + 1):
+            diamond(draw, left + 14, y + item.line_height / 2, 11, theme.accent)
+            draw_lines(draw, item, left + 60, y, theme.text)
+        y += max(per_step, item.height + 12)
+    if result_height and shown(ctx, len(steps) + 1):
+        y += 10
+        draw.line([(left, y), (right, y)], fill=theme.line, width=2)
+        value = fit(draw, slide.stat_value, DISPLAY_FONT, 700, right - left, 120, 110, 60, leading=1.0, max_lines=1)
+        draw_lines(draw, value, left, y + 24, theme.accent)
+        if slide.stat_label.strip():
+            label_left = left + int(text_width(draw, value.lines[0], value.font)) + 30
+            label = fit(draw, slide.stat_label, BODY_FONT, 600, max(200, right - label_left), 110, 40, 24, max_lines=2)
+            draw_lines(draw, label, label_left, y + 24 + (value.height - label.height) // 2, theme.text)
+
+
+def _case(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageDraw) -> None:
+    """A practical case in four cards (situation, diagnosis, solution, result), revealed one after the other."""
+    top = _title_block(slide, ctx, theme, draw)
+    left, _, right, bottom = _content_box(top)
+    right = _text_right_limit(ctx, bottom, right) if ctx.presenter else right
+    parts = slide.points[: len(CASE_PARTS)]
+    gutter = 36
+    width = (right - left - gutter) // 2
+    height = (bottom - top - gutter) // 2
+    heading_font = font(BODY_FONT, 24, 800)
+    texts = fit_all(draw, [part or "—" for part in parts], BODY_FONT, 500, width - 56, height - 90, 36, 22, max_lines=5)
+    for index, (heading, text) in enumerate(zip(CASE_PARTS, texts)):
+        if not shown(ctx, index + 1):
+            continue
+        x = left + (index % 2) * (width + gutter)
+        y = top + (index // 2) * (height + gutter)
+        if ctx.presenter and index == 3:  # the bubble sits over the last card's corner: keep its text clear
+            text = fit(draw, parts[3] or "—", BODY_FONT, 500, width - 56 - BUBBLE_SIZE // 2, height - 90, 36, 22,
+                       max_lines=5)
+        draw.rounded_rectangle([x, y, x + width, y + height], radius=16, outline=theme.line, width=2)
+        draw.rectangle([x, y + 28, x + 6, y + 64], fill=theme.accent)
+        draw_tracked(draw, heading.upper(), (x + 28, y + 30), heading_font, theme.accent, 3)
+        draw_lines(draw, text, x + 28, y + 80, theme.text)
+
+
+def _visual(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageDraw) -> None:
+    """Nothing over the scene's picture (an infographic is the content): only the header and the counter.
+    Without its picture (not generated yet, or it failed) the title stands in, like a statement."""
+    if not ctx.backdrop and slide.title.strip():
+        _statement(slide.model_copy(update={"icon": "", "quote_author": ""}), ctx, theme, draw)
+
+
 LAYOUTS = {
     "cover": _cover,
     "bullets": _bullets,
@@ -499,6 +608,10 @@ LAYOUTS = {
     "steps": _steps,
     "comparison": _comparison,
     "closing": _closing,
+    "chart": _chart,
+    "calculation": _calculation,
+    "case": _case,
+    "visual": _visual,
 }
 
 
@@ -510,6 +623,14 @@ def beat_count(slide: Slide) -> int:
         return 1 + len(visible_points(slide.left.points, MAX_COLUMN_POINTS)) + len(
             visible_points(slide.right.points, MAX_COLUMN_POINTS)
         )
+    if slide.layout == "chart":
+        return 1 + len(chart_bars(slide))
+    if slide.layout == "calculation":
+        return 1 + len(visible_points(slide.points, MAX_POINTS)) + bool(slide.stat_value.strip())
+    if slide.layout == "case":
+        return 1 + len(slide.points[: len(CASE_PARTS)])
+    if slide.layout == "visual":
+        return 1
     if slide.layout == "cover":
         return 2 + bool(slide.subtitle.strip())
     if slide.layout == "statement":
@@ -518,6 +639,8 @@ def beat_count(slide: Slide) -> int:
 
 
 def render(slide: Slide, ctx: SlideContext) -> Image.Image:
+    if slide.layout == "visual" and ctx.backdrop:
+        ctx = replace(ctx, picture_only=True)
     theme = DARK if ctx.backdrop else THEMES.get(ctx.theme, DARK)  # light text over a darkened photo
     image, draw = _frame(ctx, theme)
     LAYOUTS[slide.layout](slide, ctx, theme, draw)
@@ -531,10 +654,26 @@ def _sample_backdrop() -> Image.Image:
                                sample.point(lambda v: 110 + v // 3)))
 
 
-def render_png(slide: Slide, ctx: SlideContext, scale: float = 1.0) -> bytes:
+def _fitted(picture: Image.Image, fit: str) -> Image.Image:
+    """A picture at the slide's size: cropped to fill it ("cover") or whole on the brand's dark ("contain")."""
+    if fit == "contain":
+        canvas = Image.new("RGB", (WIDTH, HEIGHT), (17, 17, 17))
+        whole = ImageOps.contain(picture, (WIDTH, HEIGHT), Image.LANCZOS)
+        canvas.paste(whole, ((WIDTH - whole.width) // 2, (HEIGHT - whole.height) // 2))
+        return canvas
+    return ImageOps.fit(picture, (WIDTH, HEIGHT), Image.LANCZOS)
+
+
+def render_png(
+    slide: Slide, ctx: SlideContext, scale: float = 1.0, backdrop: Image.Image | None = None, fit: str = "cover"
+) -> bytes:
+    """The slide as a PNG; over a backdrop (a sample when none is given yet) when the scene has a visual."""
+    if backdrop is not None:
+        ctx = replace(ctx, backdrop=True)
     image = render(slide, ctx)
     if ctx.backdrop:
-        image = Image.alpha_composite(_sample_backdrop().convert("RGBA"), image).convert("RGB")
+        behind = _fitted(backdrop, fit) if backdrop is not None else _sample_backdrop()
+        image = Image.alpha_composite(behind.convert("RGBA"), image).convert("RGB")
     if scale != 1.0:
         image = image.resize((round(WIDTH * scale), round(HEIGHT * scale)), Image.LANCZOS)
     buffer = BytesIO()

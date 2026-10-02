@@ -64,7 +64,8 @@ class Settings(BaseSettings):
     worker_concurrency: int = Field(2, ge=1, le=8)
 
     openai_api_key: str = Field("", repr=False)
-    openai_model: str = "gpt-4o"
+    # A reasoning model: it follows the script's rules (length, data, one case per module) far better.
+    openai_model: str = "gpt-5.5"
     # Deterministic offline AI, voice and presenter (local development and e2e without API keys).
     use_fake_providers: bool = False
     elevenlabs_api_key: str = Field("", repr=False)

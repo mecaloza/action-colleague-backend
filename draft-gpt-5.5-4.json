@@ -1,0 +1,220 @@
+{
+ "scenes": [
+  {
+   "id": "s1",
+   "slide": {
+    "layout": "cover",
+    "eyebrow": "",
+    "title": "Módulo 2: Mantenimiento y costo por km",
+    "subtitle": "Aprende a detectar fugas de dinero en llantas y convertirlas en ahorro medible.",
+    "points": [],
+    "icons": [],
+    "icon": "",
+    "stat_value": "",
+    "stat_label": "",
+    "quote_author": "",
+    "left": {
+     "heading": "",
+     "points": []
+    },
+    "right": {
+     "heading": "",
+     "points": []
+    },
+    "chart_labels": [],
+    "chart_values": [],
+    "chart_unit": ""
+   },
+   "narration": "En este módulo vas a pasar de vender una llanta a asesorar una operación. En flotas, el precio de compra importa, pero no cuenta toda la historia. Lo que decide la rentabilidad es cuánto cuesta cada kilómetro rodado. Para defender ese número necesitas revisar presión, rotación, alineación, balanceo y vida útil del casco. También necesitas traducir beneficios técnicos, como reesculturado y recauchado, a costo por kilómetro. La meta es que puedas llegar a patio, reconocer señales de desgaste y proponer acciones concretas que el cliente pueda medir.",
+   "visual": {
+    "kind": "none",
+    "query": "",
+    "prompt": "",
+    "variant": 0
+   }
+  },
+  {
+   "id": "s2",
+   "slide": {
+    "layout": "visual",
+    "eyebrow": "",
+    "title": "Presión: el primer control de costo",
+    "subtitle": "",
+    "points": [],
+    "icons": [],
+    "icon": "",
+    "stat_value": "",
+    "stat_label": "",
+    "quote_author": "",
+    "left": {
+     "heading": "",
+     "points": []
+    },
+    "right": {
+     "heading": "",
+     "points": []
+    },
+    "chart_labels": [],
+    "chart_values": [],
+    "chart_unit": ""
+   },
+   "narration": "Empieza siempre por la presión. Como estándar conocido del sector, la medición debe hacerse en frío, con manómetro calibrado, al menos una vez por semana y antes de una ruta larga. La infografía muestra tres casos. Con baja presión, la llanta trabaja sobre los hombros: sube la temperatura, aumenta el arrastre y se acelera el desgaste. Con presión correcta, la huella apoya pareja y el casco se conserva mejor. Con presión alta, el centro carga más trabajo y se pierde uniformidad. Nunca ajustes usando una llanta caliente como referencia; primero registra el dato y confirma contra la presión definida por la flota.",
+   "visual": {
+    "kind": "infographic",
+    "query": "",
+    "prompt": "Infografía técnica en español. Título: “Presión de inflado: qué le pasa a la huella”. Tres columnas comparadas. Columna 1: etiqueta “Baja presión”; dibujo de llanta con hombros en rojo, flechas de calor hacia los costados y texto “más arrastre y desgaste en hombros”. Columna 2: etiqueta “Presión correcta”; dibujo de huella plana en verde, contacto uniforme y texto “apoyo parejo, mejor conservación del casco”. Columna 3: etiqueta “Presión alta”; dibujo con centro de la banda en rojo y texto “desgaste al centro y menor uniformidad”. Franja inferior: “Medir en frío • manómetro calibrado • registro semanal”.",
+    "variant": 0
+   }
+  },
+  {
+   "id": "s3",
+   "slide": {
+    "layout": "visual",
+    "eyebrow": "",
+    "title": "El desgaste dice qué corregir",
+    "subtitle": "",
+    "points": [],
+    "icons": [],
+    "icon": "",
+    "stat_value": "",
+    "stat_label": "",
+    "quote_author": "",
+    "left": {
+     "heading": "",
+     "points": []
+    },
+    "right": {
+     "heading": "",
+     "points": []
+    },
+    "chart_labels": [],
+    "chart_values": [],
+    "chart_unit": ""
+   },
+   "narration": "Después de medir presión, lee la banda de rodadura. Usa este mapa como diagnóstico rápido en patio. Si ves desgaste en ambos hombros, sospecha baja presión o sobrecarga. Si el centro está más gastado, revisa exceso de presión. Si un solo hombro se va rápido, pide alineación antes de que el problema dañe el casco. Si hay vibración, saltos o desgaste en parches, revisa balanceo y rotación. Como práctica común del sector, rota según política de la flota; cuando no exista, usa una ventana de 10,000 a 15,000 kilómetros y adelántala si aparece desgaste irregular.",
+   "visual": {
+    "kind": "infographic",
+    "query": "",
+    "prompt": "Infografía técnica en español. Título: “Mapa de desgaste: señal → acción”. Cuatro tarjetas con dibujo superior de una banda de rodadura. Tarjeta 1: “Ambos hombros gastados” con hombros rojos; acción: “verificar presión y carga”. Tarjeta 2: “Centro gastado” con centro rojo; acción: “corregir presión alta”. Tarjeta 3: “Un hombro gastado” con un lado rojo; acción: “alinear”. Tarjeta 4: “Parches o vibración” con zonas alternadas rojas; acción: “balancear y revisar rotación”. Pie: “Registrar km, posición y acción tomada”.",
+    "variant": 0
+   }
+  },
+  {
+   "id": "s4",
+   "slide": {
+    "layout": "calculation",
+    "eyebrow": "",
+    "title": "Convierte precio en costo por kilómetro",
+    "subtitle": "",
+    "points": [
+     "Base índice: 100 de costo ÷ 100 de km = 1.00 costo/km relativo.",
+     "Reesculturado correcto: hasta +25% de kilometraje potencial; vida índice 125.",
+     "Nuevo costo relativo: 100 ÷ 125 = 0.80 del costo/km base.",
+     "Ahorro potencial en llanta por km: 20%, sin contar combustible ni recauchado."
+    ],
+    "icons": [],
+    "icon": "",
+    "stat_value": "20%",
+    "stat_label": "ahorro potencial en costo de llanta por km",
+    "quote_author": "",
+    "left": {
+     "heading": "",
+     "points": []
+    },
+    "right": {
+     "heading": "",
+     "points": []
+    },
+    "chart_labels": [],
+    "chart_values": [],
+    "chart_unit": ""
+   },
+   "narration": "Para hablar con flotas, lleva todo a costo por kilómetro. Si no tienes precio real, usa índices para explicar la lógica; después sustituyes con factura y odómetro. En la base, cien unidades de costo entre cien unidades de vida dan uno punto cero. Si el neumático comercial Austone está marcado como Regroovable y el reesculturado se hace correctamente, el material indica hasta veinticinco por ciento más de potencial de kilometraje. Entonces la vida pasa a índice ciento veinticinco. Cien entre ciento veinticinco da cero punto ochenta. La lectura comercial es simple: hasta veinte por ciento menos costo de llanta por kilómetro, sin contar el ahorro de combustible reportado de hasta dos litros cada cien kilómetros.",
+   "visual": {
+    "kind": "none",
+    "query": "",
+    "prompt": "",
+    "variant": 0
+   }
+  },
+  {
+   "id": "s5",
+   "slide": {
+    "layout": "case",
+    "eyebrow": "",
+    "title": "Caso práctico: conversación en patio",
+    "subtitle": "",
+    "points": [
+     "Situación: flota mexicana de reparto TBR. Compraba por precio de llanta y no registraba costo por kilómetro.",
+     "Diagnóstico: se revisó patio y aparecieron presiones tomadas en caliente, desgaste en hombros y rotación sin kilometraje fijo.",
+     "Solución: medir en frío semanalmente, rotar entre 10,000 y 15,000 km, alinear ante desgaste de un hombro y separar cascos Clase A.",
+     "Resultado: la propuesta cambió a costo/km; se documentó potencial de hasta +25% km y hasta 2 L/100 km menos con reesculturado correcto."
+    ],
+    "icons": [],
+    "icon": "",
+    "stat_value": "",
+    "stat_label": "",
+    "quote_author": "",
+    "left": {
+     "heading": "",
+     "points": []
+    },
+    "right": {
+     "heading": "",
+     "points": []
+    },
+    "chart_labels": [],
+    "chart_values": [],
+    "chart_unit": ""
+   },
+   "narration": "Imagina esta visita de trabajo. Una flota mexicana de reparto TBR pide “la llanta más barata”. En patio encuentras que varias presiones se toman al regreso de ruta, cuando la llanta está caliente. También observas hombros castigados y no hay kilometraje fijo para rotación. Tu solución no empieza con otro producto; empieza con control. Propones medición en frío semanal, rotación con ventana definida, alineación cuando el desgaste aparece en un hombro y separación de cascos Clase A para recauchado. La lección es clave: no prometas milagros. Muestra el potencial técnico con datos del material y pide registro para confirmar el ahorro real por kilómetro.",
+   "visual": {
+    "kind": "none",
+    "query": "",
+    "prompt": "",
+    "variant": 0
+   }
+  },
+  {
+   "id": "s6",
+   "slide": {
+    "layout": "closing",
+    "eyebrow": "",
+    "title": "Tres hábitos para bajar el costo por km",
+    "subtitle": "",
+    "points": [
+     "Mide presión en frío y registra la acción, no solo el dato.",
+     "Lee el desgaste: presión, alineación, balanceo o rotación.",
+     "Vende costo por km: incluye reesculturado y cascos Clase A."
+    ],
+    "icons": [
+     "clipboard-check",
+     "eye",
+     "coins"
+    ],
+    "icon": "",
+    "stat_value": "",
+    "stat_label": "",
+    "quote_author": "",
+    "left": {
+     "heading": "",
+     "points": []
+    },
+    "right": {
+     "heading": "",
+     "points": []
+    },
+    "chart_labels": [],
+    "chart_values": [],
+    "chart_unit": ""
+   },
+   "narration": "Cierra cada asesoría con tres hábitos. Primero, mide presión en frío y registra qué se corrigió; un dato sin acción no baja costos. Segundo, lee el desgaste antes de recomendar: la banda te dice si el problema viene de presión, alineación, balanceo o rotación. Tercero, vende costo por kilómetro, no solo precio. Ahí entran el reesculturado, que puede extender el kilometraje, y el recauchado de cascos Clase A, que prolonga la vida útil de la carcasa y reduce materiales. Si haces esto, tu conversación deja de ser una cotización y se vuelve una mejora operativa medible.",
+   "visual": {
+    "kind": "none",
+    "query": "",
+    "prompt": "",
+    "variant": 0
+   }
+  }
+ ]
+}

@@ -141,6 +141,7 @@ def draft_module(ctx: JobContext) -> dict:
         module.generation_status, module.generation_error = "pending", None
         if questions and module.evaluation is None:  # a quiz the admin already has is never overwritten
             db.add(Evaluation(module_id=module.id, spec=questions))
+        studio.queue_visuals(db, module)  # its infographics, ready to review with the script
         db.commit()
     logger.info("module_drafted", extra={"module_id": ctx.module_id, "scenes": len(scenes), "questions": len(questions)})
     return {"scenes": len(scenes), "questions": len(questions)}

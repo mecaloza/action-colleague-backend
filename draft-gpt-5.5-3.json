@@ -1,0 +1,225 @@
+{
+ "scenes": [
+  {
+   "id": "s1",
+   "slide": {
+    "layout": "cover",
+    "eyebrow": "",
+    "title": "Selección y Comercialización de Llantas",
+    "subtitle": "Elige y explica la llanta correcta para cada necesidad de flota",
+    "points": [],
+    "icons": [],
+    "icon": "",
+    "stat_value": "",
+    "stat_label": "",
+    "quote_author": "",
+    "left": {
+     "heading": "",
+     "points": []
+    },
+    "right": {
+     "heading": "",
+     "points": []
+    },
+    "chart_labels": [],
+    "chart_values": [],
+    "chart_unit": ""
+   },
+   "narration": "En este módulo vas a practicar una conversación clave: pasar de “¿qué precio tiene?” a “¿qué llanta resuelve mejor tu operación?”. Tu trabajo como asesor es identificar la aplicación, elegir la marca adecuada y explicar el beneficio con datos del producto. Nos enfocaremos en llantas TBR para camión y transporte pesado, con las marcas Austone, Roadtrack, Winmax y Green Dragon. También veremos cómo usar las tecnologías de Austone, como LCI y Matrix, para argumentar durabilidad, seguridad y desempeño. La meta es que tu recomendación suene técnica, clara y comercial.",
+   "visual": {
+    "kind": "none",
+    "query": "",
+    "prompt": "",
+    "variant": 0
+   }
+  },
+  {
+   "id": "s2",
+   "slide": {
+    "layout": "visual",
+    "eyebrow": "",
+    "title": "Primero: aplicación por posición",
+    "subtitle": "",
+    "points": [],
+    "icons": [],
+    "icon": "",
+    "stat_value": "",
+    "stat_label": "",
+    "quote_author": "",
+    "left": {
+     "heading": "",
+     "points": []
+    },
+    "right": {
+     "heading": "",
+     "points": []
+    },
+    "chart_labels": [],
+    "chart_values": [],
+    "chart_unit": ""
+   },
+   "narration": "Antes de hablar de marca, ubica la aplicación. En dirección, la prioridad es estabilidad, desgaste uniforme y control. Una falla aquí afecta la conducción y la confianza del operador. En tracción, la llanta debe transmitir fuerza al piso; por eso importa el agarre y la resistencia al trabajo pesado. En remolque, la llanta soporta carga y arrastre continuo; aquí buscas durabilidad, resistencia y desempeño constante en ruta. Cuando entrevistes a la flota, pregunta tres cosas en este orden: posición donde irá montada, tipo de ruta y severidad de carga. Si saltas este paso, puedes vender una llanta buena en una aplicación equivocada. Eso genera desgaste prematuro y reclamaciones evitables.",
+   "visual": {
+    "kind": "infographic",
+    "query": "",
+    "prompt": "Infografía técnica titulada: “Aplicación por posición”. Mostrar un tractocamión con semirremolque en vista lateral. Resaltar tres zonas con color y etiqueta: 1) “Dirección: estabilidad y control” sobre el eje delantero, dibujo de volante y banda con desgaste uniforme. 2) “Tracción: agarre y fuerza” sobre los ejes motrices, dibujo de flechas empujando hacia adelante y bloques de banda. 3) “Remolque: carga y arrastre” sobre ejes del remolque, dibujo de carga y línea de ruta. Incluir al pie: “Pregunta clave: posición + ruta + carga”.",
+    "variant": 0
+   }
+  },
+  {
+   "id": "s3",
+   "slide": {
+    "layout": "visual",
+    "eyebrow": "",
+    "title": "Austone: tecnología que se argumenta",
+    "subtitle": "",
+    "points": [],
+    "icons": [],
+    "icon": "",
+    "stat_value": "",
+    "stat_label": "",
+    "quote_author": "",
+    "left": {
+     "heading": "",
+     "points": []
+    },
+    "right": {
+     "heading": "",
+     "points": []
+    },
+    "chart_labels": [],
+    "chart_values": [],
+    "chart_unit": ""
+   },
+   "narration": "Con Austone, tu argumento no debe quedarse en “es buena”. Recorre cuatro pruebas de valor. Primero, LCI: el indicador de control de carril usa un perfil de banda que ayuda a detectar desalineaciones del chasis en etapa temprana. Eso protege el rendimiento de la llanta. Segundo, Matrix: integra un alambre de acero de alta elongación de 100 metros alrededor de la corona para aportar resistencia y elasticidad. Tercero, la línea Austone para camión destaca por ser la única en México con 6 cinturones, según el material corporativo. Cuarto, el ciclo de vida: los neumáticos comerciales marcados como Regroovable pueden aumentar el potencial de kilometraje hasta 25% y ahorrar hasta 2 litros cada 100 km cuando se reescultura correctamente.",
+   "visual": {
+    "kind": "infographic",
+    "query": "",
+    "prompt": "Infografía titulada: “Austone: 4 argumentos técnicos”. Diseño en cuatro paneles numerados. Panel 1: “LCI: detecta desalineación temprana”, dibujo de banda de rodadura con indicador visible y eje ligeramente desalineado. Panel 2: “Matrix: 100 m de acero en la corona”, corte transversal de llanta con aro de alambre resaltado. Panel 3: “6 cinturones: resistencia estructural”, corte de llanta con seis capas marcadas. Panel 4: “Regroovable: hasta +25% km y hasta 2 L/100 km”, dibujo de banda reesculturada con regla de profundidad. Resaltar en negritas: “Tecnología + ciclo de vida”.",
+    "variant": 0
+   }
+  },
+  {
+   "id": "s4",
+   "slide": {
+    "layout": "comparison",
+    "eyebrow": "",
+    "title": "Cómo posicionar el portafolio TBR",
+    "subtitle": "",
+    "points": [],
+    "icons": [],
+    "icon": "",
+    "stat_value": "",
+    "stat_label": "",
+    "quote_author": "",
+    "left": {
+     "heading": "Correcto",
+     "points": [
+      "Austone: tecnología LCI, Matrix y 6 cinturones",
+      "Roadtrack: nueva generación TBR con más de 20 medidas",
+      "Winmax y Green Dragon: opciones TBR del portafolio",
+      "Import Treads: inventario, cobertura nacional y asesoría"
+     ]
+    },
+    "right": {
+     "heading": "Incorrecto",
+     "points": [
+      "Prometer tecnología sin ficha o material de respaldo",
+      "Vender solo por precio, sin aplicación ni ruta",
+      "Usar la misma llanta para dirección, tracción y remolque",
+      "Olvidar el respaldo logístico en la propuesta"
+     ]
+    },
+    "chart_labels": [],
+    "chart_values": [],
+    "chart_unit": ""
+   },
+   "narration": "Ahora convierte el portafolio en una conversación comercial. Si el cliente pide tecnología y vida útil, empieza por Austone: LCI, Matrix y 6 cinturones son argumentos concretos. Si necesita disponibilidad en TBR de nueva generación, menciona que Austone y Roadtrack tienen más de 20 medidas disponibles. Para Winmax y Green Dragon, preséntalas como opciones TBR del portafolio de Import Treads, sin atribuirles tecnologías que el material no documenta. Y siempre suma el respaldo de Import Treads: cobertura nacional, inventarios, asesoría y logística. El error común es vender solo por precio. Otro error es prometer beneficios técnicos sin evidencia. Si no está en la ficha o material, no lo digas.",
+   "visual": {
+    "kind": "none",
+    "query": "",
+    "prompt": "",
+    "variant": 0
+   }
+  },
+  {
+   "id": "s5",
+   "slide": {
+    "layout": "case",
+    "eyebrow": "",
+    "title": "Caso práctico: flota de reparto",
+    "subtitle": "",
+    "points": [
+     "Situación: flota de reparto nacional pide TBR para dirección y remolque; busca disponibilidad y menor reclamación.",
+     "Diagnóstico: se separan posiciones; dirección requiere control, remolque exige carga y arrastre continuo.",
+     "Solución: se propone Austone en dirección por LCI, Matrix y 6 cinturones; Roadtrack como opción TBR con cobertura de medidas.",
+     "Resultado: la propuesta deja de competir solo por precio y se sostiene con aplicación, tecnología y respaldo logístico."
+    ],
+    "icons": [],
+    "icon": "",
+    "stat_value": "",
+    "stat_label": "",
+    "quote_author": "",
+    "left": {
+     "heading": "",
+     "points": []
+    },
+    "right": {
+     "heading": "",
+     "points": []
+    },
+    "chart_labels": [],
+    "chart_values": [],
+    "chart_unit": ""
+   },
+   "narration": "Imagina esta visita. Una flota de reparto nacional te pide “una TBR económica” para dirección y remolque. En lugar de cotizar de inmediato, haces el diagnóstico: separas posiciones. Para dirección, explicas que necesitan control y desgaste uniforme; ahí propones Austone por LCI, Matrix y 6 cinturones. Para remolque, revisas disponibilidad y ruta, y presentas Roadtrack como alternativa TBR de nueva generación con cobertura dentro de más de 20 medidas junto con Austone. La solución no promete milagros: conecta aplicación con argumento técnico y respaldo de Import Treads. El resultado es una propuesta más defendible: ya no compite solo por precio, sino por necesidad, tecnología, disponibilidad y servicio.",
+   "visual": {
+    "kind": "none",
+    "query": "",
+    "prompt": "",
+    "variant": 0
+   }
+  },
+  {
+   "id": "s6",
+   "slide": {
+    "layout": "closing",
+    "eyebrow": "",
+    "title": "Tres hábitos para vender mejor",
+    "subtitle": "",
+    "points": [
+     "Pregunta posición, ruta y carga antes de cotizar.",
+     "Usa la marca con argumentos documentados.",
+     "Cierra con tecnología, ciclo de vida y respaldo."
+    ],
+    "icons": [
+     "clipboard-list",
+     "badge-check",
+     "handshake"
+    ],
+    "icon": "",
+    "stat_value": "",
+    "stat_label": "",
+    "quote_author": "",
+    "left": {
+     "heading": "",
+     "points": []
+    },
+    "right": {
+     "heading": "",
+     "points": []
+    },
+    "chart_labels": [],
+    "chart_values": [],
+    "chart_unit": ""
+   },
+   "narration": "Para cerrar, quédate con tres hábitos. Primero: pregunta posición, ruta y carga antes de cotizar. Esa información define si hablarás de dirección, tracción o remolque. Segundo: usa la marca con argumentos documentados. Austone permite hablar de LCI, Matrix, 6 cinturones, reesculturado y recauchado; Roadtrack suma cobertura TBR de nueva generación; Winmax y Green Dragon amplían el portafolio disponible. Tercero: cierra con tecnología, ciclo de vida y respaldo. Una buena asesoría no es recitar características. Es traducirlas a una recomendación clara para la operación de la flota.",
+   "visual": {
+    "kind": "none",
+    "query": "",
+    "prompt": "",
+    "variant": 0
+   }
+  }
+ ]
+}
