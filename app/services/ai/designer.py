@@ -28,8 +28,8 @@ from app.services.slides.icons import ICONS
 
 LANGUAGE_NAMES = {"es": "español latinoamericano", "en": "English", "pt": "português do Brasil"}
 WORDS_PER_MINUTE = 150  # narration pace
-WORDS_PER_SCENE = 85  # average narration of one scene
-MIN_SCENES, MAX_SCENES = 5, 14  # per module, whatever its duration
+WORDS_PER_SCENE = 105  # average narration of one scene (the prompt asks for 70-140 words)
+MIN_SCENES, MAX_SCENES = 5, 16  # per module, whatever its duration
 # What a stored storyboard may hold (the editor's limits too): the model's output is cut to them.
 MAX_STORYBOARD_SCENES = 40
 MAX_NARRATION_CHARS = 4000
