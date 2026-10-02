@@ -145,7 +145,7 @@ def push(before: Image.Image, after: Image.Image, count: int) -> list[Image.Imag
     frames = []
     for number in range(1, count + 1):
         shift = round(_ease(number / count) * WIDTH)
-        frame = Image.new("RGB", (WIDTH, HEIGHT))
+        frame = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 255))
         frame.paste(before, (-shift, 0))
         frame.paste(after, (WIDTH - shift, 0))
         frames.append(frame)
@@ -164,9 +164,15 @@ class Scene:
     start: float
     beat_times: list[float]  # when beats 1.. appear; one per image after the first
     push: bool = True  # enters by pushing the previous scene (else it fades in)
+    backdrop: Path | None = None  # a video or image behind its (then transparent) slides
 
 
 Segment = tuple[Path, int]  # an image and the frames it stays on screen
+
+
+def image_mode(scenes: list["Scene"]) -> str:
+    """The pixel format every image of the video is saved in: RGBA when a backdrop shows through, else RGB."""
+    return "RGBA" if any(scene.backdrop for scene in scenes) else "RGB"
 
 
 def timeline(scenes: list[Scene], total: float, work: Path, on_frame: Callable[[], None] | None = None) -> list[Segment]:
@@ -176,6 +182,9 @@ def timeline(scenes: list[Scene], total: float, work: Path, on_frame: Callable[[
     narration. A beat slides in at its time (shortened if the next event comes sooner).
     """
     total_frames = max(1, round(total * FPS))
+    # One pixel format for the whole input (FFmpeg's concat stalls when it changes midway): with alpha only if a
+    # scene has a backdrop to show through. The scenes' own images must match (see `image_mode`).
+    mode = image_mode(scenes)
     events: list[tuple[int, str, int, int]] = []  # (frame, kind, scene, beat)
     for index, scene in enumerate(scenes):
         arrive = 0 if index == 0 else max(0, round((scene.start - TRANSITION_SECONDS) * FPS))
@@ -190,7 +199,7 @@ def timeline(scenes: list[Scene], total: float, work: Path, on_frame: Callable[[
         if path not in cache:
             cache.clear()  # scenes go in order: only the current one's images are needed
             with Image.open(path) as opened:
-                cache[path] = opened.convert("RGB")
+                cache[path] = opened.convert("RGBA")  # slides over a backdrop are see-through
         return cache[path]
 
     written = 0
@@ -200,7 +209,7 @@ def timeline(scenes: list[Scene], total: float, work: Path, on_frame: Callable[[
         segments = []
         for frame in frames:
             path = work / f"motion_{written:05d}.png"
-            frame.save(path, compress_level=1)
+            frame.convert(mode).save(path, compress_level=1)
             written += 1
             segments.append((path, 1))
             if on_frame:
@@ -224,7 +233,7 @@ def timeline(scenes: list[Scene], total: float, work: Path, on_frame: Callable[[
         if kind == "scene":
             count = min(_frames(TRANSITION_SECONDS), room)
             if current is None:
-                black = Image.new("RGB", (WIDTH, HEIGHT))
+                black = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 255))
                 frames = fade(black, image(target), count)
             else:
                 before = image(current).copy()

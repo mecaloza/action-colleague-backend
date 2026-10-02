@@ -11,7 +11,7 @@ from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 from app.services.slides.icons import ICON_FONT, ICONS
 from app.services.slides.spec import MAX_COLUMN_POINTS, MAX_POINTS, Slide, SlideContext, visible_items, visible_points
@@ -26,6 +26,8 @@ HERO_SIZE = 600
 HERO_BOX = (WIDTH - MARGIN_X - HERO_SIZE, (HEIGHT - HERO_SIZE) // 2 + 30, WIDTH - MARGIN_X, (HEIGHT + HERO_SIZE) // 2 + 30)
 HERO_TEXT_RIGHT = HERO_BOX[0] - 90
 ICON_BADGE = 76  # the rounded square an item's icon sits in
+SCRIM_LEFT, SCRIM_RIGHT = 225, 60  # opacity of the darkening over a backdrop, at the left and right edges
+SCRIM_EDGE = 200  # and at the top and bottom edges (header and footer)
 MAX_ITEM_STEP = 150  # the most a list item is placed below the previous one
 
 FONTS_DIR = Path(__file__).resolve().parent / "fonts"  # SIL Open Font License (see the OFL files)
@@ -263,6 +265,19 @@ def is_hero(slide: Slide, index: int, total: int, presenter: bool) -> bool:
 # ── Frame (background, header, footer) ────────────────────────────────
 
 
+def _scrim() -> Image.Image:
+    """Transparent, darkened where the text goes (left and bottom): a backdrop shows through, the text reads."""
+    across = Image.linear_gradient("L").rotate(90, expand=True).resize((WIDTH, HEIGHT))  # 255 left -> 0 right
+    alpha = across.point(lambda value: round(SCRIM_RIGHT + (SCRIM_LEFT - SCRIM_RIGHT) * value / 255))
+    # The header and footer rows read over any picture: the top and bottom edges darken too.
+    down = Image.linear_gradient("L").resize((WIDTH, HEIGHT))  # 0 top -> 255 bottom
+    edges = down.point(lambda value: round(SCRIM_EDGE * max(0, 1 - value / 60, (value - 215) / 40)))
+    alpha = ImageChops.lighter(alpha, edges)
+    scrim = Image.new("RGBA", (WIDTH, HEIGHT), (8, 8, 8, 0))
+    scrim.putalpha(alpha)
+    return scrim
+
+
 def _background(theme: Theme) -> Image.Image:
     base = Image.new("RGB", (WIDTH, HEIGHT), theme.background)
     gradient = Image.linear_gradient("L").resize((WIDTH, HEIGHT))
@@ -279,10 +294,12 @@ def _diamonds(draw: ImageDraw.ImageDraw, theme: Theme) -> None:
 
 
 def _frame(ctx: SlideContext, theme: Theme) -> tuple[Image.Image, ImageDraw.ImageDraw]:
-    """Background, corner motif, header label and page counter; returns the image and its drawing handle."""
-    image = _background(theme)
+    """Background, corner motif, header label and page counter; returns the image and its drawing handle.
+
+    Over a backdrop (a photo or video behind) the slide is RGBA: transparent but for a dark scrim and its text."""
+    image = _scrim() if ctx.backdrop else _background(theme)
     draw = ImageDraw.Draw(image)
-    if not ctx.hero:  # the large presenter takes that side
+    if not ctx.hero and not ctx.backdrop:  # the large presenter (or the photo) takes that side
         _diamonds(draw, theme)
 
     label_font = font(BODY_FONT, 24, 700)
@@ -501,14 +518,23 @@ def beat_count(slide: Slide) -> int:
 
 
 def render(slide: Slide, ctx: SlideContext) -> Image.Image:
-    theme = THEMES.get(ctx.theme, DARK)
+    theme = DARK if ctx.backdrop else THEMES.get(ctx.theme, DARK)  # light text over a darkened photo
     image, draw = _frame(ctx, theme)
     LAYOUTS[slide.layout](slide, ctx, theme, draw)
     return image
 
 
+def _sample_backdrop() -> Image.Image:
+    """What the editor's preview shows behind a scene with a visual (the real one is found when producing)."""
+    sample = Image.linear_gradient("L").rotate(-35, expand=True).resize((WIDTH, HEIGHT))
+    return Image.merge("RGB", (sample.point(lambda v: 70 + v // 3), sample.point(lambda v: 90 + v // 3),
+                               sample.point(lambda v: 110 + v // 3)))
+
+
 def render_png(slide: Slide, ctx: SlideContext, scale: float = 1.0) -> bytes:
     image = render(slide, ctx)
+    if ctx.backdrop:
+        image = Image.alpha_composite(_sample_backdrop().convert("RGBA"), image).convert("RGB")
     if scale != 1.0:
         image = image.resize((round(WIDTH * scale), round(HEIGHT * scale)), Image.LANCZOS)
     buffer = BytesIO()

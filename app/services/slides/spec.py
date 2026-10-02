@@ -70,6 +70,17 @@ def visible_items(slide: "Slide", limit: int) -> list[tuple[str, str]]:
     ][:limit]
 
 
+VisualKind = Literal["none", "stock", "image", "clip"]
+
+
+class SceneVisual(BaseModel):
+    """What fills the screen behind a scene's text (see `app.services.video.visuals`)."""
+
+    kind: VisualKind = "none"
+    query: Annotated[str, StringConstraints(max_length=120, strip_whitespace=True)] = ""  # English keywords (stock)
+    prompt: Annotated[str, StringConstraints(max_length=600, strip_whitespace=True)] = ""  # English description
+
+
 @dataclass(frozen=True)
 class SlideContext:
     course_title: str = ""
@@ -80,3 +91,4 @@ class SlideContext:
     presenter: bool = False  # reserve the bottom-right corner for the presenter bubble
     hero: bool = False  # the presenter is shown large on the right (cover and closing): text keeps to the left
     reveal: int | None = None  # beats shown (see `render.beat_count`); None shows the whole slide
+    backdrop: bool = False  # a photo or video fills the screen behind: transparent background with a dark scrim

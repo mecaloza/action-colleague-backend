@@ -12,6 +12,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 from app.services.ai.llm import LLM
+from app.core.config import get_settings
 from app.services.quiz import validate_questions
 from app.services.slides.spec import (
     MAX_COLUMN_POINTS,
@@ -21,7 +22,9 @@ from app.services.slides.spec import (
     ComparisonColumn,
     Layout,
     Slide,
+    SceneVisual,
     SlideIcon,
+    VisualKind,
     visible_points,
 )
 from app.services.slides.icons import ICONS
@@ -70,6 +73,9 @@ class SceneDraft(BaseModel):
     right_heading: str
     right_points: list[str]
     narration: str
+    visual_kind: VisualKind
+    visual_query: str  # English keywords (stock)
+    visual_prompt: str  # English description (image / clip)
 
 
 class PairDraft(BaseModel):
@@ -192,6 +198,7 @@ def module_prompt(
     previous_scenes: list[dict] | None = None,
 ) -> str:
     scenes = _scene_count(module.estimated_minutes)
+    max_clips = get_settings().max_clips_per_module
     module_list = "\n".join(f"{i}. {m.title}" for i, m in enumerate(outline.modules, start=1))
     feedback_block = _feedback_block(feedback, "VERSIÓN", _scenes_text(previous_scenes or []))
     return f"""Escribe el guion en escenas del módulo {number} de un curso y su evaluación.
@@ -226,6 +233,14 @@ ESCENAS ({scenes} aprox.). Cada escena es una diapositiva + lo que el presentado
 - icons (solo "bullets" y "closing"): un ícono por cada point, en el mismo orden, que represente esa idea;
   icon: el de "statement" o "stat".
   Usa solo nombres de esta lista ("" si ninguno encaja): {", ".join(ICONS)}.
+- Visual de cada escena (lo que se ve DETRÁS del texto, a pantalla completa):
+  * "stock": un video real de banco (camiones, talleres, carreteras, personas trabajando). visual_query: 2-4
+    palabras clave EN INGLÉS concretas y visuales (p. ej. "truck tire workshop"). Úsalo en la mitad de las escenas.
+  * "image": una ilustración generada cuando el stock no puede mostrarlo (un corte técnico, un diagrama, un objeto
+    específico). visual_prompt: descripción EN INGLÉS de la imagen, concreta, sin texto en la imagen.
+  * "clip": una animación corta generada para el concepto físico CLAVE del módulo (aire, presión, fuerzas,
+    desgaste, un proceso). visual_prompt: descripción EN INGLÉS de la escena en movimiento. Máximo {max_clips} por módulo.
+  * "none": solo el fondo de marca (listas largas, comparaciones, cierres).
 - Deja vacíos ("" o []) los campos que el layout no usa.
 
 reading_summary: resumen en Markdown para leer (5-10 líneas, con viñetas).
@@ -294,13 +309,29 @@ def to_slide(scene: SceneDraft) -> Slide:
     )
 
 
-def to_scenes(drafts: list[SceneDraft]) -> list[dict]:
-    """Storyboard scenes (`{id, slide, narration}`) within the editor's limits; a scene without narration is dropped."""
+def to_visual(scene: SceneDraft, clips_left: int) -> SceneVisual:
+    """The model's visual for a scene: an animated clip only while the module has clips left (then an image)."""
+    kind = scene.visual_kind
+    if kind == "clip" and clips_left <= 0:
+        kind = "image"
+    if kind == "stock" and not scene.visual_query.strip() or kind in ("image", "clip") and not scene.visual_prompt.strip():
+        kind = "none"
+    return SceneVisual(kind=kind, query=_clip(scene.visual_query, 120), prompt=_clip(scene.visual_prompt, 600))
+
+
+def to_scenes(drafts: list[SceneDraft], max_clips: int = 2) -> list[dict]:
+    """Storyboard scenes (`{id, slide, narration, visual}`) within the editor's limits; a scene without narration
+    is dropped, and at most `max_clips` animated clips are kept."""
     narrated = [scene for scene in drafts if scene.narration.strip()][:MAX_STORYBOARD_SCENES]
-    return [
-        {"id": f"s{number}", "slide": to_slide(scene).model_dump(), "narration": _clip(scene.narration, MAX_NARRATION_CHARS)}
-        for number, scene in enumerate(narrated, start=1)
-    ]
+    scenes, clips = [], 0
+    for number, scene in enumerate(narrated, start=1):
+        visual = to_visual(scene, max_clips - clips)
+        clips += visual.kind == "clip"
+        scenes.append({
+            "id": f"s{number}", "slide": to_slide(scene).model_dump(),
+            "narration": _clip(scene.narration, MAX_NARRATION_CHARS), "visual": visual.model_dump(),
+        })
+    return scenes
 
 
 _MD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")

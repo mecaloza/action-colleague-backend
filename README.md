@@ -136,6 +136,7 @@ Los tests de migraciones corren contra SQLite y contra un PostgreSQL 16 embebido
 | `USE_FAKE_PROVIDERS` | no | Solo desarrollo y e2e: IA, voz y presentador falsos y deterministas, sin llaves ni red. |
 | `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL` | para voz | Narración (voz por defecto y modelo `eleven_multilingual_v2`) y subtítulos automáticos (Scribe). |
 | `HEYGEN_API_KEY`, `HEYGEN_ENGINE` | para presentador | Presentador IA con la API v3 (`avatar_iii` por costo; `avatar_iv`/`avatar_v` más naturales). Sin llave, los videos salen sin presentador. |
+| `PIXABAY_API_KEY`, `GEMINI_API_KEY`, `OPENAI_IMAGE_MODEL`, `VEO_MODEL`, `MAX_CLIPS_PER_MODULE` | opcionales | Visuales de cada escena: video de stock (Pixabay, gratis), imágenes generadas (OpenAI) y clips animados cortos (Google Veo, de pago). Sin ellas las escenas salen con su fondo de marca. |
 
 El entorno se detecta con `RAILWAY_ENVIRONMENT_NAME` (Railway lo define) o `ENVIRONMENT`.
 

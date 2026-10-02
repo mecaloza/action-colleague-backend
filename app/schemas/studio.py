@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 from app.schemas.courses import MAX_AUDIENCE_CHARS, MAX_MODULES, AvatarEngine, ModuleCount
 from app.services.ai.designer import MAX_NARRATION_CHARS, MAX_STORYBOARD_SCENES, CourseOutline, OutlineModule
-from app.services.slides.spec import Slide
+from app.services.slides.spec import SceneVisual, Slide
 
 __all__ = [
     "MAX_MODULES",
@@ -66,6 +66,7 @@ class StoryboardScene(BaseModel):
     id: str = Field(min_length=1, max_length=40)
     slide: Slide
     narration: str = Field(min_length=1, max_length=MAX_NARRATION_CHARS)
+    visual: SceneVisual = Field(default_factory=SceneVisual)
 
 
 class Storyboard(BaseModel):
@@ -87,6 +88,7 @@ class SlidePreviewContext(BaseModel):
     total: int = Field(default=1, ge=1, le=99)
     theme: Literal["dark", "light"] = "dark"
     presenter: bool = False
+    backdrop: bool = False  # the scene has a visual: its text goes over a darkened picture
 
 
 class SlidePreview(BaseModel):
@@ -127,6 +129,7 @@ class RenderRequest(BaseModel):
     co_voice_id: str | None = Field(default=None, max_length=100, pattern=r"^[A-Za-z0-9_-]*$")
     co_voice_name: str | None = Field(default=None, max_length=200)
     avatar_engine: AvatarEngine | None = None
+    animation: Literal["", "high"] | None = None
     presenter: bool | None = None
     theme: Literal["dark", "light"] | None = None
 
@@ -153,3 +156,5 @@ class Capabilities(BaseModel):
     voice: bool
     avatar: bool
     storage: bool
+    visuals: list[Literal["stock", "image", "clip"]] = Field(default_factory=list)  # the kinds of scene visual offered
+    max_clips: int = 0  # animated clips per module (standard animation)
