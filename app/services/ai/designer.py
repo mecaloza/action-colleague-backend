@@ -181,6 +181,7 @@ Reglas:
 - Título del curso: máximo 70 caracteres. Descripción: 1-2 frases.
 - Por módulo: título (máx. 60 caracteres), resumen (1-2 frases), 2-4 objetivos que empiecen con un verbo,
   3-5 puntos clave, minutos estimados (3-15) y si debe tener evaluación (normalmente sí).
+- Los minutos estimados de los módulos suman la DURACIÓN TOTAL APROXIMADA (es el tiempo de video que se narra).
 - Objetivos del curso: 3-5.
 {feedback_block}
 {_materials_block(materials, 60_000)}"""
@@ -205,18 +206,20 @@ MÓDULO {number}: {module.title}
 Resumen: {module.summary}
 Objetivos: {"; ".join(module.objectives)}
 Puntos clave: {"; ".join(module.key_points)}
-Duración objetivo: {module.estimated_minutes} minutos (~{WORDS_PER_MINUTE} palabras por minuto de narración)
+Duración objetivo: {module.estimated_minutes} minutos: la narración de todas las escenas suma unas
+{module.estimated_minutes * WORDS_PER_MINUTE} palabras ({WORDS_PER_MINUTE} por minuto). No te quedes corto: es lo que dura el video.
 
 ESCENAS ({scenes} aprox.). Cada escena es una diapositiva + lo que el presentador dice mientras se ve:
 - La primera escena usa layout "cover" (título del módulo + subtítulo con el beneficio para quien aprende).
 - La última usa "closing" (título + 3 conclusiones en points).
-- En medio alterna layouts según el contenido: "bullets" (2-4 points), "steps" (3-5 pasos en points),
+- En medio alterna layouts según el contenido: "bullets" (3-4 points), "steps" (3-5 pasos en points),
   "statement" (una idea fuerte en title; quote_author opcional), "stat" (solo si el material trae una cifra
   real: stat_value + stat_label), "comparison" (left_heading/left_points vs right_heading/right_points,
-  2-4 points cada lado, p. ej. «Correcto» vs «Incorrecto»).
+  3-4 points cada lado, p. ej. «Correcto» vs «Incorrecto»). Prefiere bullets, steps y comparison: la pantalla
+  debe mostrar contenido concreto (datos, pasos, ejemplos), no solo un título.
 - Texto en pantalla MUY breve: title máx. 60 caracteres, cada point máx. 80 caracteres. La pantalla resume;
   la narración explica.
-- narration: 40-110 palabras, natural, en segunda persona, sin leer literalmente la diapositiva, sin
+- narration: 70-140 palabras por escena, natural, con ejemplos concretos del trabajo, en segunda persona, sin leer literalmente la diapositiva, sin
   marcas como [pausa] ni emojis. Debe fluir de una escena a la siguiente.
 - Los points aparecen en pantalla uno a uno cuando la narración los menciona: nómbralos en el mismo orden,
   usando sus palabras clave.
