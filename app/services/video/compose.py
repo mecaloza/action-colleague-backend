@@ -328,12 +328,16 @@ def compose_video(
 BACKDROP_ZOOM = 0.12  # an image grows this much over its scene: a slow push-in, so it never sits still
 
 
-def _backdrop_inputs(source: Path | None, seconds: float) -> tuple[list[str], str]:
+def _backdrop_inputs(source: Path | None, seconds: float, fit: str = "cover") -> tuple[list[str], str]:
     """FFmpeg input args and the filter that make one scene's backdrop exactly `seconds` long at 1920x1080."""
     frames = max(1, round(seconds * FPS))
     cover = f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT},setsar=1"
     if source is None:
         return ["-f", "lavfi", "-t", f"{seconds:.3f}", "-i", f"color=c=black:s={WIDTH}x{HEIGHT}:r={FPS}"], "setsar=1"
+    if fit == "contain":  # all of it, still (an infographic is read, not watched): the brand's dark around it
+        still = ["-loop", "1", "-framerate", str(FPS), "-t", f"{seconds:.3f}", "-i", str(source)]
+        return still, (f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
+                       f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=0x111111,setsar=1")
     if source.suffix.lower() == ".png":
         # Upscaled first: zoompan steps in whole pixels, which would make a slow zoom shake at 1080p.
         zoom = (f"scale={WIDTH * 2}:{HEIGHT * 2}:force_original_aspect_ratio=increase,crop={WIDTH * 2}:{HEIGHT * 2},"
@@ -355,7 +359,7 @@ def backdrop_track(scenes: list[motion.Scene], total: float, work: Path) -> Path
     cmd, parts = [*FFMPEG], []
     for n, (scene, start, end) in enumerate(zip(scenes, arrivals, ends)):
         seconds = (end - start) + (fade if n < len(scenes) - 1 else 0)
-        args, chain = _backdrop_inputs(scene.backdrop, seconds)
+        args, chain = _backdrop_inputs(scene.backdrop, seconds, scene.fit)
         cmd += args
         parts.append(f"[{n}:v]{chain},format=yuv420p,settb=AVTB,trim=duration={seconds:.3f},setpts=PTS-STARTPTS[b{n}]")
     last = "b0"

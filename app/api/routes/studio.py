@@ -6,9 +6,11 @@ presenters to choose from, the production of each module's video, and camera rec
 import tempfile
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 
+from PIL import Image
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
@@ -44,10 +46,11 @@ from app.services.slides.render import is_hero, render_png
 from app.services.slides.spec import SlideContext
 from app.services.storage import StorageError, get_storage
 from app.services.video.avatar import AvatarError, get_avatar_provider
-from app.services.video.visuals import get_visuals
+from app.services.video.visuals import VisualRequest, cache_path, get_visuals
 from app.services.video.voice import VoiceError, get_voice_provider
 from app.worker import queue
 from app.worker.jobs.recording import enqueue_transcription, voice_available
+from app.worker.jobs.render import scene_prompt
 
 router = APIRouter(tags=["studio"], dependencies=[Depends(require_admin)])
 
@@ -263,6 +266,7 @@ def save_storyboard(module_id: int, payload: Storyboard, db: Session = Depends(g
     if len(set(ids)) != len(ids):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Hay escenas repetidas")
     module.storyboard = {**(module.storyboard or {}), "scenes": [scene.model_dump() for scene in payload.scenes]}
+    studio.queue_visuals(db, module)  # a new or changed infographic is made now, for the preview
     db.commit()
     return Storyboard(scenes=studio.scenes_of(module))
 
@@ -307,18 +311,74 @@ PREVIEW_WAIT_SECONDS = 15
 
 
 @router.post("/slides/preview", response_class=Response)
-def preview_slide(payload: SlidePreview):
-    """The slide exactly as the video will show it (960x540 PNG)."""
+def preview_slide(payload: SlidePreview, db: Session = Depends(get_db)):
+    """The slide exactly as the video will show it (960x540 PNG): over its infographic or image when one is
+    made already. `X-Visual-Pending: 1` says it is still being made (the editor asks again in a while)."""
     asked = payload.context
     hero = is_hero(payload.slide, asked.index, asked.total, asked.presenter)  # as the video will show it
     context = SlideContext(**{**asked.model_dump(), "presenter": asked.presenter and not hero, "hero": hero})
     if not _PREVIEW_SLOTS.acquire(timeout=PREVIEW_WAIT_SECONDS):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Hay muchas vistas previas en curso; intenta de nuevo.")
     try:
-        png = render_png(payload.slide, context, scale=0.5)
+        picture, pending = _prepared_picture(db, payload)
+        png = render_png(payload.slide, context, scale=0.5, backdrop=picture,
+                         fit="contain" if payload.visual and payload.visual.kind == "infographic" else "cover")
     finally:
         _PREVIEW_SLOTS.release()
-    return Response(png, media_type="image/png", headers={"Cache-Control": "no-store"})
+    headers = {"Cache-Control": "no-store", **({"X-Visual-Pending": "1"} if pending else {})}
+    return Response(png, media_type="image/png", headers=headers)
+
+
+# The prepared visuals last shown in a preview, decoded and shrunk to the preview's size (most recent last).
+_PICTURES: OrderedDict[str, Image.Image] = OrderedDict()
+_PICTURES_LOCK = threading.Lock()
+MAX_CACHED_PICTURES = 16
+PICTURE_SIZE = (960, 960)  # enough to fill (or fit in) the 960x540 preview
+
+
+def _prepared_picture(db: Session, payload: SlidePreview) -> tuple[Image.Image | None, bool]:
+    """The infographic or image made for the scene (None if none), and whether it is still being made: only
+    while the course has a preparation job running (never for one that failed or was never asked for)."""
+    visual = payload.visual
+    if visual is None or payload.course_id is None or visual.kind not in studio.PREPARED_VISUALS:
+        return None, False
+    scene = {"slide": payload.slide.model_dump(), "visual": visual.model_dump()}
+    request = VisualRequest(visual.kind, visual.query, scene_prompt(scene), visual.variant)
+    path = cache_path(payload.course_id, request)
+    with _PICTURES_LOCK:
+        if path in _PICTURES:
+            _PICTURES.move_to_end(path)
+            return _PICTURES[path], False
+    storage = get_storage()
+    try:
+        if not storage.size(path):
+            return None, _preparing(db, payload.course_id, request)
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / "picture.png"
+            storage.download_file(path, local)
+            with Image.open(local) as opened:
+                picture = opened.convert("RGB")
+                picture.thumbnail(PICTURE_SIZE)
+    except (StorageError, OSError):
+        return None, False  # the preview still shows the slide over the sample
+    with _PICTURES_LOCK:
+        _PICTURES[path] = picture
+        while len(_PICTURES) > MAX_CACHED_PICTURES:
+            _PICTURES.popitem(last=False)
+    return picture, False
+
+
+def _preparing(db: Session, course_id: int, request: VisualRequest) -> bool:
+    """Whether a "visuals.prepare" job of the course will make this picture: one that hasn't started yet (it reads
+    the saved script when it does) or one making exactly this (a description not saved yet is never pending)."""
+    if request.kind not in get_visuals().available():
+        return False
+    jobs = db.query(Job).filter(Job.type == "visuals.prepare", Job.course_id == course_id, Job.status.in_(queue.ACTIVE))
+    key = request.key()
+    return any(
+        "signature" not in (job.state or {}) or any(entry.endswith(f":{key}") for entry in job.state["signature"])
+        for job in jobs
+    )
 
 
 # ── Voices and presenters ─────────────────────────────────────────────

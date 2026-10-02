@@ -88,3 +88,17 @@ def module_content_for_quiz(db: Session, module: Module) -> str:
     document = db.get(MediaAsset, module.document_asset_id) if module.document_asset_id else None
     parts = [module.content_text or "", narration_text(module), _asset_text(video, "transcript"), _asset_text(document)]
     return "\n\n".join(part for part in parts if part and part.strip())
+
+
+PREPARED_VISUALS = ("infographic", "image")  # made right after the script is written, for the admin to review
+
+
+def queue_visuals(db: Session, module: Module) -> None:
+    """Have the module's infographics and images made now (see the "visuals.prepare" job); the caller commits."""
+    from app.services.video.visuals import get_visuals
+    from app.worker import queue
+
+    wanted = {(scene.get("visual") or {}).get("kind") for scene in scenes_of(module)}
+    if wanted & set(PREPARED_VISUALS) & get_visuals().available():
+        queue.enqueue(db, "visuals.prepare", {}, course_id=module.course_id, module_id=module.id,
+                      dedupe_key=f"visuals:{module.id}", max_attempts=2, commit=False)

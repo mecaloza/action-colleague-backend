@@ -28,8 +28,8 @@ from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-Kind = str  # "stock" | "image" | "clip"
-KINDS = ("stock", "image", "clip")
+Kind = str  # "stock" | "image" | "clip" | "infographic"
+KINDS = ("stock", "image", "clip", "infographic")
 PIXABAY = "https://pixabay.com/api"
 GEMINI = "https://generativelanguage.googleapis.com/v1beta"
 OPENAI_IMAGES = "https://api.openai.com/v1/images/generations"
@@ -44,6 +44,14 @@ GEMINI_HOST = "generativelanguage.googleapis.com"
 DOWNLOAD_DOMAINS = ("pixabay.com", "googleapis.com", "googleusercontent.com")
 MIN_STOCK_SECONDS = 5
 CLIP_SECONDS = 8
+# An infographic explains: exact labels in the course's language, the brand's look, and the corner where the
+# presenter's bubble goes left empty.
+INFOGRAPHIC_STYLE = (
+    "Clean, accurate technical infographic for a corporate training course. Dark charcoal background (#111111), flat "
+    "vector illustration with precise technical drawings, orange (#ff4c01) highlights, white sans-serif text. "
+    "Write every label exactly as given, spelled correctly, large and legible; no other text. Keep the bottom-right "
+    "corner (the last 25% of the width and 35% of the height) completely empty. No logos, no watermarks."
+)
 STYLE = ("Cinematic, realistic, professional training video look, soft natural light. Absolutely no text, letters, "
          "numbers, signs, captions, watermarks, brand names or logos anywhere in the frame.")
 
@@ -62,16 +70,17 @@ class VisualError(RuntimeError):
 class VisualRequest:
     kind: Kind
     query: str  # English keywords for stock
-    prompt: str  # English description for generated images and clips
+    prompt: str  # English description for generated images and clips (an infographic's, in the course's language)
+    variant: int = 0  # "another version" of the same description
 
     def key(self) -> str:
         """Stable id of what was asked: the same request reuses the same file."""
-        text = "\n".join([self.kind, self.query.strip().lower(), self.prompt.strip()])
+        text = "\n".join([self.kind, self.query.strip().lower(), self.prompt.strip(), str(self.variant)])
         return hashlib.sha256(text.encode()).hexdigest()[:24]
 
     @property
     def extension(self) -> str:
-        return "png" if self.kind == "image" else "mp4"
+        return "png" if self.kind in ("image", "infographic") else "mp4"
 
 
 def cache_path(course_id: int, request: VisualRequest) -> str:
@@ -128,7 +137,7 @@ class Visuals:
 
     def available(self) -> set[Kind]:
         return {kind for kind, key in (("stock", self.pixabay_key), ("image", self.openai_key),
-                                       ("clip", self.gemini_key)) if key}
+                                       ("infographic", self.openai_key), ("clip", self.gemini_key)) if key}
 
     # ── Stock (Pixabay) ──
 
@@ -170,13 +179,18 @@ class Visuals:
     # ── Generated image (OpenAI) ──
 
     def image(self, prompt: str, dest: Path) -> Path:
+        return self._generate(f"{prompt.strip()} {STYLE}", "medium", dest)
+
+    def infographic(self, prompt: str, dest: Path) -> Path:
+        return self._generate(f"{prompt.strip()}\n\n{INFOGRAPHIC_STYLE}", "high", dest)
+
+    def _generate(self, prompt: str, quality: str, dest: Path) -> Path:
         if not self.openai_key:
             raise VisualError("No hay generador de imágenes configurado.")
         with _network("generar la imagen"):
             response = self.client.post(OPENAI_IMAGES, timeout=IMAGE_TIMEOUT_SECONDS, headers={
                 "Authorization": f"Bearer {self.openai_key}"}, json={
-                "model": self.image_model, "prompt": f"{prompt.strip()} {STYLE}", "size": "1536x1024",
-                "quality": "medium", "n": 1,
+                "model": self.image_model, "prompt": prompt, "size": "1536x1024", "quality": quality, "n": 1,
             })
         if not response.is_success:
             logger.error("visual_image_failed", extra={"status": response.status_code, "detail": response.text[:300]})
@@ -305,6 +319,18 @@ class FakeVisuals:
 
         dest = dest.with_suffix(".png")
         Image.new("RGB", (1536, 1024), (40, 90, 140)).save(dest)
+        return dest
+
+    def infographic(self, prompt: str, dest: Path) -> Path:
+        from PIL import Image, ImageDraw
+
+        dest = dest.with_suffix(".png")
+        image = Image.new("RGB", (1536, 1024), (17, 17, 17))
+        draw = ImageDraw.Draw(image)
+        for n in range(3):  # three panels, like a comparison infographic
+            draw.rectangle([90 + n * 470, 220, 470 + n * 470, 760], outline=(255, 76, 1), width=10)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        image.save(dest)
         return dest
 
     def start_clip(self, prompt: str) -> str:

@@ -6,7 +6,9 @@ canonical slide and question formats and drops anything that does not validate, 
 inventing placeholder content.
 """
 
+import math
 import re
+import unicodedata
 from typing import Literal
 
 from pydantic import BaseModel
@@ -15,8 +17,11 @@ from app.services.ai.llm import LLM
 from app.core.config import get_settings
 from app.services.quiz import validate_questions
 from app.services.slides.spec import (
+    CASE_PARTS,
+    MAX_CHART_VALUE,
     MAX_COLUMN_POINTS,
     MAX_LABEL_CHARS,
+    MAX_LIST_ITEMS,
     MAX_POINTS,
     MAX_TEXT_CHARS,
     ComparisonColumn,
@@ -72,10 +77,13 @@ class SceneDraft(BaseModel):
     left_points: list[str]
     right_heading: str
     right_points: list[str]
+    chart_labels: list[str]
+    chart_values: list[float]
+    chart_unit: str
     narration: str
     visual_kind: VisualKind
     visual_query: str  # English keywords (stock)
-    visual_prompt: str  # English description (image / clip)
+    visual_prompt: str  # English description (image / clip); for an infographic, in the course's language
 
 
 class PairDraft(BaseModel):
@@ -199,7 +207,10 @@ def module_prompt(
 ) -> str:
     scenes = _scene_count(module.estimated_minutes)
     max_clips = get_settings().max_clips_per_module
-    module_list = "\n".join(f"{i}. {m.title}" for i, m in enumerate(outline.modules, start=1))
+    module_list = "\n".join(
+        f"{i}. {m.title}" + ("" if i == number else f" (lo cubre ese módulo: {'; '.join(m.key_points)})")
+        for i, m in enumerate(outline.modules, start=1)
+    )
     feedback_block = _feedback_block(feedback, "VERSIÓN", _scenes_text(previous_scenes or []))
     return f"""Escribe el guion en escenas del módulo {number} de un curso y su evaluación.
 
@@ -209,6 +220,8 @@ TONO: {tone or "profesional y cercano"}
 MÓDULOS DEL CURSO:
 {module_list}
 
+Enseña SOLO lo de este módulo: no repitas temas, infografías ni casos que corresponden a los otros.
+
 MÓDULO {number}: {module.title}
 Resumen: {module.summary}
 Objetivos: {"; ".join(module.objectives)}
@@ -216,31 +229,41 @@ Puntos clave: {"; ".join(module.key_points)}
 Duración objetivo: {module.estimated_minutes} minutos: la narración de todas las escenas suma unas
 {module.estimated_minutes * WORDS_PER_MINUTE} palabras ({WORDS_PER_MINUTE} por minuto). No te quedes corto: es lo que dura el video.
 
-ESCENAS ({scenes} aprox.). Cada escena es una diapositiva + lo que el presentador dice mientras se ve:
+ESCENAS ({scenes} aprox.). Cada escena es lo que se ve + lo que el presentador dice mientras se ve. El curso debe
+ENSEÑAR a hacer el trabajo: datos concretos (cifras, rangos, frecuencias, especificaciones), procedimientos paso a
+paso, cómo reconocer un problema, errores comunes y su costo. Nada genérico ("revisa regularmente"): di cuánto,
+cada cuándo, cómo y por qué. Usa los datos de los materiales; si das un dato que no está en ellos, que sea un
+estándar conocido del sector, y dilo así en la narración.
 - La primera escena usa layout "cover" (título del módulo + subtítulo con el beneficio para quien aprende).
-- La última usa "closing" (título + 3 conclusiones en points).
-- En medio alterna layouts según el contenido: "bullets" (3-4 points), "steps" (3-5 pasos en points),
-  "statement" (una idea fuerte en title; quote_author opcional), "stat" (solo si el material trae una cifra
-  real: stat_value + stat_label), "comparison" (left_heading/left_points vs right_heading/right_points,
-  3-4 points cada lado, p. ej. «Correcto» vs «Incorrecto»). Prefiere bullets, steps y comparison: la pantalla
-  debe mostrar contenido concreto (datos, pasos, ejemplos), no solo un título.
-- Texto en pantalla MUY breve: title máx. 60 caracteres, cada point máx. 80 caracteres. La pantalla resume;
-  la narración explica.
-- narration: 70-140 palabras por escena, natural, con ejemplos concretos del trabajo, en segunda persona, sin leer literalmente la diapositiva, sin
-  marcas como [pausa] ni emojis. Debe fluir de una escena a la siguiente.
+- La última usa "closing" (título + 3 conclusiones accionables en points).
+- Incluye SIEMPRE un caso práctico: layout "case" con points = [situación, diagnóstico, solución, resultado]
+  (en ese orden, sin escribir la etiqueta: la pantalla ya la pone; cada uno 1-2 frases con datos: tipo de flota, cifras, qué se observó, qué se hizo, qué mejoró).
+  La narración lo cuenta como una historia real del trabajo y cierra con la lección.
+- Para los conceptos técnicos clave (2-4 por módulo) usa layout "visual" con visual_kind "infographic": la
+  infografía ES la explicación (p. ej. cómo se desgasta la llanta según la presión, qué mide el indicador LCI, cómo
+  funciona una técnica). visual_prompt: describe la infografía EN EL IDIOMA DEL CURSO con sus textos exactos
+  (título, etiquetas, 2-4 partes comparadas o pasos), qué dibujo técnico muestra cada parte y qué se resalta.
+  title: el tema de la infografía. La narración recorre la infografía parte por parte.
+- Si hay cifras para comparar, usa "chart" (chart_labels + chart_values con los números exactos + chart_unit;
+  2-6 barras). Si hay una cuenta que el asesor debe saber hacer, usa "calculation": points = los pasos con
+  números reales del tema (forma: "Opción A: precio ÷ km de vida = costo por km"; las cifras salen de los
+  materiales o del caso, nunca de este ejemplo) y stat_value + stat_label = el resultado. Si los materiales no
+  traen precios, usa un ejemplo con cifras redondas y realistas del mercado y dilo en la narración ("por ejemplo");
+  nunca índices abstractos (1.00 ÷ 1.00) que no enseñan a hacer la cuenta.
+- En el resto alterna: "bullets" (3-4 points), "steps" (3-5 pasos), "comparison" (left/right 3-4 points cada
+  lado, p. ej. «Correcto» vs «Incorrecto»), "stat" (una cifra real) y, poco, "statement".
+- Texto en pantalla breve: title máx. 60 caracteres, cada point máx. 90 caracteres (en "case" y "calculation"
+  hasta 160). La pantalla resume; la narración explica.
+- narration: 70-140 palabras por escena, natural, en segunda persona, con ejemplos concretos del trabajo, sin leer
+  literalmente la diapositiva, sin marcas como [pausa] ni emojis. Debe fluir de una escena a la siguiente.
 - Los points aparecen en pantalla uno a uno cuando la narración los menciona: nómbralos en el mismo orden,
   usando sus palabras clave.
 - icons (solo "bullets" y "closing"): un ícono por cada point, en el mismo orden, que represente esa idea;
   icon: el de "statement" o "stat".
   Usa solo nombres de esta lista ("" si ninguno encaja): {", ".join(ICONS)}.
-- Visual de cada escena (lo que se ve DETRÁS del texto, a pantalla completa):
-  * "stock": un video real de banco (camiones, talleres, carreteras, personas trabajando). visual_query: 2-4
-    palabras clave EN INGLÉS concretas y visuales (p. ej. "truck tire workshop"). Úsalo en la mitad de las escenas.
-  * "image": una ilustración generada cuando el stock no puede mostrarlo (un corte técnico, un diagrama, un objeto
-    específico). visual_prompt: descripción EN INGLÉS de la imagen, concreta, sin texto en la imagen.
-  * "clip": una animación corta generada para el concepto físico CLAVE del módulo (aire, presión, fuerzas,
-    desgaste, un proceso). visual_prompt: descripción EN INGLÉS de la escena en movimiento. Máximo {max_clips} por módulo.
-  * "none": solo el fondo de marca (listas largas, comparaciones, cierres).
+- visual_kind de las demás escenas: "none" (el diseño de marca) casi siempre. Solo si un proceso físico se entiende
+  mejor en movimiento, "clip" con visual_prompt EN INGLÉS describiendo ese proceso concreto (máximo {max_clips} por
+  módulo). No uses visuales decorativos que no expliquen nada del tema.
 - Deja vacíos ("" o []) los campos que el layout no usa.
 
 reading_summary: resumen en Markdown para leer (5-10 líneas, con viñetas).
@@ -272,6 +295,18 @@ CONTENIDO DEL MÓDULO:
 # ── Conversions ───────────────────────────────────────────────────────
 
 
+def _unlabeled(text: str, heading: str) -> str:
+    """The text without a leading "Heading:" (any case or accents)."""
+    match = re.match(r"\s*([^:]{1,20}):\s*", text)
+    if match and _plain(match.group(1)) == _plain(heading):
+        return text[match.end():]
+    return text
+
+
+def _plain(text: str) -> str:
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().strip().lower()
+
+
 def _clip(text: str, limit: int) -> str:
     return text.strip()[:limit].strip()
 
@@ -293,7 +328,13 @@ def _column(heading: str, points: list[str]) -> ComparisonColumn:
 
 def to_slide(scene: SceneDraft) -> Slide:
     """The model's scene as a slide, cut to the slide's limits (the model does not always respect them)."""
+    bars = [  # a figure the slide can't draw (not a number, or absurdly large) drops its bar, label and all
+        (label, value) for label, value in zip(scene.chart_labels, scene.chart_values)
+        if math.isfinite(value) and abs(value) <= MAX_CHART_VALUE
+    ][:MAX_LIST_ITEMS]
     points, icons = _points_with_icons(scene.points, scene.icons, MAX_POINTS)
+    if scene.layout == "case":  # the slide labels each part: "Situación: …" would say it twice
+        points = [_unlabeled(point, heading) for point, heading in zip(points, CASE_PARTS)] + points[len(CASE_PARTS):]
     return Slide(
         layout=scene.layout,
         title=_clip(scene.title, MAX_TEXT_CHARS),
@@ -306,17 +347,26 @@ def to_slide(scene: SceneDraft) -> Slide:
         quote_author=_clip(scene.quote_author, MAX_LABEL_CHARS),
         left=_column(scene.left_heading, scene.left_points),
         right=_column(scene.right_heading, scene.right_points),
+        chart_labels=[_clip(label, MAX_LABEL_CHARS) for label, _ in bars],
+        chart_values=[value for _, value in bars],
+        chart_unit=_clip(scene.chart_unit, MAX_LABEL_CHARS),
     )
 
 
 def to_visual(scene: SceneDraft, clips_left: int) -> SceneVisual:
-    """The model's visual for a scene: an animated clip only while the module has clips left (then an image)."""
+    """The model's visual for a scene. An infographic goes with the "visual" layout (it is the scene's content);
+    an animated clip only while the module has clips left; a visual without its description is dropped."""
     kind = scene.visual_kind
+    prompt = scene.visual_prompt
+    if scene.layout == "visual":
+        kind, prompt = "infographic", prompt or scene.title
+    elif kind == "infographic":
+        kind = "none"  # over another layout's text it would clash: only "visual" scenes show one
     if kind == "clip" and clips_left <= 0:
-        kind = "image"
-    if kind == "stock" and not scene.visual_query.strip() or kind in ("image", "clip") and not scene.visual_prompt.strip():
         kind = "none"
-    return SceneVisual(kind=kind, query=_clip(scene.visual_query, 120), prompt=_clip(scene.visual_prompt, 600))
+    if kind == "stock" and not scene.visual_query.strip() or kind in ("image", "clip", "infographic") and not prompt.strip():
+        kind = "none"
+    return SceneVisual(kind=kind, query=_clip(scene.visual_query, 120), prompt=_clip(prompt, 1200))
 
 
 def to_scenes(drafts: list[SceneDraft], max_clips: int = 2) -> list[dict]:
@@ -386,7 +436,7 @@ def generate_outline(
         _system(language),
         outline_prompt(brief, audience, tone, target_modules, minutes, materials, feedback, previous),
         CourseOutline,
-        max_tokens=4000,
+        max_tokens=16000,
     )
 
 
@@ -398,10 +448,10 @@ def generate_module(
         _system(language),
         module_prompt(outline, module, number, tone, materials, feedback, previous_scenes),
         ModuleDraft,
-        max_tokens=12000,
+        max_tokens=40000,  # a reasoning model thinks before it writes: room for both
     )
 
 
 def generate_quiz(llm: LLM, *, title: str, content: str, count: int, language: str) -> list[dict]:
-    draft = llm.structured(_system(language), quiz_prompt(title, content, count), QuizDraft, max_tokens=4000)
+    draft = llm.structured(_system(language), quiz_prompt(title, content, count), QuizDraft, max_tokens=16000)
     return to_questions(draft.quiz, limit=count)

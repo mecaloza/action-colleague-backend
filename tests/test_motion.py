@@ -130,6 +130,7 @@ def test_the_model_s_icons_stay_with_their_points():
         layout="bullets", title="T", subtitle="", points=["Casco", " ", "Gafas"], icons=["hard-hat", "x", "glasses"],
         icon="", stat_value="", stat_label="", quote_author="", left_heading="", left_points=[], right_heading="",
         right_points=[], narration="n", visual_kind="none", visual_query="", visual_prompt="",
+        chart_labels=[], chart_values=[], chart_unit="",
     )
     slide = designer.to_slide(scene)
     assert slide.points == ["Casco", "Gafas"] and slide.icons == ["hard-hat", "glasses"]

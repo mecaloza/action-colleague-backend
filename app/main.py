@@ -99,7 +99,7 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
-        expose_headers=["x-request-id"],
+        expose_headers=["x-request-id", "x-visual-pending"],  # the slide preview says its picture is coming
     )
     # Railway terminates TLS; trust X-Forwarded-Proto so redirects keep https.
     app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")

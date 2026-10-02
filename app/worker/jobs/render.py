@@ -44,6 +44,7 @@ from app.services.video import captions, compose, motion
 from app.services.video.avatar import MAX_ASSET_BYTES, AvatarError, AvatarProvider, get_avatar_provider
 from app.services.video.visuals import VisualError, VisualRequest, cache_path, get_visuals
 from app.services.video.voice import VoiceError, get_voice_provider
+from app.worker import queue
 from app.worker.runner import JobCancelled, JobContext, JobError, Reschedule, handler, holds_job, open_session
 
 logger = logging.getLogger(__name__)
@@ -290,8 +291,22 @@ def _narration_from_state(ctx: JobContext, work: Path) -> compose.Narration:
 # ── 2. Visuals ──────────────────────────────────────────────────────
 
 
-FALLBACKS = {"clip": ("clip", "image", "stock"), "image": ("image", "stock"), "stock": ("stock", "image")}
+FALLBACKS = {
+    "clip": ("clip", "image", "stock"), "image": ("image", "stock"), "stock": ("stock",),  # always cheaper, never dearer
+    "infographic": ("infographic",),  # it explains the scene: nothing else stands in for it (the title does)
+}
 MAX_VISUAL_RETRIES = 6  # a busy provider (rate limit) is asked again this many times, then the next kind is tried
+
+
+def scene_prompt(scene: dict) -> str:
+    """What a generated visual shows: its description, or (keywords alone make a poor prompt) the slide's title
+    with its search keywords."""
+    visual = scene.get("visual") or {}
+    prompt, query = (visual.get("prompt") or "").strip(), (visual.get("query") or "").strip()
+    if prompt or not query:
+        return prompt
+    title = ((scene.get("slide") or {}).get("title") or "").strip()
+    return f"{title}. {query}" if title else query
 
 
 def _visual_options(render: RenderInput) -> dict[int, list[VisualRequest]]:
@@ -305,14 +320,13 @@ def _visual_options(render: RenderInput) -> dict[int, list[VisualRequest]]:
     for index, scene in enumerate(render.scenes):
         visual = scene.get("visual") or {}
         kind, query, prompt = visual.get("kind") or "none", visual.get("query") or "", visual.get("prompt") or ""
-        if render.animation == "high" and kind != "none":  # the course pays for animation everywhere
+        variant = int(visual.get("variant") or 0)
+        if render.animation == "high" and kind not in ("none", "infographic"):  # animation everywhere it decorates
             kind = "clip"
-        if not prompt.strip() and query.strip():  # keywords alone make a poor prompt: add what the slide says
-            title = ((scene.get("slide") or {}).get("title") or "").strip()
-            prompt = f"{title}. {query}" if title else query
+        prompt = scene_prompt(scene)
         chain = [kind for kind in FALLBACKS.get(kind, ()) if kind != "clip" or clips_left > 0]
         tries = [
-            VisualRequest(candidate, query, prompt)
+            VisualRequest(candidate, query, prompt, variant)
             for candidate in chain
             if candidate in available and (query if candidate == "stock" else prompt).strip()
         ]
@@ -357,6 +371,8 @@ def _fetch(ctx: JobContext, request: VisualRequest, entry: dict, local_name: Pat
         return provider.download_clip(status.uri, local_name)
     if request.kind == "image":
         return provider.image(prompt, local_name)
+    if request.kind == "infographic":
+        return provider.infographic(request.prompt, local_name)
     return provider.stock(request.query, local_name)
 
 
@@ -410,6 +426,11 @@ def _get_visual(
 
 def _visuals(ctx: JobContext, render: RenderInput, work: Path) -> Reschedule | None:
     """Get every scene's visual. Returns Reschedule while a clip is being made or a busy provider must wait."""
+    with open_session() as db:  # the infographics being made for the editor: wait for them, not pay twice
+        preparing = queue.active_with_key(db, f"visuals:{ctx.module_id}") is not None
+    if preparing:
+        ctx.progress(49, "Terminando las infografías")
+        return Reschedule(VISUAL_POLL_SECONDS)
     ctx.state.setdefault("visuals", {})
     done = [_get_visual(ctx, render, work, index, tries) for index, tries in _visual_options(render).items()]
     if not all(done):
@@ -645,9 +666,10 @@ def _draw_scenes(
         # Into or out of a backdrop the slides fade, in step with the backdrops' cross-fade (a push would slide
         # the text away from the picture it belongs to).
         plain = index not in backdrops and index - 1 not in backdrops
+        explains = (scene.get("visual") or {}).get("kind") == "infographic"
         scenes.append(motion.Scene(
             images, start, times[: len(images) - 1], push=plain and index not in (0, len(render.scenes) - 1),
-            backdrop=backdrops.get(index),
+            backdrop=backdrops.get(index), fit="contain" if explains else "cover",
         ))
     return scenes
 
@@ -824,3 +846,50 @@ def _compose_video(ctx: JobContext, render: RenderInput, work: Path) -> _Composi
                 else "No pudimos usar las imágenes de fondo. El video se produjo con el diseño de marca."
             )
     raise AssertionError("unreachable")
+
+
+# ── Visuals ahead of production ───────────────────────────────────────
+
+
+@handler("visuals.prepare")
+def prepare_visuals(ctx: JobContext) -> dict | Reschedule:
+    """Make the module's infographics and images as soon as its script is written or saved, so the admin reviews
+    them in the editor before producing the video (which then reuses them: they are cached by description)."""
+    render = _prepared_input(ctx.module_id)
+    if render is None:
+        return {"skipped": "module gone or not an AI module"}
+    options = _prepared_options(render)
+    signature = _signature(options)
+    if ctx.state.get("signature") != signature:  # the script changed since the last run: its scenes start over
+        ctx.state.update(signature=signature, visuals={})
+    ctx.progress(10, "Dibujando las infografías")  # saves the signature: the previews know what is coming
+    with tempfile.TemporaryDirectory(prefix="visuals-") as tmp:
+        done = [_get_visual(ctx, render, Path(tmp), index, tries) for index, tries in options.items()]
+    if not all(done):
+        return Reschedule(VISUAL_POLL_SECONDS)  # a busy provider: asked again in a while
+    # Saved again while this ran (the queue hands that save this same job): make what the new script asks too.
+    latest = _prepared_input(ctx.module_id)
+    if latest is not None and _signature(_prepared_options(latest)) != signature:
+        return Reschedule(0)
+    made = sum(1 for entry in ctx.state["visuals"].values() if entry.get("path"))
+    return {"visuals": made}
+
+
+def _prepared_input(module_id: int | None) -> RenderInput | None:
+    with open_session() as db:
+        module = db.get(Module, module_id)
+        if module is None or module.source != "ai":
+            return None
+        return _read_input(module, {})
+
+
+def _prepared_options(render: RenderInput) -> dict[int, list[VisualRequest]]:
+    """The scenes whose first choice is made ahead (an infographic or an image): only what the video will use,
+    so a clip's fallback image is never paid for in advance."""
+    return {
+        index: tries[:1] for index, tries in _visual_options(render).items() if tries[0].kind in studio.PREPARED_VISUALS
+    }
+
+
+def _signature(options: dict[int, list[VisualRequest]]) -> list[str]:
+    return [f"{index}:{tries[0].key()}" for index, tries in sorted(options.items())]

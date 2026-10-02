@@ -99,7 +99,7 @@ def test_approving_the_outline_creates_the_modules_and_drafts_them(client, db, a
     jobs = client.post(f"/api/v1/courses/{ai_course.id}/draft", headers=admin_headers, json={}).json()
     assert len(jobs) == 2
     assert client.get(f"/api/v1/courses/{ai_course.id}", headers=admin_headers).json()["modules"][0]["generation_status"] == "queued"
-    assert worker() == 2
+    assert worker() == 4  # the two drafts, then each module's infographics (made for the admin to review)
 
     detail = client.get(f"/api/v1/courses/{ai_course.id}", headers=admin_headers).json()
     first, second = detail["modules"]
