@@ -19,6 +19,7 @@ class MediaRef(BaseModel):
 
 
 MAX_AUDIENCE_CHARS = 500
+AvatarEngine = Literal["", "avatar_iii", "avatar_iv"]
 MAX_MODULES = 12  # per course, both when asking the AI for a structure and when approving one
 # Modules asked for in a brief; None lets the AI choose.
 ModuleCount = Annotated[int | None, Field(ge=1, le=MAX_MODULES)]
@@ -37,6 +38,13 @@ class CourseSettings(BaseModel):
     voice_name: str = Field(default="", max_length=200)
     avatar_id: str = Field(default="", max_length=100)
     avatar_name: str = Field(default="", max_length=200)
+    # A second presenter takes turns with the first, scene by scene, with a voice of their own ("" = none).
+    co_avatar_id: str = Field(default="", max_length=100)
+    co_avatar_name: str = Field(default="", max_length=200)
+    co_voice_id: str = Field(default="", max_length=100, pattern=r"^[A-Za-z0-9_-]*$")  # goes into a URL path
+    co_voice_name: str = Field(default="", max_length=200)
+    # HeyGen engine for the presenters: "" uses the server's default; Avatar IV is more natural and costs more.
+    avatar_engine: AvatarEngine = ""
     presenter: bool = True
     theme: Literal["dark", "light"] = "dark"
 

@@ -9,7 +9,7 @@ render job, so a retried request never pays twice.
 
 import logging
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Protocol
@@ -49,6 +49,8 @@ class AvatarLook:
     preview_image_url: str
     preview_video_url: str
     gender: str = ""
+    own: bool = False  # made from the account's own photo or footage (e.g. the company's managers)
+    engines: list[str] = field(default_factory=list)  # HeyGen engines it renders on (empty: unknown, any)
 
 
 @dataclass
@@ -63,7 +65,7 @@ class AvatarProvider(Protocol):
     def upload_audio(self, audio: Path) -> str: ...
     def start(
         self, avatar_id: str, background: str, *, idempotency_key: str,
-        audio_asset_id: str | None = None, audio_url: str | None = None,
+        audio_asset_id: str | None = None, audio_url: str | None = None, engine: str | None = None,
     ) -> str: ...
     def status(self, video_id: str) -> RenderStatus: ...
     def download(self, url: str, dest: Path) -> None: ...
@@ -75,13 +77,15 @@ def _unexpected(action: str) -> AvatarError:
     return AvatarError(f"HeyGen respondió algo inesperado al {action}.", retryable=True)
 
 
-def _avatar_look(item: dict) -> AvatarLook:
+def _avatar_look(item: dict, own: bool = False) -> AvatarLook:
     return AvatarLook(
         id=item["id"],
         name=item.get("name") or "",
         preview_image_url=item.get("preview_image_url") or "",
         preview_video_url=item.get("preview_video_url") or "",
         gender=item.get("gender") or "",
+        own=own,
+        engines=[engine for engine in item.get("supported_api_engines") or [] if isinstance(engine, str)],
     )
 
 
@@ -135,25 +139,37 @@ class HeyGen:
             raise _unexpected(action)
         return value
 
-    def _looks_page(self, token: str | None) -> dict:
-        params: dict = {"ownership": "public", "avatar_type": "studio_avatar", "limit": LOOKS_PAGE_SIZE}
+    def _looks_page(self, token: str | None, own: bool = False) -> dict:
+        params: dict = (
+            {"ownership": "private", "limit": LOOKS_PAGE_SIZE}  # photo avatars and digital twins
+            if own
+            else {"ownership": "public", "avatar_type": "studio_avatar", "limit": LOOKS_PAGE_SIZE}
+        )
         if token:
             params["token"] = token
         with self._network("listar los avatares"):
             response = self.client.get(f"{API}/v3/avatars/looks", headers=self.headers, params=params)
         return self._body(self._check(response, "listar los avatares"), "listar los avatares")
 
-    def _supports_engine(self, look: dict) -> bool:
-        engines = look.get("supported_api_engines") or []
-        return not engines or self.engine in engines
-
     def looks(self) -> list[AvatarLook]:
+        """The account's own avatars first (ready ones), then HeyGen's catalog."""
+        looks: list[AvatarLook] = []
+        for own in (True, False):
+            try:
+                looks += self._all_looks(own)
+            except AvatarError:
+                if not own:
+                    raise
+                logger.warning("heygen_own_avatars_unavailable")  # e.g. a plan without them: the catalog still lists
+        return looks
+
+    def _all_looks(self, own: bool) -> list[AvatarLook]:
         looks: list[AvatarLook] = []
         token = None
         for _ in range(MAX_LOOK_PAGES):
-            page = self._looks_page(token)
+            page = self._looks_page(token, own)
             items = [item for item in page.get("data") or [] if isinstance(item, dict) and item.get("id")]
-            looks += [_avatar_look(item) for item in items if self._supports_engine(item)]
+            looks += [_avatar_look(item, own) for item in items if item.get("status", "completed") == "completed"]
             token = page.get("next_token") if page.get("has_more") else None
             if not token:
                 break
@@ -175,9 +191,11 @@ class HeyGen:
 
     def start(
         self, avatar_id: str, background: str, *, idempotency_key: str,
-        audio_asset_id: str | None = None, audio_url: str | None = None,
+        audio_asset_id: str | None = None, audio_url: str | None = None, engine: str | None = None,
     ) -> str:
-        """Ask for the presenter video with an uploaded narration (or one HeyGen downloads from `audio_url`)."""
+        """Ask for the presenter video with an uploaded narration (or one HeyGen downloads from `audio_url`).
+
+        `engine` overrides the configured one (e.g. a course that pays for the more natural Avatar IV)."""
         body: dict = {
             "type": "avatar",
             "avatar_id": avatar_id,
@@ -186,7 +204,7 @@ class HeyGen:
             "fit": "cover",
             "background": {"type": "color", "value": background},
             "output_format": "mp4",
-            "engine": {"type": self.engine},
+            "engine": {"type": engine or self.engine},
         }
         if audio_asset_id:
             body["audio_asset_id"] = audio_asset_id

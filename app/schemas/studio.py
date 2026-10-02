@@ -1,8 +1,8 @@
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints, model_validator
 
-from app.schemas.courses import MAX_AUDIENCE_CHARS, MAX_MODULES, ModuleCount
+from app.schemas.courses import MAX_AUDIENCE_CHARS, MAX_MODULES, AvatarEngine, ModuleCount
 from app.services.ai.designer import MAX_NARRATION_CHARS, MAX_STORYBOARD_SCENES, CourseOutline, OutlineModule
 from app.services.slides.spec import Slide
 
@@ -110,6 +110,8 @@ class AvatarOut(BaseModel):
     preview_image_url: str = ""
     preview_video_url: str = ""
     gender: str = ""
+    own: bool = False  # the company's own avatar (from a photo or footage), listed first
+    engines: list[str] = Field(default_factory=list)  # HeyGen engines it renders on (empty: any)
 
 
 class RenderRequest(BaseModel):
@@ -120,8 +122,19 @@ class RenderRequest(BaseModel):
     voice_name: str | None = Field(default=None, max_length=200)
     avatar_id: str | None = Field(default=None, max_length=100)
     avatar_name: str | None = Field(default=None, max_length=200)
+    co_avatar_id: str | None = Field(default=None, max_length=100)  # "" removes the second presenter
+    co_avatar_name: str | None = Field(default=None, max_length=200)
+    co_voice_id: str | None = Field(default=None, max_length=100, pattern=r"^[A-Za-z0-9_-]*$")
+    co_voice_name: str | None = Field(default=None, max_length=200)
+    avatar_engine: AvatarEngine | None = None
     presenter: bool | None = None
     theme: Literal["dark", "light"] | None = None
+
+    @model_validator(mode="after")
+    def _two_different_presenters(self) -> "RenderRequest":
+        if self.co_avatar_id and self.co_avatar_id == self.avatar_id:
+            raise ValueError("El segundo presentador debe ser otra persona")
+        return self
 
 
 class TimelinePoint(BaseModel):

@@ -60,7 +60,8 @@ SAMPLE_EXTENSIONS = {
     "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/aac": ".aac", "audio/ogg": ".ogg", "audio/flac": ".flac",
     "audio/webm": ".webm", "video/webm": ".webm", "video/mp4": ".mp4",
 }
-RENDER_CHOICES = ("voice_id", "avatar_id", "presenter", "theme")  # the course settings a render is made with
+# The course settings a render is made with.
+RENDER_CHOICES = ("voice_id", "avatar_id", "co_avatar_id", "co_voice_id", "avatar_engine", "presenter", "theme")
 USABLE_UPLOADS = ("uploaded", "processing", "ready")  # pending: never confirmed; failed: unusable
 CATALOG_CACHE_SECONDS = 10 * 60
 
@@ -383,6 +384,26 @@ def list_avatars():
 # ── Video production ──────────────────────────────────────────────────
 
 
+def _check_presenters(choices: dict) -> None:
+    """The chosen presenters render on the chosen quality (HeyGen engine): else say so now, not after narrating."""
+    provider = get_avatar_provider()
+    wanted = [choices.get("avatar_id"), choices.get("co_avatar_id")]
+    if provider is None or not choices.get("presenter", True) or not any(wanted):
+        return
+    engine = choices.get("avatar_engine") or get_settings().heygen_engine
+    try:
+        looks = {look.id: look for look in _cached("avatars", provider.looks)}
+    except AvatarError:
+        return  # the catalog can't be read now: HeyGen itself will tell
+    for avatar_id in filter(None, wanted):
+        look = looks.get(avatar_id)
+        if look and look.engines and engine not in look.engines:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                f"«{look.name}» no está disponible en esa calidad: elige otra calidad u otro presentador",
+            )
+
+
 def _render_choices(course: Course) -> dict:
     """What the course's videos are made with (voice, presenter, look): travels with each render job."""
     settings = course.settings or {}
@@ -438,6 +459,7 @@ def render_course(
     if not modules:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Ningún módulo creado con IA tiene guion todavía")
     render_choices = _render_choices(course)
+    _check_presenters(render_choices)
     jobs = [_enqueue_render(db, module, admin, render_choices) for module in modules]
     db.commit()
     return [job_out(job) for job in jobs]
@@ -448,7 +470,9 @@ def render_module(module_id: int, db: Session = Depends(get_db), admin: User = D
     """Produce (or re-produce after edits) one module's video with the course's voice and presenter."""
     _require_voice()
     module = module_or_404(db, module_id)
-    job = _enqueue_render(db, module, admin, _render_choices(module.course))
+    choices = _render_choices(module.course)
+    _check_presenters(choices)
+    job = _enqueue_render(db, module, admin, choices)
     db.commit()
     return job_out(job)
 

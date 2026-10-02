@@ -118,6 +118,55 @@ def to_mp3(src: Path, dest: Path) -> Path:
     return dest
 
 
+def cut_audio(master: Path, segments: list[tuple[float, float]], dest: Path) -> Path:
+    """The stretches of the narration one presenter speaks, back to back (MP3): what HeyGen animates them with.
+
+    `presenter_track` puts the resulting clip back in place, so each stretch is cut exactly at its bounds."""
+    parts = [f"[0:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS[a{n}]" for n, (start, end) in enumerate(segments)]
+    joined = "".join(f"[a{n}]" for n in range(len(segments)))
+    graph = ";".join([*parts, f"{joined}concat=n={len(segments)}:v=0:a=1[out]"])
+    run([*FFMPEG, "-i", str(master), "-filter_complex", graph, "-map", "[out]", "-c:a", "libmp3lame", "-b:a", "128k",
+         str(dest)])
+    return dest
+
+
+def _clip_seconds(path: Path) -> float:
+    """A video's length as its container states it (0 when it doesn't)."""
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+                             check=True, capture_output=True, text=True, timeout=120).stdout.strip()
+        return float(out)
+    except (subprocess.SubprocessError, ValueError):
+        return 0.0
+
+
+def presenter_track(clips: list[Path], speakers: list[int], segments: list[tuple[float, float]], dest: Path) -> Path:
+    """One presenter video for the whole narration from each presenter's clip of their own scenes.
+
+    Presenter p's clip holds its scenes' stretches back to back (see `cut_audio`): scene i is taken from its
+    speaker's clip where that stretch lies, so the lips stay on the narration. Squares at 720 px, no audio."""
+    cursors = [0.0] * len(clips)
+    lengths = [_clip_seconds(clip) for clip in clips]
+    cmd, parts = [*FFMPEG], []
+    for n, (speaker, (start, end)) in enumerate(zip(speakers, segments)):
+        length = end - start
+        # Seek on the input (each stretch decodes only itself); a stretch past the clip's end (a clip shorter
+        # than its audio) still lasts its time, holding the last frame, so later scenes never move earlier.
+        # Past the clip's end a seek yields nothing to hold: start inside its last half second instead.
+        last_moment = max(0.0, lengths[speaker] - 0.5) if lengths[speaker] else cursors[speaker]
+        cmd += ["-ss", f"{min(cursors[speaker], last_moment):.3f}", "-i", str(clips[speaker])]
+        parts.append(
+            f"[{n}:v]setpts=PTS-STARTPTS,fps={FPS},tpad=stop_mode=clone:stop_duration={length:.3f},"
+            f"trim=duration={length:.3f},setpts=PTS-STARTPTS,crop='min(iw,ih)':'min(iw,ih)',scale=720:720,setsar=1[v{n}]"
+        )
+        cursors[speaker] += length
+    joined = "".join(f"[v{n}]" for n in range(len(segments)))
+    graph = ";".join([*parts, f"{joined}concat=n={len(segments)}:v=1:a=0,format=yuv420p[out]"])
+    run([*cmd, "-filter_complex", graph, "-map", "[out]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+         "-an", str(dest)])
+    return dest
+
+
 def _circle(dest: Path, mode: str, background: int | tuple[int, ...], diameter: int = BUBBLE, **style) -> Path:
     """A square image filled by a circle, drawn SUPERSAMPLE times larger and shrunk (anti-aliased)."""
     size = diameter * SUPERSAMPLE

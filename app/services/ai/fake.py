@@ -147,14 +147,19 @@ class FakeAvatar:
         self._videos: dict[str, str] = {}  # idempotency key -> video id, like HeyGen
 
     def looks(self):
-        return [AvatarLook(id="fake-avatar", name="Presentadora de prueba", preview_image_url="", preview_video_url="")]
+        return [
+            AvatarLook(id="fake-avatar", name="Presentadora de prueba", preview_image_url="", preview_video_url=""),
+            AvatarLook(id="fake-avatar-2", name="Directivo de prueba", preview_image_url="", preview_video_url="", own=True),
+            AvatarLook(id="fake-avatar-basic", name="Presentador básico", preview_image_url="", preview_video_url="",
+                       engines=["avatar_iii"]),
+        ]
 
     def upload_audio(self, audio):
         asset_id = uuid.uuid4().hex
         self._audio[asset_id] = _duration(audio)
         return asset_id
 
-    def start(self, avatar_id, background, *, idempotency_key, audio_asset_id=None, audio_url=None):
+    def start(self, avatar_id, background, *, idempotency_key, audio_asset_id=None, audio_url=None, engine=None):
         if idempotency_key not in self._videos:
             video_id = uuid.uuid4().hex
             self._durations[video_id] = self._audio.get(audio_asset_id or "", FALLBACK_SECONDS)

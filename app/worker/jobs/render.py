@@ -23,7 +23,7 @@ import logging
 import tempfile
 import time
 import uuid
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import MISSING, asdict, dataclass, fields, replace
 from pathlib import Path
 
 import httpx
@@ -70,6 +70,9 @@ class RenderInput:
     avatar_id: str
     presenter: bool
     theme: str
+    co_avatar_id: str = ""  # a second presenter takes every other scene, with co_voice_id
+    co_voice_id: str = ""
+    avatar_engine: str = ""  # "" = the server's HeyGen engine
 
 
 class _Skip(Exception):
@@ -90,7 +93,8 @@ def intermediate_paths(state: dict | None) -> list[str]:
     """The files a render's phases hand to each other, as its job state records them."""
     state = state or {}
     paths = [scene["path"] for scene in (state.get("narration") or {}).values() if scene.get("path")]
-    return paths + [state[key] for key in INTERMEDIATE_KEYS if state.get(key)]
+    paths += [state[key] for key in INTERMEDIATE_KEYS if state.get(key)] + list(state.get("take_paths") or [])
+    return list(dict.fromkeys(paths))  # each once (a lone presenter's clip is also the video's presenter)
 
 
 def leftover_paths(state: dict | None) -> list[str]:
@@ -108,9 +112,15 @@ def _render_failed(db: Session, job: Job, error: str) -> None:
 
 
 def _thaw(frozen: dict) -> RenderInput | None:
-    """The input the first run froze; None when a new release changed its fields (it is read again)."""
-    names = {field.name for field in fields(RenderInput)}
-    return RenderInput(**{name: frozen[name] for name in names}) if names <= frozen.keys() else None
+    """The input the first run froze; None when a new release needs a field it lacks (it is read again).
+
+    A field added later with a default keeps it: a render started before (e.g. narrated with one presenter)
+    must not pick up the course's newer choices halfway."""
+    all_fields = fields(RenderInput)
+    required = {field.name for field in all_fields if field.default is MISSING and field.default_factory is MISSING}
+    if not required <= frozen.keys():
+        return None
+    return RenderInput(**{field.name: frozen[field.name] for field in all_fields if field.name in frozen})
 
 
 def _read_input(module: Module, choices: dict) -> RenderInput:
@@ -129,6 +139,9 @@ def _read_input(module: Module, choices: dict) -> RenderInput:
         avatar_id=options.get("avatar_id") or "",
         presenter=bool(options.get("presenter", True)),
         theme=options.get("theme") or "dark",
+        co_avatar_id=options.get("co_avatar_id") or "",
+        co_voice_id=options.get("co_voice_id") or "",
+        avatar_engine=options.get("avatar_engine") or "",
     )
 
 
@@ -173,6 +186,18 @@ def _local_copy(work: Path, name: str, storage_path: str) -> Path:
 # ── 1. Narration ──────────────────────────────────────────────────────
 
 
+def scene_speakers(render: RenderInput) -> list[int]:
+    """Who presents each scene: 0, or with a second presenter 0 and 1 taking turns (the first opens)."""
+    two = render.presenter and bool(render.avatar_id and render.co_avatar_id)
+    return [index % 2 if two else 0 for index in range(len(render.scenes))]
+
+
+def _scene_voices(render: RenderInput) -> list[str]:
+    """Each scene's voice: the presenter's own (the second presenter's, or the first's if it has none)."""
+    voices = (render.voice_id, render.co_voice_id or render.voice_id)
+    return [voices[speaker] for speaker in scene_speakers(render)]
+
+
 def _scene_file(index: int) -> str:
     return f"scene_{index:02d}.mp3"
 
@@ -182,17 +207,17 @@ def _speak_scenes(ctx: JobContext, render: RenderInput, work: Path) -> None:
     storage, voice = get_storage(), get_voice_provider()
     done = ctx.state.setdefault("narration", {})
     narrations = [scene["narration"] for scene in render.scenes]
+    voices = _scene_voices(render)
+
+    def same_voice(other: int) -> str:  # continuity hints only make sense within one voice
+        return narrations[other] if 0 <= other < len(narrations) and voices[other] == voices[index] else ""
+
     for index, text in enumerate(narrations):
         if str(index) in done:
             continue
         ctx.progress(5 + int(40 * index / len(narrations)), f"Narrando la escena {index + 1} de {len(narrations)}")
         try:
-            speech = voice.speak(
-                text,
-                render.voice_id,
-                previous_text=narrations[index - 1] if index else "",
-                next_text=narrations[index + 1] if index + 1 < len(narrations) else "",
-            )
+            speech = voice.speak(text, voices[index], previous_text=same_voice(index - 1), next_text=same_voice(index + 1))
         except VoiceError as exc:
             raise JobError(str(exc), permanent=exc.permanent) from exc
         local = work / _scene_file(index)
@@ -264,10 +289,16 @@ def _drop_presenter(ctx: JobContext, reason: str) -> None:
     ctx.state["phase"] = "compose"
 
 
-def _skip_presenter(ctx: JobContext, reason: str) -> None:
-    """The presenter failed: log it and drop the bubble."""
-    logger.warning("presenter_skipped", extra={"module_id": ctx.module_id, "reason": reason})
+def _skip_presenter(ctx: JobContext, reason: str, take: dict | None = None) -> None:
+    """A presenter failed: log it and drop the presenter. With two, either one failing drops both (each clip
+    only has its own scenes, so the other can't present the whole video)."""
+    logger.warning("presenter_skipped", extra={"module_id": ctx.module_id, "reason": reason,
+                                               "take": take["key"] if take else None})
     _drop_presenter(ctx, reason)
+
+
+def _who(take: dict) -> str:
+    return "el segundo presentador" if take["key"] == "heygen_co" else "el presentador"
 
 
 def _plan_presenter(ctx: JobContext, render: RenderInput) -> None:
@@ -281,17 +312,44 @@ def _plan_presenter(ctx: JobContext, render: RenderInput) -> None:
         ctx.state["phase"] = "compose"
 
 
-def _hand_over_narration(ctx: JobContext, render: RenderInput, work: Path, provider: AvatarProvider) -> dict:
-    """The narration as HeyGen takes it, handed over once and saved: a retry sends the very same request."""
-    heygen = ctx.state["heygen"]
+def _segments(ctx: JobContext) -> list[tuple[float, float]]:
+    """Each scene's stretch of the video, end to end: from its transition to the next one's (seconds)."""
+    starts, total = ctx.state["starts"], ctx.state["total"]
+    bounds = [0.0, *(max(0.0, start - motion.TRANSITION_SECONDS) for start in starts[1:]), total]
+    return list(zip(bounds[:-1], bounds[1:]))
+
+
+def _takes(render: RenderInput) -> list[dict]:
+    """One HeyGen video per presenter, with the scenes it presents ("key" is its record in the state)."""
+    speakers = scene_speakers(render)
+    takes = [{"key": "heygen", "avatar_id": render.avatar_id, "scenes": [i for i, s in enumerate(speakers) if s == 0]}]
+    if 1 in speakers:
+        takes.append({"key": "heygen_co", "avatar_id": render.co_avatar_id,
+                      "scenes": [i for i, s in enumerate(speakers) if s == 1]})
+    return takes
+
+
+def _hand_over_narration(
+    ctx: JobContext, render: RenderInput, work: Path, provider: AvatarProvider, take: dict
+) -> dict:
+    """The presenter's narration as HeyGen takes it (only its scenes when it shares the video), handed over
+    once and saved: a retry sends the very same request."""
+    heygen = ctx.state[take["key"]]
     if heygen.get("audio_asset_id") or heygen.get("audio_url"):
         return heygen
-    audio = compose.to_mp3(_narration_from_state(ctx, work).audio, work / "narration.mp3")
+    name = f"{take['key']}.mp3"
+    if len(take["scenes"]) == len(render.scenes):
+        audio = compose.to_mp3(_narration_from_state(ctx, work).audio, work / name)
+    else:
+        segments = _segments(ctx)
+        audio = compose.cut_audio(
+            _narration_from_state(ctx, work).audio, [segments[index] for index in take["scenes"]], work / name
+        )
     if audio.stat().st_size > MAX_ASSET_BYTES:  # too big to upload to HeyGen: it downloads it from a link
         storage = get_storage()
-        path = f"{_intermediate_prefix(render, ctx)}/narration.mp3"
+        path = f"{_intermediate_prefix(render, ctx)}/{name}"
         storage.upload_file(path, audio, "audio/mpeg")
-        ctx.state["narration_mp3_path"] = path  # an intermediate too: deleted with the others
+        ctx.state.setdefault("take_paths", []).append(path)  # an intermediate too: deleted with the others
         heygen["audio_url"] = storage.signed_urls([path], SIGNED_URL_SECONDS).get(path)
     else:
         heygen["audio_asset_id"] = provider.upload_audio(audio)
@@ -299,60 +357,84 @@ def _hand_over_narration(ctx: JobContext, render: RenderInput, work: Path, provi
     return heygen
 
 
-def _start_presenter(ctx: JobContext, render: RenderInput, work: Path, provider: AvatarProvider) -> Reschedule:
-    """Send the narration to HeyGen and start waiting for the presenter."""
-    ctx.progress(50, "Preparando al presentador")
-    heygen = _hand_over_narration(ctx, render, work, provider)
-    video_id = provider.start(
-        render.avatar_id,
+def _start_take(ctx: JobContext, render: RenderInput, work: Path, provider: AvatarProvider, take: dict) -> None:
+    """Send the presenter's narration to HeyGen and start its video."""
+    heygen = _hand_over_narration(ctx, render, work, provider, take)
+    suffix = "" if take["key"] == "heygen" else "-co"
+    heygen["video_id"] = provider.start(
+        take["avatar_id"],
         PRESENTER_BACKGROUND,
-        idempotency_key=f"ac-presenter-{ctx.job_id}",  # this job's one presenter video, however often asked
+        idempotency_key=f"ac-presenter-{ctx.job_id}{suffix}",  # this job's one video per presenter
         audio_asset_id=heygen.get("audio_asset_id"),
         audio_url=heygen.get("audio_url"),
+        engine=render.avatar_engine or None,
     )
-    heygen.update(video_id=video_id, started_at=time.time())
+    heygen["started_at"] = time.time()
     ctx.progress(55, "El presentador se está grabando")
-    return Reschedule(PRESENTER_POLL_SECONDS)
 
 
-def _poll_presenter(
-    ctx: JobContext, render: RenderInput, work: Path, provider: AvatarProvider
-) -> Reschedule | None:
-    """Check on HeyGen: keep waiting (Reschedule), give up on the presenter, or fetch the finished video."""
-    heygen = ctx.state["heygen"]
+def _poll_take(ctx: JobContext, render: RenderInput, work: Path, provider: AvatarProvider, take: dict) -> bool | None:
+    """Check on one presenter's video: True when downloaded, False while HeyGen works, None if it gave up."""
+    heygen = ctx.state[take["key"]]
     status = provider.status(heygen["video_id"])
     heygen["errors"] = 0  # HeyGen answered: only errors in a row give up on the presenter
     if status.status == "failed":
-        _skip_presenter(ctx, f"HeyGen no pudo generar el presentador ({status.error or 'sin detalle'}).")
+        _skip_presenter(ctx, f"HeyGen no pudo generar {_who(take)} ({status.error or 'sin detalle'}).", take)
         return None
     if status.status != "completed" or not status.video_url:
         patience = max(MAX_PRESENTER_WAIT_SECONDS, PRESENTER_WAIT_FACTOR * ctx.state.get("total", 0))
         if time.time() - heygen["started_at"] > patience:
-            _skip_presenter(ctx, "El presentador tardó demasiado en generarse.")
+            _skip_presenter(ctx, f"{_who(take).capitalize()} tardó demasiado en generarse.", take)
             return None
-        ctx.progress(60, "El presentador se está grabando")
-        return Reschedule(PRESENTER_POLL_SECONDS)
-
-    ctx.progress(70, "Descargando al presentador")
-    local = work / "presenter.mp4"
+        return False
+    local = work / f"{take['key']}.mp4"
     provider.download(status.video_url, local)
-    path = f"{_intermediate_prefix(render, ctx)}/presenter.mp4"
+    path = f"{_intermediate_prefix(render, ctx)}/{take['key']}.mp4"
     get_storage().upload_file(path, local, "video/mp4")
-    ctx.state.update(avatar_path=path, phase="compose")
-    return None
+    heygen["path"] = path
+    ctx.state.setdefault("take_paths", []).append(path)
+    return True
+
+
+def _assemble_presenters(ctx: JobContext, render: RenderInput, work: Path, takes: list[dict]) -> str:
+    """The presenter's track for the whole video: the one clip, or both presenters' clips scene by scene."""
+    if len(takes) == 1:
+        return ctx.state[takes[0]["key"]]["path"]
+    clips = [_local_copy(work, f"{take['key']}.mp4", ctx.state[take["key"]]["path"]) for take in takes]
+    track = compose.presenter_track(clips, scene_speakers(render), _segments(ctx), work / "presenter.mp4")
+    path = f"{_intermediate_prefix(render, ctx)}/presenter.mp4"
+    get_storage().upload_file(path, track, "video/mp4")
+    return path
 
 
 def _presenter(ctx: JobContext, render: RenderInput, work: Path) -> Reschedule | None:
-    """Advance the HeyGen render one step. Returns Reschedule while it is still working."""
+    """Advance the HeyGen renders one step. Returns Reschedule while they are still working."""
     provider = get_avatar_provider()
-    heygen = ctx.state.setdefault("heygen", {})
+    takes = _takes(render)
     try:
-        if not heygen.get("video_id"):
-            return _start_presenter(ctx, render, work, provider)
-        return _poll_presenter(ctx, render, work, provider)
+        waiting = False
+        for take in takes:
+            heygen = ctx.state.setdefault(take["key"], {})
+            if heygen.get("path"):
+                continue
+            if not heygen.get("video_id"):
+                _start_take(ctx, render, work, provider, take)
+                waiting = True
+                continue
+            done = _poll_take(ctx, render, work, provider, take)
+            if done is None:
+                return None  # the presenter was dropped
+            waiting = waiting or not done
+        if waiting:
+            ctx.progress(60, "El presentador se está grabando")
+            return Reschedule(PRESENTER_POLL_SECONDS)
+        ctx.progress(70, "Descargando al presentador")
+        ctx.state.update(avatar_path=_assemble_presenters(ctx, render, work, takes), phase="compose")
+        return None
     except AvatarError as exc:
-        errors = heygen.get("errors", 0) + 1
-        heygen["errors"] = errors
+        errors = max(ctx.state.get(take["key"], {}).get("errors", 0) for take in takes) + 1
+        for take in takes:
+            ctx.state.setdefault(take["key"], {})["errors"] = errors
         if exc.retryable and errors < MAX_PRESENTER_ERRORS:
             return Reschedule(PRESENTER_POLL_SECONDS * errors)
         _skip_presenter(ctx, str(exc))

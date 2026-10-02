@@ -1,6 +1,8 @@
 """The video render under retries, deploys and admins working at the same time (fake voice and presenter)."""
 
 import shutil
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -8,7 +10,7 @@ from app.db.models import Course, Job, MediaAsset, Module
 from app.services.ai.fake import FakeAvatar, FakeVoice
 from app.services.video import captions, compose
 from app.services.storage import StorageError
-from app.services.video.avatar import AvatarError
+from app.services.video.avatar import AvatarError, RenderStatus
 from app.services.video.voice import VoiceError
 from app.worker import queue
 from tests.conftest import auth_headers
@@ -279,7 +281,7 @@ def test_a_storage_failure_after_heygen_finished_keeps_the_presenter(
     upload_file, failed = type(storage).upload_file, []
 
     def flaky_upload(self, path, file_path, content_type):
-        if path.endswith("/presenter.mp4") and not failed:
+        if path.endswith("/heygen.mp4") and not failed:  # the presenter HeyGen made
             failed.append(path)
             raise StorageError("Storage no pudo subir el archivo (sin conexión)")
         return upload_file(self, path, file_path, content_type)
@@ -448,3 +450,183 @@ def test_a_render_narrated_before_beats_existed_still_produces_the_video(
     db.expire_all()
     module = db.get(Module, ai_module.id)
     assert module.generation_status == "completed" and module.video_asset_id
+
+
+def test_two_presenters_take_turns_with_their_own_voices(
+    client, db, admin_headers, ai_module, storage, worker, monkeypatch
+):
+    from app.worker.jobs import render as render_job
+
+    spoken, started = [], []
+    speak, start = FakeVoice.speak, FakeAvatar.start
+
+    def record_speak(self, text, voice_id, previous_text="", next_text=""):
+        spoken.append(voice_id)
+        return speak(self, text, voice_id, previous_text, next_text)
+
+    def record_start(self, avatar_id, background, **kwargs):
+        started.append((avatar_id, kwargs.get("engine")))
+        return start(self, avatar_id, background, **kwargs)
+
+    monkeypatch.setattr(FakeVoice, "speak", record_speak)
+    monkeypatch.setattr(FakeAvatar, "start", record_start)
+    module = db.get(Module, ai_module.id)
+    module.storyboard = {"scenes": THREE_SCENES}
+    db.commit()
+    response = client.post(
+        f"/api/v1/courses/{ai_module.course_id}/render",
+        headers=admin_headers,
+        json={**RENDER_CHOICES, "co_avatar_id": "fake-avatar-2", "co_voice_id": "fake-voice-2", "avatar_engine": "avatar_iv"},
+    )
+    assert response.status_code == 202, response.text
+    _run_until_done(db, worker)
+
+    db.expire_all()
+    module = db.get(Module, ai_module.id)
+    assert module.generation_status == "completed" and module.video_asset_id
+    assert spoken == ["fake-voice-es", "fake-voice-2", "fake-voice-es"]  # scenes alternate, the first opens
+    assert sorted(started) == [("fake-avatar", "avatar_iv"), ("fake-avatar-2", "avatar_iv")]
+    assert not list((storage.root / storage.bucket).rglob("render/*/*"))  # both presenters' files cleaned up
+    assert render_job.scene_speakers(render_job.RenderInput(
+        course_id=1, course_title="", language="es", module_label="", scenes=THREE_SCENES, voice_id="a",
+        avatar_id="x", presenter=True, theme="dark", co_avatar_id="y",
+    )) == [0, 1, 0]
+
+
+def _numbered_clip(tmp_path: Path, name: str, seconds: int) -> Path:
+    """A 720x720 clip whose red level is 20 x the second it is in (second 3 is red 60)."""
+    parts = []
+    for second in range(seconds):
+        part = tmp_path / f"{name}{second}.mp4"
+        subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-f", "lavfi", "-i",
+                        f"color=c=0x{20 * second:02x}0000:s=720x720:r=30:d=1", "-pix_fmt", "yuv444p", "-crf", "0",
+                        str(part)], check=True)
+        parts.append(part)
+    listing = tmp_path / f"{name}.txt"
+    listing.write_text("".join(f"file '{part}'\n" for part in parts))
+    clip = tmp_path / f"{name}.mp4"
+    subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(listing),
+                    "-pix_fmt", "yuv444p", "-crf", "0", str(clip)], check=True)
+    return clip
+
+
+def _red_at(video: Path, at: float, tmp_path: Path) -> int:
+    from PIL import Image
+    frame = tmp_path / "frame.png"
+    subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-ss", str(at), "-i", str(video), "-frames:v", "1",
+                    str(frame)], check=True)
+    return Image.open(frame).convert("RGB").getpixel((360, 360))[0]
+
+
+def _duration(path: Path) -> float:
+    return float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+                                 str(path)], capture_output=True, text=True, check=True).stdout)
+
+
+def test_the_presenter_track_takes_each_scene_from_its_place_in_the_clip(tmp_path):
+    # Presenter 0 speaks scenes 0 (2 s) and 2 (2 s): its clip holds them back to back, so scene 2 is at 2-4 s.
+    clips = [_numbered_clip(tmp_path, "zero", 4), _numbered_clip(tmp_path, "one", 3)]
+    track = compose.presenter_track(clips, [0, 1, 0], [(0.0, 2.0), (2.0, 5.0), (5.0, 7.0)], tmp_path / "track.mp4")
+
+    assert _duration(track) == pytest.approx(7.0, abs=0.1)
+    assert abs(_red_at(track, 5.5, tmp_path) - 20 * 2) < 12  # scene 2 starts at its clip's second 2
+    assert abs(_red_at(track, 3.5, tmp_path) - 20 * 1) < 12  # presenter 1's second 1
+
+
+def test_a_presenter_clip_shorter_than_its_audio_never_moves_later_scenes(tmp_path):
+    clips = [_numbered_clip(tmp_path, "short", 2), _numbered_clip(tmp_path, "full", 3)]  # 0 should last 4 s
+    track = compose.presenter_track(clips, [0, 0, 1], [(0.0, 2.0), (2.0, 4.0), (4.0, 7.0)], tmp_path / "track.mp4")
+
+    assert _duration(track) == pytest.approx(7.0, abs=0.1)
+    assert abs(_red_at(track, 4.5, tmp_path) - 0) < 12  # presenter 1 still starts at 4 s, at its own second 0
+
+
+def test_cut_audio_keeps_exactly_the_stretches(tmp_path):
+    master = tmp_path / "master.wav"
+    subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-f", "lavfi", "-t", "10", "-i",
+                    "sine=frequency=440:sample_rate=48000", str(master)], check=True)
+    cut = compose.cut_audio(master, [(0.0, 2.5), (6.0, 7.25)], tmp_path / "cut.mp3")
+    assert _duration(cut) == pytest.approx(3.75, abs=0.06)
+
+
+def test_if_the_second_presenter_fails_the_video_comes_out_without_presenters(
+    client, db, admin_headers, ai_module, storage, worker, monkeypatch
+):
+    status = FakeAvatar.status
+
+    def second_fails(self, video_id):
+        if self._durations.get(video_id) is not None and video_id in self._failing:
+            return RenderStatus("failed", error="moderation")
+        return status(self, video_id)
+
+    start = FakeAvatar.start
+
+    def mark(self, avatar_id, background, **kwargs):
+        video_id = start(self, avatar_id, background, **kwargs)
+        if avatar_id == "fake-avatar-2":
+            self._failing = {*getattr(self, "_failing", set()), video_id}
+        else:
+            self._failing = getattr(self, "_failing", set())
+        return video_id
+
+    monkeypatch.setattr(FakeAvatar, "status", second_fails)
+    monkeypatch.setattr(FakeAvatar, "start", mark)
+    module = db.get(Module, ai_module.id)
+    module.storyboard = {"scenes": THREE_SCENES}
+    db.commit()
+    response = client.post(f"/api/v1/courses/{ai_module.course_id}/render", headers=admin_headers,
+                           json={**RENDER_CHOICES, "co_avatar_id": "fake-avatar-2", "co_voice_id": "fake-voice-2"})
+    assert response.status_code == 202, response.text
+    _run_until_done(db, worker)
+
+    db.expire_all()
+    module = db.get(Module, ai_module.id)
+    assert module.generation_status == "completed" and module.video_asset_id
+    render = _module_render(db, ai_module.id)
+    assert render["avatar_id"] == "" and "segundo presentador" in render["warning"]
+    assert not list((storage.root / storage.bucket).rglob("render/*/*"))
+
+
+def test_a_presenter_without_the_chosen_quality_is_refused_before_narrating(client, admin_headers, ai_module):
+    url = f"/api/v1/courses/{ai_module.course_id}/render"
+    basic = {**RENDER_CHOICES, "avatar_id": "fake-avatar-basic", "avatar_engine": "avatar_iv"}
+    refused = client.post(url, headers=admin_headers, json=basic)
+    assert refused.status_code == 422 and "Presentador básico" in refused.json()["detail"]
+
+    same = client.post(url, headers=admin_headers, json={**RENDER_CHOICES, "co_avatar_id": RENDER_CHOICES["avatar_id"]})
+    assert same.status_code == 422
+
+
+def test_a_render_started_before_a_second_presenter_existed_keeps_its_one_presenter(
+    client, db, admin_headers, ai_module, storage, worker, monkeypatch
+):
+    from app.worker.jobs import render as render_job
+
+    _start_render(client, admin_headers, ai_module)
+    job = db.query(Job).one()
+    # As the previous release left it: frozen input without the new fields, waiting on its one HeyGen video.
+    calls = []
+    original_presenter = render_job._presenter
+
+    def stop_after_narration(ctx, render, work):
+        frozen = ctx.state["input"]
+        for key in ("co_avatar_id", "co_voice_id", "avatar_engine"):
+            frozen.pop(key, None)
+        calls.append(1)
+        return original_presenter(ctx, render, work)
+
+    monkeypatch.setattr(render_job, "_presenter", stop_after_narration)
+    worker(max_jobs=1)  # narrates, starts the presenter and waits for it
+    monkeypatch.setattr(render_job, "_presenter", original_presenter)
+    course = db.get(Course, ai_module.course_id)
+    course.settings = {**course.settings, "co_avatar_id": "fake-avatar-2", "co_voice_id": "fake-voice-2"}
+    db.commit()
+    started = []
+    start = FakeAvatar.start
+    monkeypatch.setattr(FakeAvatar, "start", lambda self, *a, **k: started.append(a[0]) or start(self, *a, **k))
+    _run_until_done(db, worker)
+
+    db.expire_all()
+    assert calls and db.get(Job, job.id).status == "succeeded"
+    assert started == []  # no second presenter asked for halfway
+    assert _module_render(db, ai_module.id)["avatar_id"] == "fake-avatar"
