@@ -159,7 +159,10 @@ class SupabaseStorage:
 
     def size(self, path: str) -> int | None:
         try:
-            response = self.client.head(f"{self.base}/object/authenticated/{self._object(path)}", headers=self.headers)
+            # Uncompressed: Supabase gzips text files (.md, .txt) for clients that accept it, and a gzipped
+            # response has no Content-Length: the file would look missing.
+            response = self.client.head(f"{self.base}/object/authenticated/{self._object(path)}",
+                                        headers={**self.headers, "Accept-Encoding": "identity"})
         except httpx.HTTPError as exc:
             raise StorageError("Storage no pudo revisar el archivo (sin conexión)") from exc
         length = response.headers.get("content-length", "")

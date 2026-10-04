@@ -482,3 +482,14 @@ def test_a_job_claimed_while_stopping_is_handed_back_without_running(session_fac
     db.expire_all()
     stored = db.get(Job, job.id)
     assert ran == [] and (stored.status, stored.attempts, stored.locked_by) == ("queued", 0, None)
+
+
+def test_a_text_file_size_is_read_uncompressed():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("accept-encoding") != "identity":  # Supabase gzips text, without a length
+            return httpx.Response(200, headers={"content-encoding": "gzip"})
+        return httpx.Response(200, headers={"content-length": "21628"})
+
+    storage = SupabaseStorage("https://x.supabase.co", "sb_secret_x", "course-media",
+                              client=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert storage.size("courses/1/notes.md") == 21628
