@@ -60,6 +60,18 @@ class StorageError(RuntimeError):
     pass
 
 
+class StorageTooLarge(StorageError):
+    """The file is bigger than the storage accepts: retrying can't help, and the admin can raise the limit."""
+
+    permanent = True
+
+    def __init__(self) -> None:
+        super().__init__(
+            "El archivo pesa más de lo que permite el almacenamiento. Sube el límite de tamaño por archivo en "
+            "Supabase → Storage → Settings (el plan Pro admite archivos grandes) y vuelve a intentarlo."
+        )
+
+
 class SupabaseStorage:
     def __init__(self, url: str, key: str, bucket: str, client: httpx.Client | None = None):
         self.url = url.rstrip("/")
@@ -80,6 +92,9 @@ class SupabaseStorage:
         return f"{self.bucket}/{quote(path)}"
 
     def _check(self, response: httpx.Response, action: str) -> httpx.Response:
+        # Supabase answers an upload over its size limit with 400 (or 413) and statusCode "413" in the body.
+        if response.status_code == 413 or (response.status_code == 400 and '"413"' in response.text):
+            raise StorageTooLarge()
         if response.is_error:
             raise StorageError(f"Storage no pudo {action} ({response.status_code})")
         return response

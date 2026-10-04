@@ -493,3 +493,19 @@ def test_a_text_file_size_is_read_uncompressed():
     storage = SupabaseStorage("https://x.supabase.co", "sb_secret_x", "course-media",
                               client=httpx.Client(transport=httpx.MockTransport(handler)))
     assert storage.size("courses/1/notes.md") == 21628
+
+
+def test_an_upload_over_the_storage_limit_says_so(tmp_path):
+    from app.services.storage import StorageTooLarge
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and "/object/course-media/" in str(request.url):
+            return httpx.Response(400, json={"statusCode": "413", "error": "Payload too large"})
+        return httpx.Response(200, json={"id": "course-media", "public": False})
+
+    storage = SupabaseStorage("https://x.supabase.co", "sb_secret_x", "course-media",
+                              client=httpx.Client(transport=httpx.MockTransport(handler)))
+    big = tmp_path / "presenter.mp4"
+    big.write_bytes(b"0" * 1024)
+    with pytest.raises(StorageTooLarge):
+        storage.upload_file("courses/1/presenter.mp4", big, "video/mp4")

@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 
 from app.db import session as db_session
 from app.db.models import Job
+from app.services.storage import StorageTooLarge
 from app.worker import queue
 
 logger = logging.getLogger(__name__)
@@ -175,7 +176,8 @@ def _call_handler(job: Job, ctx: JobContext) -> dict | Reschedule | None:
 
 def _record_failure(job: Job, worker_id: str, exc: Exception, state: dict, log_ctx: dict) -> None:
     """A handler raised: log it and count a failed attempt (retry with backoff, or fail for good)."""
-    user_facing = isinstance(exc, JobError)  # only JobError messages are meant to be read by people
+    # Only these messages are meant to be read by people (a file over the storage's limit says how to fix it).
+    user_facing = isinstance(exc, (JobError, StorageTooLarge))
     detail = str(exc)[:MAX_ERROR_CHARS]
     logger.error("job_failed", extra={**log_ctx, "error": detail}, exc_info=None if user_facing else exc)
     with open_session() as db:

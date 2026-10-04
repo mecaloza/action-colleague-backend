@@ -162,7 +162,8 @@ def presenter_track(clips: list[Path], speakers: list[int], segments: list[tuple
         cursors[speaker] += length
     joined = "".join(f"[v{n}]" for n in range(len(segments)))
     graph = ";".join([*parts, f"{joined}concat=n={len(segments)}:v=1:a=0,format=yuv420p[out]"])
-    run([*cmd, "-filter_complex", graph, "-map", "[out]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+    # CRF 23: it only fills the presenter's bubble, and a long module at CRF 18 outgrew storage's file limit.
+    run([*cmd, "-filter_complex", graph, "-map", "[out]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
          "-an", str(dest)])
     return dest
 

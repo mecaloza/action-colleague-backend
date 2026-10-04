@@ -169,3 +169,21 @@ def test_concurrent_enqueues_with_the_same_key_create_one_job(db, session_factor
     job = queue.enqueue(db, "demo", dedupe_key="same")
 
     assert db.query(Job).count() == 1 and job.dedupe_key == "same"
+
+
+def test_a_file_over_the_storage_limit_fails_at_once_saying_how_to_fix_it(jobs_db, registry, db):
+    from app.services.storage import StorageTooLarge
+
+    runs = []
+
+    def too_big(ctx):
+        runs.append(ctx.job_id)
+        raise StorageTooLarge()
+
+    registry.handler("demo")(too_big)
+    job = queue.enqueue(db, "demo", {}, max_attempts=3)
+    for _ in range(3):
+        runner.run_pending()
+    failed = _job(jobs_db, job.id)
+    assert failed.status == "failed" and len(runs) == 1  # no retries: a bigger upload can't fit later
+    assert "Supabase → Storage" in failed.error
