@@ -21,7 +21,9 @@ from itertools import product
 MAX_FORMULA_CHARS = 200
 MAX_DEPTH = 32  # nesting of parentheses and signs
 
-_TOKEN = re.compile(r"\s*(?:(\d+(?:\.\d+)?|\.\d+)|([A-Za-z_][A-Za-z0-9_]*)|(.))")
+# Spaces are only " \t\r\n" and digits only 0-9, as in the frontend: no Unicode lookalike passes in one and not
+# the other.
+_TOKEN = re.compile(r"[ \t\r\n]*(?:([0-9]+(?:\.[0-9]+)?|\.[0-9]+)|([A-Za-z_][A-Za-z0-9_]*)|(.))")
 FUNCTIONS = {"min": min, "max": max}
 _OPERATORS = {"+": operator.add, "-": operator.sub, "*": operator.mul, "/": operator.truediv}
 
@@ -65,7 +67,7 @@ Node = Num | Var | Neg | BinOp | Call
 def _tokens(text: str) -> list[tuple[str, str]]:
     tokens: list[tuple[str, str]] = []
     position = 0
-    text = text.rstrip()
+    text = text.rstrip(" \t\r\n")
     while position < len(text):
         match = _TOKEN.match(text, position)
         if not match:  # only trailing spaces are left
@@ -143,7 +145,8 @@ class _Parser:
 
 def parse(text: str, variables: Iterable[str]) -> Node:
     """The formula's tree, or FormulaError if it isn't valid with these variables."""
-    if not text.strip():
+    text = text.strip(" \t\r\n")
+    if not text:
         raise FormulaError("Escribe la fórmula del simulador.")
     if len(text) > MAX_FORMULA_CHARS:
         raise FormulaError(f"La fórmula es demasiado larga (máximo {MAX_FORMULA_CHARS} caracteres).")
