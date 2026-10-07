@@ -95,6 +95,8 @@ def create_activity(module_id: int, payload: ActivityCreate, db: Session = Depen
     db.add(activity)
     db.flush()
     _publishable(db, activity)
+    if activity.status == "ready":
+        studio.queue_activity_voice(db, activity)
     db.commit()
     return _admin_view(db, activity)
 
@@ -123,11 +125,23 @@ def update_activity(activity_id: int, payload: ActivityUpdate, db: Session = Dep
             activity.spec, changed = spec, True
     if changed:
         activity.version += 1
+    published = payload.status == "ready" and activity.status != "ready"
     if payload.status is not None:
         activity.status = payload.status
     _publishable(db, activity)
+    if activity.status == "ready" and (published or changed):  # its lines, voiced (unchanged ones are reused)
+        studio.queue_activity_voice(db, activity)
     db.commit()
     return _admin_view(db, activity)
+
+
+@router.post("/activities/{activity_id}/narration", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
+def voice_activity(activity_id: int, db: Session = Depends(get_db)):
+    """Voice the activity's lines again (e.g. after the course's voice changed)."""
+    activity = _activity_or_404(db, activity_id)
+    studio.queue_activity_voice(db, activity)
+    db.commit()
+    return job_out(queue.active_with_key(db, f"activity-voice:{activity.id}"))
 
 
 @router.delete("/activities/{activity_id}", status_code=status.HTTP_204_NO_CONTENT)

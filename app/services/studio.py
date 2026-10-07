@@ -111,3 +111,13 @@ def queue_activities(db: Session, module: Module) -> None:
 
     queue.enqueue(db, "ai.activities", {}, course_id=module.course_id, module_id=module.id,
                   dedupe_key=f"activities:{module.id}", max_attempts=2, commit=False)
+
+
+def queue_activity_voice(db: Session, activity) -> None:
+    """Have a published activity's lines voiced (unchanged lines reuse their clips); the caller commits."""
+    from app.worker import queue
+
+    activity.voice_status = "pending"
+    queue.enqueue(db, "activities.voice", {"activity_id": activity.id}, course_id=activity.module.course_id,
+                  module_id=activity.module_id, dedupe_key=f"activity-voice:{activity.id}", max_attempts=3,
+                  commit=False)
