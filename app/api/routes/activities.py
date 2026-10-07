@@ -11,9 +11,10 @@ from app.schemas.activities import ActivityAdmin, ActivityCreate, ActivityImage,
 from app.schemas.learn import ActivityMoveIn, ActivityMoveOut, ActivityPlay
 from app.schemas.media import JobOut
 from app.services import activities as engine
+from app.services import progress
 from app.services import studio
 from app.services.activity_spec import SpecError, parse_spec, ready_problems
-from app.services.media import MediaResolver
+from app.services.media import MediaResolver, discard_assets
 from app.services.media_views import job_out
 from app.worker import queue
 
@@ -124,10 +125,14 @@ def update_activity(activity_id: int, payload: ActivityUpdate, db: Session = Dep
             activity.spec, changed = spec, True
     if changed:
         activity.version += 1
+        activity.source = "admin"  # the admin's now: a new AI proposal never replaces it
     published = payload.status == "ready" and activity.status != "ready"
+    unpublished = payload.status == "draft" and activity.status == "ready"
     if payload.status is not None:
         activity.status = payload.status
     _publishable(db, activity)
+    if unpublished:  # learners who only waited for it complete the module
+        progress.recheck_module(db, activity.module)
     if activity.status == "ready" and (published or changed):  # its lines, voiced (unchanged ones are reused)
         studio.queue_activity_voice(db, activity)
     db.commit()
@@ -145,9 +150,13 @@ def voice_activity(activity_id: int, db: Session = Depends(get_db)):
 
 @router.delete("/activities/{activity_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_activity(activity_id: int, db: Session = Depends(get_db)):
-    """Its plays go with it; a module that only waited for this activity is left for the learner to finish."""
-    db.delete(_activity_or_404(db, activity_id))
+    """Its plays and voice clips go with it; learners who only waited for it complete the module."""
+    activity = _activity_or_404(db, activity_id)
+    module, clips = activity.module, [clip.get("asset_id") for clip in (activity.narration or {}).values()]
+    db.delete(activity)
+    progress.recheck_module(db, module)
     db.commit()
+    discard_assets(db, clips)  # unless another activity says the same lines
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -205,7 +214,8 @@ def preview_activity(activity_id: int, db: Session = Depends(get_db), admin: Use
         raise HTTPException(exc.status, str(exc)) from exc
     db.commit()
     return ActivityPlay(attempt_id=attempt.id, activity_id=activity.id, view=view,
-                        narration=engine.narration_urls(db, activity, ["intro", *engine.revealed_lines(view)]))
+                        narration=engine.narration_urls(db, activity, ["intro", *engine.revealed_lines(view)]),
+                        image_url=engine.image_url(db, activity))
 
 
 @router.post("/activity-previews/{attempt_id}/moves", response_model=ActivityMoveOut)

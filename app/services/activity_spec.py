@@ -22,6 +22,7 @@ Fraction = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
 Number = Annotated[float, Field(ge=-1e9, le=1e9, allow_inf_nan=False)]
 
 MAX_DECISION_DEPTH = 4
+MAX_SIMULATOR_CHECKS = 5000  # slider combinations a simulator's formula is checked on when saved
 MIN_ZONE_SIZE = 0.03
 
 
@@ -38,6 +39,13 @@ class Choice(BaseModel):
     points: int = Field(ge=0, le=10)
     feedback: Spoken  # the consequence, spoken
     next: Annotated[str, StringConstraints(pattern=r"^[a-z0-9_]{0,24}$")] = ""  # "" ends the conversation
+
+    @field_validator("id")
+    @classmethod
+    def _not_a_line_name(cls, value: str) -> str:
+        if value == "situation":  # "<node>.situation" is the narration key of the situation itself
+            raise ValueError("Una opción no puede llamarse «situation».")
+        return value
 
 
 class DecisionNode(BaseModel):
@@ -159,7 +167,26 @@ class Variable(BaseModel):
             raise ValueError(f"En «{self.label}», el valor inicial debe estar entre el mínimo y el máximo.")
         if (self.max - self.min) / self.step > 1000:
             raise ValueError(f"En «{self.label}», el paso es demasiado pequeño para el rango.")
+        # The slider only stops on min + k*step: both ends and the initial value must be among those stops.
+        if not _on_step(self.max - self.min, self.step) or not _on_step(self.default - self.min, self.step):
+            raise ValueError(f"En «{self.label}», el máximo y el valor inicial deben caer en un paso del control.")
         return self
+
+    @property
+    def stops(self) -> int:
+        """How many values the slider has."""
+        return round((self.max - self.min) / self.step) + 1
+
+    def sample(self, count: int) -> list[float]:
+        """`count` of the slider's values, evenly spread and ends included (all of them if it has fewer)."""
+        last = self.stops - 1
+        positions = range(self.stops) if self.stops <= count else sorted({round(last * i / (count - 1)) for i in range(count)})
+        return [self.min + position * self.step for position in positions]
+
+
+def _on_step(distance: float, step: float) -> bool:
+    steps = distance / step
+    return abs(steps - round(steps)) < 1e-6
 
 
 class Output(BaseModel):
@@ -204,30 +231,22 @@ class SimulatorSpec(BaseModel):
         keys = [variable.key for variable in self.variables]
         if len(set(keys)) != len(keys):
             raise ValueError("Dos controles del simulador tienen la misma clave.")
+        # The values the sliders can actually take (all of them, or an even sample of up to ~5000 combinations):
+        # the formula must compute on every one, and the target be met on at least one.
+        per_variable = max(2, int(MAX_SIMULATOR_CHECKS ** (1 / len(self.variables))))
+        names = keys
         try:
             tree = formula.parse(self.formula, keys)
-            ranges = {variable.key: (variable.min, variable.max) for variable in self.variables}
-            results = [formula.evaluate(tree, values) for values in formula.corners(ranges)]
+            results = [formula.evaluate(tree, dict(zip(names, combo)))
+                       for combo in product(*(variable.sample(per_variable) for variable in self.variables))]
             start = formula.evaluate(tree, {variable.key: variable.default for variable in self.variables})
         except formula.FormulaError as exc:
             raise ValueError(str(exc)) from exc
-        if not any(self.target.met(result) for result in results) and not self._reachable_inside(tree):
+        if not any(self.target.met(result) for result in results):
             raise ValueError("Con ningún valor de los controles se alcanza el objetivo.")
         if self.target.met(start):
             raise ValueError("Con los valores iniciales el objetivo ya se cumple: no hay reto.")
         return self
-
-    def _reachable_inside(self, tree: formula.Node) -> bool:
-        """A coarse grid over the ranges, for targets reached between the corners (e.g. a 'between' band)."""
-        grids = {v.key: [v.min + (v.max - v.min) * i / 6 for i in range(7)] for v in self.variables}
-        names = list(grids)
-        for combo in product(*(grids[name] for name in names)):
-            try:
-                if self.target.met(formula.evaluate(tree, dict(zip(names, combo)))):
-                    return True
-            except formula.FormulaError:
-                continue
-        return False
 
     def result(self, values: dict[str, float]) -> float:
         return formula.evaluate(formula.parse(self.formula, [v.key for v in self.variables]), values)

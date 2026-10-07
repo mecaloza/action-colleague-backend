@@ -78,6 +78,13 @@ def _learner_module(state: ModuleState, media: MediaResolver) -> LearnerModule:
     )
 
 
+def _max_score(activity) -> int:
+    try:
+        return activity_engine.max_score(activity)
+    except activity_engine.GameError:  # a spec edited by hand that no longer validates: never break the course
+        return 0
+
+
 def _activity_summaries(state: ModuleState) -> list[LearnerActivitySummary]:
     return [
         LearnerActivitySummary(
@@ -87,7 +94,7 @@ def _activity_summaries(state: ModuleState) -> list[LearnerActivitySummary]:
             intro=activity.intro,
             finished=activity.id in state.best_scores,
             best_score=state.best_scores.get(activity.id),
-            max_score=activity_engine.max_score(activity),
+            max_score=_max_score(activity),
         )
         for activity in state.activities
     ]

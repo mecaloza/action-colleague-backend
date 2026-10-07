@@ -5,6 +5,8 @@ import copy
 import pytest
 
 from app.db.models import Activity, ActivityAttempt, Course, Enrollment, Evaluation, MediaAsset, Module
+from app.services import activities as engine
+from app.services.activities import text_hash
 from tests.conftest import auth_headers
 from tests.test_activity_spec import DECISION, QUICK_ORDER
 from tests.test_learning_api import QUESTIONS, _perfect_answers
@@ -152,7 +154,7 @@ def test_the_voice_of_each_revealed_line_comes_with_it(client, db, course, learn
                            mime_type="audio/mpeg")
         db.add(asset)
         db.flush()
-        clips[key] = {"asset_id": asset.id, "text_hash": "x"}
+        clips[key] = {"asset_id": asset.id, "text_hash": text_hash(engine.line_keys(activity)[key])}
     activity.narration = clips
     db.commit()
 
@@ -171,3 +173,84 @@ def test_finished_plays_count_once_even_if_played_again(client, db, course, lear
     assert second["score"] == 10
     assert db.query(ActivityAttempt).filter(ActivityAttempt.activity_id == activity.id,
                                             ActivityAttempt.finished_at.isnot(None)).count() == 2
+
+
+def test_an_inspection_starts_with_its_picture(client, db, course, learner, storage, tmp_path):
+    from tests.test_activity_spec import INSPECTION
+
+    plain = _modules(course)[0]
+    picture = tmp_path / "pic.png"
+    picture.write_bytes(b"\x89PNG")
+    storage.upload_file("courses/1/visuals/pic.png", picture, "image/png")
+    asset = MediaAsset(kind="image", status="ready", bucket=storage.bucket, path="courses/1/visuals/pic.png",
+                       mime_type="image/png")
+    db.add(asset)
+    db.flush()
+    inspection = Activity(module_id=plain.id, order=3, type="inspection", title="Desgaste", intro="",
+                          spec=copy.deepcopy(INSPECTION), status="ready", image_asset_id=asset.id)
+    db.add(inspection)
+    db.commit()
+    play = client.post(f"{API}/activities/{inspection.id}/attempts", headers=learner, json={}).json()
+    assert play["image_url"] and play["view"]["revealed"] == []
+
+
+
+def test_a_clip_of_an_older_wording_is_never_played(client, db, course, learner, storage, tmp_path):
+    activity = _activity(db, _modules(course)[0], "decision")
+    clip = tmp_path / "clip.mp3"
+    clip.write_bytes(b"ID3")
+    storage.upload_file("activity-audio/intro.mp3", clip, "audio/mpeg")
+    asset = MediaAsset(kind="audio", status="ready", bucket=storage.bucket, path="activity-audio/intro.mp3",
+                       mime_type="audio/mpeg")
+    db.add(asset)
+    db.flush()
+    activity.narration = {"intro": {"asset_id": asset.id, "text_hash": text_hash("Lo que decía antes.")}}
+    db.commit()
+    play = client.post(f"{API}/activities/{activity.id}/attempts", headers=learner, json={}).json()
+    assert "intro" not in play["narration"]  # the text on screen is newer than the voice: silence, not a mismatch
+
+
+def test_a_module_left_waiting_for_a_removed_activity_completes(client, db, course, learner, admin):
+    plain, quizzed, _ = _modules(course)
+    _play_decision(client, learner, _activity(db, plain, "decision").id)
+    passed = client.post(f"{API}/modules/{quizzed.id}/quiz/attempts", headers=learner,
+                         json={"answers": _perfect_answers(quizzed.evaluation.id)}).json()
+    assert passed["passed"] and not passed["module_completed"]
+
+    admin_headers = auth_headers(client, admin.email)
+    gone = client.delete(f"/api/v1/activities/{_activity(db, quizzed, 'quick').id}", headers=admin_headers)
+    assert gone.status_code == 204
+    modules = client.get(f"{API}/courses/{course.id}", headers=learner).json()["modules"]
+    assert modules[1]["completed"] and modules[2]["unlocked"]
+
+
+def test_a_finished_play_survives_an_edit_of_the_activity(client, db, course, learner):
+    activity = _activity(db, _modules(course)[0], "decision")
+    play = client.post(f"{API}/activities/{activity.id}/attempts", headers=learner, json={}).json()
+    price = next(c["token"] for c in play["view"]["node"]["choices"] if c["text"].startswith("Le doy"))
+    client.post(f"{API}/activity-attempts/{play['attempt_id']}/moves", headers=learner, json={"move": {"choice": price}})
+    activity.title, activity.version = "Otro título", activity.version + 1  # an admin fixed a typo
+    db.commit()
+    finished = client.post(f"{API}/activity-attempts/{play['attempt_id']}/finish", headers=learner)
+    assert finished.status_code == 200 and finished.json()["score"] == 2
+
+
+def test_a_quick_challenge_without_its_clock_has_no_time_bonus_to_win(client, db, course, learner):
+    plain = _modules(course)[0]
+    quick = db.query(Activity).filter(Activity.module_id == plain.id, Activity.type == "quick").one()
+    quick.status = "ready"
+    db.commit()
+    timed = client.post(f"{API}/activities/{quick.id}/attempts", headers=learner, json={}).json()
+    assert timed["view"]["max_score"] == 4 * 20 + 40 // 2
+    db.query(ActivityAttempt).delete()
+    db.commit()
+    untimed = client.post(f"{API}/activities/{quick.id}/attempts", headers=learner, json={"untimed": True}).json()
+    assert untimed["view"]["max_score"] == 4 * 20
+
+
+def test_an_activity_broken_by_hand_never_breaks_the_course(client, db, course, learner):
+    activity = _activity(db, _modules(course)[0], "decision")
+    activity.spec = {"nodes": []}
+    db.commit()
+    response = client.get(f"{API}/courses/{course.id}", headers=learner)
+    assert response.status_code == 200 and response.json()["modules"][0]["activities"][0]["max_score"] == 0

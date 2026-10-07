@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 ACTIVITIES_PER_MODULE = 3
 MAX_ACTIVITIES = 6  # the admin's limit too (app/api/routes/activities.py)
 VISUALS_WAIT_SECONDS = 20
+MAX_VISUALS_WAITS = 30  # ~10 minutes: then the activities are drafted without the infographics
 
 
 def _infographic_scenes(module: Module) -> list[dict]:
@@ -66,14 +67,16 @@ def draft_activities(ctx: JobContext) -> dict | Reschedule:
         module = db.get(Module, ctx.module_id)
         if module is None:
             return {"skipped": "module deleted"}
-        if queue.active_with_key(db, f"visuals:{module.id}"):  # its infographics are being drawn
+        waits = ctx.state.get("waits", 0)
+        if waits < MAX_VISUALS_WAITS and queue.active_with_key(db, f"visuals:{module.id}"):  # being drawn
+            ctx.state["waits"] = waits + 1
             ctx.progress(5, "Esperando las infografías")
             return Reschedule(VISUALS_WAIT_SECONDS)
         title, language = module.title, module.course.language or "es"
         script = studio.module_content_for_quiz(db, module)
         materials = studio.materials_text(db, module.course_id)
         infographics = _infographic_scenes(module)
-        kept = sum(1 for activity in module.activities if activity.status == "ready")
+        kept = sum(1 for activity in module.activities if activity.source != "ai" or activity.status == "ready")
     if len(script.strip()) < MIN_QUIZ_CONTENT_CHARS:
         raise JobError("El módulo aún no tiene suficiente contenido para crear actividades.", permanent=True)
     count = min(ACTIVITIES_PER_MODULE, MAX_ACTIVITIES - kept)
@@ -93,18 +96,24 @@ def draft_activities(ctx: JobContext) -> dict | Reschedule:
         module = db.get(Module, ctx.module_id)
         if module is None:
             return {"skipped": "module deleted"}
-        for activity in [a for a in module.activities if a.status == "draft"]:  # the AI's earlier proposals
+        replaced = [a for a in module.activities if a.source == "ai" and a.status == "draft"]  # untouched proposals
+        clips = [clip.get("asset_id") for activity in replaced for clip in (activity.narration or {}).values()]
+        for activity in replaced:
             db.delete(activity)
         db.flush()
-        start = max((a.order for a in module.activities if a.status == "ready"), default=0)
+        db.refresh(module)
+        kept = [a for a in module.activities]  # read again: the admin may have added some meanwhile
+        drafts = drafts[: max(0, MAX_ACTIVITIES - len(kept))]
+        start = max((a.order for a in kept), default=0)
         for position, draft in enumerate(drafts, start=start + 1):
             picture = None
             if 0 <= draft["infographic"] < len(infographics):
                 picture = _picture(db, module, infographics[draft["infographic"]])
             db.add(Activity(module_id=module.id, order=position, type=draft["type"], title=draft["title"],
-                            intro=draft["intro"], spec=draft["spec"], status="draft",
+                            intro=draft["intro"], spec=draft["spec"], status="draft", source="ai",
                             image_asset_id=picture.id if picture else None))
         db.commit()
+        discard_assets(db, clips)
     logger.info("activities_drafted", extra={"module_id": ctx.module_id, "activities": len(drafts)})
     return {"activities": [draft["type"] for draft in drafts]}
 
@@ -179,11 +188,12 @@ def voice_activity(ctx: JobContext) -> dict | Reschedule:
                 local = Path(tmp) / f"{number}.mp3"
                 local.write_bytes(speech.audio)
                 storage.upload_file(path, local, "audio/mpeg")
-            clips[key] = {"path": path, "local": local, "text_hash": path.rsplit("/", 1)[-1].removesuffix(".mp3")}
+            clips[key] = {"path": path, "local": local, "text_hash": engine.text_hash(text)}
             ctx.progress(10 + 85 * (number + 1) // max(1, len(lines)), "Grabando la voz de la actividad")
 
         with open_session() as db:
-            activity = db.get(Activity, activity_id)
+            # Locked: an edit committed between this check and the write would be voiced with its old text.
+            activity = db.query(Activity).filter(Activity.id == activity_id).with_for_update().first()
             if activity is None:
                 return {"skipped": "activity deleted"}
             if activity.version != version:  # edited meanwhile: voice the new text

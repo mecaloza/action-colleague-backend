@@ -163,6 +163,7 @@ class ActivityPlay(BaseModel):
     activity_id: int
     view: dict[str, Any]
     narration: dict[str, str]  # line key -> audio URL, for the lines this response reveals
+    image_url: str | None = None  # the picture an inspection is played on
 
 
 class ActivityMoveIn(BaseModel):

@@ -26,6 +26,8 @@ class Activity(Base):
     version: Mapped[int] = mapped_column(default=1, server_default="1")
     # draft (only admins see it) | ready (learners play it)
     status: Mapped[str] = mapped_column(String(20), default="draft", server_default="draft")
+    # ai: proposed by the AI and untouched (a new proposal may replace it) | admin: written or edited by an admin
+    source: Mapped[str] = mapped_column(String(10), default="admin", server_default="admin")
     image_asset_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("media_assets.id", ondelete="SET NULL"))
     # One voice clip per spoken line: {line key: {"asset_id", "text_hash"}}.
     narration: Mapped[dict[str, Any] | None] = mapped_column(JSONDict)

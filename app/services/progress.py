@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, contains_eager, selectinload
 
 from app.db.models import Activity, ActivityAttempt, Course, Enrollment, Evaluation, Module, ModuleProgress
+from app.services import quiz
 from app.services.metrics import percentage
 
 
@@ -162,6 +163,22 @@ def complete_if_done(state: ModuleState, record: ModuleProgress, has_quiz: bool)
         return False
     mark_completed(record)
     return True
+
+
+def recheck_module(db: Session, module: Module) -> None:
+    """After an activity is deleted or unpublished: learners who only waited for it complete the module."""
+    db.flush()
+    activities = ready_activities(db, [module]).get(module.id, [])
+    evaluation = evaluations_by_module(db, [module]).get(module.id)
+    has_quiz = bool(quiz.evaluation_questions(evaluation))
+    waiting = db.query(ModuleProgress).filter(ModuleProgress.module_id == module.id, ModuleProgress.completed.is_(False))
+    for record in waiting.order_by(ModuleProgress.id).with_for_update():
+        state = ModuleState(module, record, evaluation, True, activities,
+                            activity_best_scores(db, record.enrollment) if activities else {})
+        if not activities and not has_quiz:
+            continue  # nothing left to complete it by itself: the learner marks it done
+        complete_if_done(state, record, has_quiz)
+    refresh_course_enrollments(db, module.course)
 
 
 def mark_completed(record: ModuleProgress) -> None:

@@ -186,3 +186,21 @@ def test_a_formula_can_not_be_endless():
         formula.parse("precio + " * 30 + "precio", ["precio"])
     with pytest.raises(formula.FormulaError, match="anidada"):
         formula.parse("(" * 40 + "precio" + ")" * 40, ["precio"])
+
+
+
+def test_a_simulator_is_checked_on_the_values_its_sliders_can_take():
+    one = {"key": "a", "label": "A", "unit": "", "min": 0, "max": 10, "step": 1, "default": 0}
+    base = {**SIMULATOR, "variables": [one], "target": {"op": "gte", "value": 10}}
+    with pytest.raises(SpecError, match="divide entre cero"):  # a = 5 on the way
+        parse_spec("simulator", {**base, "formula": "100 / (a - 5)"})
+    with pytest.raises(SpecError, match="caer en un paso"):  # 0, 3, 6, 9: the slider never reaches 10
+        parse_spec("simulator", {**base, "formula": "a", "variables": [{**one, "step": 3}]})
+    assert parse_spec("simulator", {**base, "formula": "a"})
+
+
+def test_a_choice_can_not_take_the_name_of_the_situation_s_line():
+    spec = copy.deepcopy(DECISION)
+    spec["nodes"][0]["choices"][0]["id"] = "situation"
+    with pytest.raises(SpecError, match="situation"):
+        parse_spec("decision", spec)
