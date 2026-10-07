@@ -1,5 +1,5 @@
 """
-Slide renderer: 1920x1080 PNG slides in the brand style (black, white, orange #ff4c01).
+Slide renderer: 1920x1080 PNG slides in the brand style (black, white, Rubinstein orange #E9501E).
 
 Every layout lays text out inside explicit boxes and shrinks the font until it fits, so a slide
 can never overflow, overlap the presenter bubble, or be distorted (always rendered at the exact
@@ -46,6 +46,9 @@ BODY_FONT = FONTS_DIR / "RedHatDisplay.ttf"
 Color = tuple[int, int, int]
 
 
+BRAND_ORANGE = (233, 80, 30)  # #E9501E, Rubinstein Consulting's orange
+
+
 @dataclass(frozen=True)
 class Theme:
     background: Color
@@ -58,11 +61,11 @@ class Theme:
 
 DARK = Theme(
     background=(12, 12, 12), background_end=(24, 24, 24), text=(255, 255, 255), muted=(168, 168, 168),
-    accent=(255, 76, 1), line=(56, 56, 56),
+    accent=BRAND_ORANGE, line=(56, 56, 56),
 )
 LIGHT = Theme(
     background=(255, 255, 255), background_end=(244, 244, 244), text=(29, 29, 29), muted=(96, 96, 96),
-    accent=(255, 76, 1), line=(222, 222, 222),
+    accent=BRAND_ORANGE, line=(222, 222, 222),
 )
 THEMES = {"dark": DARK, "light": LIGHT}
 
@@ -299,12 +302,27 @@ def _background(theme: Theme) -> Image.Image:
     return Image.composite(end, base, gradient)
 
 
+# The Rubinstein mark: a diamond with two faceted strips, as strokes centered on (0, 0) and 1 unit tall.
+_MARK_STROKES = [
+    [(0.0, -0.5), (0.41, 0.0), (0.0, 0.5), (-0.412, 0.0), (0.0, -0.5)],
+    [(-0.412, 0.0), (-0.159, -0.002)],
+    [(0.098, -0.402), (-0.159, -0.002), (-0.127, 0.331)],
+    [(0.171, 0.0), (0.41, 0.0)],
+    [(0.108, -0.355), (0.171, 0.0), (-0.114, 0.384)],
+]
+
+
+def brand_mark(draw: ImageDraw.ImageDraw, cx: float, cy: float, height: float, color: Color, width: int) -> None:
+    """The brand's faceted diamond, `height` pixels tall, centered on (cx, cy)."""
+    for stroke in _MARK_STROKES:
+        draw.line([(cx + x * height, cy + y * height) for x, y in stroke], fill=color, width=width, joint="curve")
+
+
 def _diamonds(draw: ImageDraw.ImageDraw, theme: Theme) -> None:
-    """Brand motif in the top-right corner: two outlined diamonds and a small orange one."""
+    """Brand motif in the top-right corner: the faceted mark, outlined, over a small orange one."""
     cx = WIDTH - 190
-    diamond(draw, cx, 150, 95, outline=theme.line, width=3)
-    diamond(draw, cx, 270, 60, outline=theme.line, width=3)
-    diamond(draw, cx, 360, 26, fill=theme.accent)
+    brand_mark(draw, cx, 200, 250, theme.line, 4)
+    brand_mark(draw, cx, 382, 70, theme.accent, 5)
 
 
 def _frame(ctx: SlideContext, theme: Theme) -> tuple[Image.Image, ImageDraw.ImageDraw]:

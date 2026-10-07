@@ -26,7 +26,7 @@ LEAD_IN, GAP, TAIL = 0.4, 0.7, 1.0
 RING = 6  # thickness of the presenter bubble's ring, in pixels
 SUPERSAMPLE = 4  # the bubble's circles are drawn this many times larger, then shrunk to smooth their edge
 PRESENTER_HOLD_SECONDS = 5  # a presenter clip shorter than the narration freezes on its last frame this long
-ACCENT = (255, 76, 1)
+ACCENT = (233, 80, 30)  # the brand orange, #E9501E
 FFMPEG = ("ffmpeg", "-nostdin", "-y", "-loglevel", "error")
 LOUDNORM = "loudnorm=I=-16:TP=-1.5:LRA=11"  # loudness target of every narration and recording
 FFMPEG_TIMEOUT_SECONDS = 3600
