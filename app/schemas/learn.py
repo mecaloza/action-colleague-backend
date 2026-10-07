@@ -31,6 +31,16 @@ class QuizSummary(BaseModel):
     passing_score: int
 
 
+class LearnerActivitySummary(BaseModel):
+    id: int
+    type: str
+    title: str
+    intro: str
+    finished: bool
+    best_score: int | None = None
+    max_score: int
+
+
 class LearnerModule(BaseModel):
     id: int
     title: str
@@ -47,6 +57,7 @@ class LearnerModule(BaseModel):
     content_text: str | None = None
     last_position_seconds: float = 0
     quiz: QuizSummary | None = None
+    activities: list[LearnerActivitySummary] = []
 
 
 class LearnerCourseInfo(BaseModel):
@@ -141,3 +152,34 @@ class CompletionResult(BaseModel):
 
 class PositionUpdate(BaseModel):
     seconds: float = Field(ge=0, le=24 * 3600)
+
+
+class ActivityStart(BaseModel):
+    untimed: bool = False  # a quick challenge without its clock (and its time bonus), for those who need it
+
+
+class ActivityPlay(BaseModel):
+    attempt_id: int
+    activity_id: int
+    view: dict[str, Any]
+    narration: dict[str, str]  # line key -> audio URL, for the lines this response reveals
+
+
+class ActivityMoveIn(BaseModel):
+    # One play: {"choice"} for a decision, {"x", "y"} for an inspection, {"values"} for a simulator,
+    # {"card", "answer"?} for a quick challenge. Bounded: a move is a handful of fields.
+    move: dict[str, Any] = Field(max_length=8)
+
+
+class ActivityMoveOut(BaseModel):
+    result: dict[str, Any]
+    done: bool
+    narration: dict[str, str]
+
+
+class ActivityFinishOut(BaseModel):
+    score: int
+    max_score: int
+    module_completed: bool
+    next_module_id: int | None = None
+    course_completed: bool
