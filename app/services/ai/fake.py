@@ -40,8 +40,8 @@ class FakeLLM:
         """One activity of each kind."""
         empty = {"situations": [], "inspection_prompt": "", "scene": "cards", "verdicts": [], "inspect_items": [],
                  "simulator_prompt": "", "variables": [], "formula": "", "output_label": "", "output_unit": "",
-                 "output_decimals": 0, "target_op": "lte", "target_value": 0, "target_value2": 0, "success_text": "", "fail_text": "",
-                 "hint": "", "quick_mode": "order", "quick_prompt": "", "items": [], "pairs": [], "seconds": 0}
+                 "output_decimals": 0, "target_op": "lte", "target_value": 0, "target_value2": 0,
+                 "success_text": "", "fail_text": "", "hint": "", "quick_mode": "order", "quick_prompt": "", "items": [], "pairs": [], "seconds": 0}
         choice = designer.ChoiceDraft
         decision = designer.ActivityDraft(**{**empty, "type": "decision", "title": "Cliente que solo pide precio",
             "intro": "Atiende al cliente.", "situations": [

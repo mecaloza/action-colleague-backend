@@ -13,7 +13,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from app.services.activity_spec import SpecError, parse_spec
+from app.services.activity_spec import Look, SpecError, parse_spec
 from app.services.ai.llm import LLM
 from app.core.config import get_settings
 from app.services.quiz import validate_questions
@@ -448,7 +448,7 @@ class FactDraft(BaseModel):
 class ItemDraft(BaseModel):
     label: str
     facts: list[FactDraft]
-    look: Literal["none", "even", "center", "shoulders", "one_side", "cupping", "cuts", "bulge"]
+    look: Look
     answer: int  # index of the right verdict
     explanation: str
 
@@ -538,6 +538,18 @@ GUION DEL MÓDULO:
 {_materials_block(materials, 20_000)}"""
 
 
+def _inspection_spec(draft: ActivityDraft) -> dict:
+    verdicts = [{"id": f"v{n + 1}", "label": _clip(label, 40)} for n, label in enumerate(draft.verdicts[:4])]
+    items = [{"id": f"e{n + 1}", "label": _clip(item.label, 80),
+              "facts": [{"label": _clip(fact.label, 80), "value": _clip(fact.value, 60)} for fact in item.facts[:5]],
+              "look": item.look, "explanation": _clip(item.explanation, 600),
+              "answer": f"v{item.answer + 1}" if 0 <= item.answer < len(verdicts) else ""}
+             for n, item in enumerate(draft.inspect_items[:10])]
+    truck = draft.scene == "truck" and len(items) % 2 == 0  # tires go in pairs: else, cards
+    return {"prompt": _clip(draft.inspection_prompt, 200), "scene": "truck" if truck else "cards",
+            "verdicts": verdicts, "items": items}
+
+
 def _activity_spec(draft: ActivityDraft) -> dict:
     if draft.type == "decision":
         return {"nodes": [
@@ -552,15 +564,7 @@ def _activity_spec(draft: ActivityDraft) -> dict:
             for index, situation in enumerate(draft.situations[:8])
         ]}
     if draft.type == "inspection":
-        verdicts = [{"id": f"v{n + 1}", "label": _clip(label, 40)} for n, label in enumerate(draft.verdicts[:4])]
-        items = [{"id": f"e{n + 1}", "label": _clip(item.label, 80),
-                  "facts": [{"label": _clip(fact.label, 80), "value": _clip(fact.value, 60)} for fact in item.facts[:5]],
-                  "look": item.look, "explanation": _clip(item.explanation, 600),
-                  "answer": f"v{item.answer + 1}" if 0 <= item.answer < len(verdicts) else ""}
-                 for n, item in enumerate(draft.inspect_items[:10])]
-        truck = draft.scene == "truck" and len(items) % 2 == 0  # tires go in pairs: else, cards
-        return {"prompt": _clip(draft.inspection_prompt, 200), "scene": "truck" if truck else "cards",
-                "verdicts": verdicts, "items": items}
+        return _inspection_spec(draft)
     if draft.type == "simulator":
         return {
             "prompt": _clip(draft.simulator_prompt, 200), "formula": draft.formula.strip(),

@@ -3,8 +3,8 @@ The game engine of the interactive activities: what a learner sees, how each mov
 
 Everything is decided here, on the server, from the activity's `spec` and the attempt's `state`. The learner only
 receives what they have already earned: the current situation of a conversation (not where each choice leads), the
-answers to the inspection items they already decided on, the pairs they matched. Choices and items travel as opaque tokens, different for
-every attempt, so a token copied from someone else's play means nothing.
+answers to the inspection items they already decided on, the pairs they matched. Choices and quick cards travel as
+opaque tokens, different for every attempt, so a token copied from someone else's play means nothing.
 
 `start` builds a fresh state; `view` shows it; `move` grades one play; `finish` closes the attempt. Narration lines
 are named by keys (`line_keys`) that the voice job and the learner's player share.
@@ -26,6 +26,7 @@ from app.db.models import Activity, ActivityAttempt
 from app.services.activity_spec import (
     DecisionSpec,
     InspectionSpec,
+    Item,
     QuickSpec,
     SimulatorSpec,
     Spec,
@@ -178,14 +179,15 @@ def _node_view(spec: DecisionSpec, node_id: str, attempt_id: int, secret: str) -
     return {"line": f"{node.id}.situation", "speaker": node.speaker, "situation": node.situation, "choices": choices}
 
 
-def _item_view(spec: InspectionSpec, item, state: dict, reveal: bool = False) -> dict:
+def _item_view(spec: InspectionSpec, item: Item, state: dict, reveal: bool = False) -> dict:
     """An item as the learner sees it: its facts always; its answer only once decided (or the play is over)."""
+    chosen = state["decided"].get(item.id)
     view = {"id": item.id, "label": item.label, "facts": [fact.model_dump() for fact in item.facts],
-            "look": item.look, "chosen": state["decided"].get(item.id), "outcome": None}
-    if item.id in state["decided"] or reveal:
+            "look": item.look, "chosen": chosen, "outcome": None}
+    if chosen is not None or reveal:
         answer = next(verdict for verdict in spec.verdicts if verdict.id == item.answer)
         view["outcome"] = {"answer": answer.id, "answer_label": answer.label, "explanation": item.explanation,
-                           "line": f"item.{item.id}", "correct": state["decided"].get(item.id) == item.answer}
+                           "line": f"item.{item.id}", "correct": chosen == item.answer}
     return view
 
 
