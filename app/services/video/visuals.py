@@ -48,7 +48,7 @@ CLIP_SECONDS = 8
 # presenter's bubble goes left empty.
 INFOGRAPHIC_STYLE = (
     "Clean, accurate technical infographic for a corporate training course. Dark charcoal background (#111111), flat "
-    "vector illustration with precise technical drawings, orange (#ff4c01) highlights, white sans-serif text. "
+    "vector illustration with precise technical drawings, orange (#E9501E) highlights, white sans-serif text. "
     "Write every label exactly as given, spelled correctly, large and legible; no other text. Keep the bottom-right "
     "corner (the last 25% of the width and 35% of the height) completely empty. No logos, no watermarks."
 )
@@ -328,7 +328,7 @@ class FakeVisuals:
         image = Image.new("RGB", (1536, 1024), (17, 17, 17))
         draw = ImageDraw.Draw(image)
         for n in range(3):  # three panels, like a comparison infographic
-            draw.rectangle([90 + n * 470, 220, 470 + n * 470, 760], outline=(255, 76, 1), width=10)
+            draw.rectangle([90 + n * 470, 220, 470 + n * 470, 760], outline=(233, 80, 30), width=10)
         dest.parent.mkdir(parents=True, exist_ok=True)
         image.save(dest)
         return dest

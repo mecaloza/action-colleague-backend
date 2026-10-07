@@ -88,7 +88,7 @@ def create_app() -> FastAPI:
     settings = get_settings()
     configure_logging(settings.log_level)
 
-    app = FastAPI(title="Action Colleague API", version="2.0.0", lifespan=lifespan)
+    app = FastAPI(title="Rubinstein Colleague API", version="2.0.0", lifespan=lifespan)
     app.add_exception_handler(RequestValidationError, validation_error)
     # Middleware added last runs first: proxy headers -> CORS -> request logging -> routes.
     app.add_middleware(RequestLogMiddleware)
