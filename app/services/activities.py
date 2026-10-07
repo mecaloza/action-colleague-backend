@@ -19,7 +19,10 @@ from typing import Any
 
 from sqlalchemy.orm.attributes import flag_modified
 
+from sqlalchemy.orm import Session
+
 from app.db.models import Activity, ActivityAttempt
+from app.services.media import MediaResolver
 from app.services.activity_spec import (
     DecisionSpec,
     InspectionSpec,
@@ -357,3 +360,23 @@ def finish(activity: Activity, attempt: ActivityAttempt, now: datetime | None = 
     attempt.score = max(0, min(state["score"], attempt.max_score))
     flag_modified(attempt, "state")
     return {"score": attempt.score, "max_score": attempt.max_score}
+
+
+# ── Narration ─────────────────────────────────────────────────────────
+
+
+def revealed_lines(data: object) -> list[str]:
+    """The narration keys a response reveals: every "line" in it (the situation, a consequence, a zone...)."""
+    if isinstance(data, dict):
+        return [line for key, value in data.items() for line in ([value] if key == "line" else revealed_lines(value))
+                if isinstance(line, str)]
+    if isinstance(data, list):
+        return [line for item in data for line in revealed_lines(item)]
+    return []
+
+
+def narration_urls(db: Session, activity: Activity, keys: list[str]) -> dict[str, str]:
+    """Signed audio URLs for these lines (those with a voice clip)."""
+    clips = {key: (activity.narration or {}).get(key, {}).get("asset_id") for key in dict.fromkeys(keys)}
+    media = MediaResolver(db).prepare(extra_asset_ids=clips.values())
+    return {key: url for key, asset_id in clips.items() if (url := media.url(asset_id))}

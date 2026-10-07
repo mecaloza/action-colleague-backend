@@ -9,6 +9,7 @@ from sqlalchemy import update
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from app.api.routes import (
+    activities,
     auth,
     courses,
     dashboard,
@@ -36,6 +37,7 @@ ROUTERS = (
     dashboard,
     media,
     studio,
+    activities,
 )
 
 

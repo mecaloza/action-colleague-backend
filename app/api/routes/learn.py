@@ -239,23 +239,6 @@ def _activity_secret() -> str:
     return engine.activity_secret(get_settings().jwt_secret)
 
 
-def _lines(data: object) -> list[str]:
-    """The narration keys a response reveals: every "line" in it (the situation, a consequence, a zone...)."""
-    if isinstance(data, dict):
-        return [line for key, value in data.items() for line in ([value] if key == "line" else _lines(value))
-                if isinstance(line, str)]
-    if isinstance(data, list):
-        return [line for item in data for line in _lines(item)]
-    return []
-
-
-def _narration(db: Session, activity: Activity, keys: list[str]) -> dict[str, str]:
-    """Signed audio URLs for these lines (those with a voice clip)."""
-    clips = {key: (activity.narration or {}).get(key, {}).get("asset_id") for key in dict.fromkeys(keys)}
-    media = MediaResolver(db).prepare(extra_asset_ids=clips.values())
-    return {key: url for key, asset_id in clips.items() if (url := media.url(asset_id))}
-
-
 def _engine_errors(exc: engine.GameError) -> HTTPException:
     return HTTPException(exc.status, str(exc))
 
@@ -300,9 +283,9 @@ def start_activity(
     except engine.GameError as exc:
         raise _engine_errors(exc) from exc
     db.commit()
-    keys = ["intro", *_lines(view)]
+    keys = ["intro", *engine.revealed_lines(view)]
     return ActivityPlay(attempt_id=attempt.id, activity_id=activity.id, view=view,
-                        narration=_narration(db, activity, keys))
+                        narration=engine.narration_urls(db, activity, keys))
 
 
 @router.post("/activity-attempts/{attempt_id}/moves", response_model=ActivityMoveOut)
@@ -317,7 +300,7 @@ def play_move(
         raise _engine_errors(exc) from exc
     db.commit()
     return ActivityMoveOut(result=outcome.result, done=outcome.done,
-                           narration=_narration(db, activity, _lines(outcome.result)))
+                           narration=engine.narration_urls(db, activity, engine.revealed_lines(outcome.result)))
 
 
 @router.post("/activity-attempts/{attempt_id}/finish", response_model=ActivityFinishOut)

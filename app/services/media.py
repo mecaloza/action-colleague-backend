@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, defer
 
-from app.db.models import Course, MediaAsset, Module
+from app.db.models import Activity, Course, MediaAsset, Module
 from app.schemas.courses import MediaRef
 from app.services import legacy_heygen
 from app.services.storage import StorageError, get_storage
@@ -86,11 +86,12 @@ def sign_assets(assets: list[MediaAsset], expires_in: int) -> dict[str, str]:
 
 
 def _referenced(db: Session, asset_ids: set[str]) -> set[str]:
-    """Which of these assets a module or a course still points at."""
+    """Which of these assets a module, a course or an activity still points at."""
     columns = (Module.video_asset_id, Module.poster_asset_id, Module.captions_asset_id, Module.document_asset_id)
     rows = db.query(*columns).filter(or_(*(column.in_(asset_ids) for column in columns))).all()
     used = {value for row in rows for value in row if value in asset_ids}
     used.update(cover for (cover,) in db.query(Course.cover_asset_id).filter(Course.cover_asset_id.in_(asset_ids)))
+    used.update(image for (image,) in db.query(Activity.image_asset_id).filter(Activity.image_asset_id.in_(asset_ids)))
     return used
 
 
