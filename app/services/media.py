@@ -92,6 +92,11 @@ def _referenced(db: Session, asset_ids: set[str]) -> set[str]:
     used = {value for row in rows for value in row if value in asset_ids}
     used.update(cover for (cover,) in db.query(Course.cover_asset_id).filter(Course.cover_asset_id.in_(asset_ids)))
     used.update(image for (image,) in db.query(Activity.image_asset_id).filter(Activity.image_asset_id.in_(asset_ids)))
+    audio = {asset_id for (asset_id,) in db.query(MediaAsset.id).filter(MediaAsset.id.in_(asset_ids),
+                                                                         MediaAsset.kind == "audio")}
+    if audio:  # an activity's voice clips live in its narration (JSON): read them where they may be
+        for (narration,) in db.query(Activity.narration).filter(Activity.narration.isnot(None)):
+            used.update(clip.get("asset_id") for clip in narration.values() if clip.get("asset_id") in audio)
     return used
 
 

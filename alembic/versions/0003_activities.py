@@ -33,6 +33,7 @@ def upgrade() -> None:
         sa.Column("spec", _JSON, nullable=False),
         sa.Column("version", sa.Integer(), nullable=False, server_default="1"),
         sa.Column("status", sa.String(20), nullable=False, server_default="draft"),
+        sa.Column("source", sa.String(10), nullable=False, server_default="admin"),
         sa.Column("image_asset_id", sa.String(36), sa.ForeignKey("media_assets.id", ondelete="SET NULL")),
         sa.Column("narration", _JSON),
         sa.Column("voice_status", sa.String(20), nullable=False, server_default="none"),

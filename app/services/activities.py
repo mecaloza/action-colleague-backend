@@ -12,17 +12,17 @@ are named by keys (`line_keys`) that the voice job and the learner's player shar
 
 import hashlib
 import hmac
+import json
 import random
 from dataclasses import dataclass
+from functools import lru_cache
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
-from sqlalchemy.orm import Session
-
 from app.db.models import Activity, ActivityAttempt
-from app.services.media import MediaResolver
 from app.services.activity_spec import (
     DecisionSpec,
     InspectionSpec,
@@ -32,6 +32,8 @@ from app.services.activity_spec import (
     SpecError,
     parse_spec,
 )
+from app.services import formula
+from app.services.media import MediaResolver
 
 PROBLEM_POINTS = 10  # inspection: a problem found
 DISTRACTOR_PENALTY = 3  # inspection: a sound zone taken for a problem
@@ -77,14 +79,21 @@ def _token(secret: str, attempt_id: int, kind: str, key: str) -> str:
     return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()[:12]
 
 
+@lru_cache(maxsize=256)
+def _parsed(activity_type: str, spec_json: str) -> Spec:
+    return parse_spec(activity_type, json.loads(spec_json))
+
+
 def spec_of(activity: Activity) -> Spec:
+    """The activity's validated spec (cached by content: a simulator's check runs once, not on every move)."""
     try:
-        return parse_spec(activity.type, activity.spec)
+        return _parsed(activity.type, json.dumps(activity.spec, sort_keys=True))
     except SpecError as exc:  # an activity is validated when saved: this one was edited by hand
         raise GameError(f"La actividad no se puede jugar: {exc}", status=409) from exc
 
 
-def max_score(activity: Activity) -> int:
+def max_score(activity: Activity, untimed: bool = False) -> int:
+    """The most a play can score (a quick challenge without its clock has no time bonus to win)."""
     spec = spec_of(activity)
     match spec:
         case DecisionSpec():
@@ -94,7 +103,7 @@ def max_score(activity: Activity) -> int:
         case SimulatorSpec():
             return SIMULATOR_POINTS
         case QuickSpec():
-            return spec.size * (QUICK_POINTS + QUICK_MAX_STREAK_BONUS) + spec.seconds // 2
+            return spec.size * (QUICK_POINTS + QUICK_MAX_STREAK_BONUS) + (0 if untimed else spec.seconds // 2)
 
 
 def line_keys(activity: Activity) -> dict[str, str]:
@@ -139,7 +148,7 @@ def start(activity: Activity, now: datetime | None = None, untimed: bool = False
 def view(activity: Activity, attempt: ActivityAttempt, secret: str, now: datetime | None = None) -> dict:
     """What the learner sees of the play right now (also to resume it after a reload)."""
     spec, state = spec_of(activity), attempt.state
-    base = {"type": activity.type, "title": activity.title, "intro": activity.intro, "score": state["score"],
+    base = {"type": activity.type, "title": activity.title, "intro": activity.intro, "score": _shown(state, attempt),
             "max_score": attempt.max_score, "done": state["done"]}
     match spec:
         case DecisionSpec():
@@ -161,7 +170,7 @@ def view(activity: Activity, attempt: ActivityAttempt, secret: str, now: datetim
 
 def _node_view(spec: DecisionSpec, node_id: str, attempt_id: int, secret: str) -> dict:
     node = next(node for node in spec.nodes if node.id == node_id)
-    rng = random.Random(f"{attempt_id}:{node_id}")
+    rng = random.Random(_token(secret, attempt_id, "shuffle", node_id))  # a seed the learner can't rebuild
     choices = [{"token": _token(secret, attempt_id, f"choice:{node.id}", choice.id), "text": choice.text}
                for choice in node.choices]
     rng.shuffle(choices)  # the best answer is not always the same button
@@ -216,11 +225,16 @@ def move(activity: Activity, attempt: ActivityAttempt, payload: dict, secret: st
             outcome = _simulate(spec, state, payload)
         case QuickSpec():
             outcome = _quick(spec, state, payload, attempt.id, secret, now or utcnow())
-    state["score"] = max(0, min(state["score"], attempt.max_score))
     state["done"] = outcome.done
-    attempt.score = state["score"]
+    attempt.score = _shown(state, attempt)
     flag_modified(attempt, "state")  # nested lists changed in place: JSON columns only notice reassignments
-    return Move({**outcome.result, "score": state["score"], "done": outcome.done}, outcome.done)
+    return Move({**outcome.result, "score": attempt.score, "done": outcome.done}, outcome.done)
+
+
+def _shown(state: dict, attempt: ActivityAttempt) -> int:
+    """The score as shown: the running total keeps every penalty (an early mistake is not free), but what the
+    learner sees and keeps never goes below zero nor above the maximum."""
+    return max(0, min(state["score"], attempt.max_score))
 
 
 def _playable(activity: Activity, attempt: ActivityAttempt) -> None:
@@ -290,7 +304,10 @@ def _simulate(spec: SimulatorSpec, state: dict, payload: dict) -> Move:
         values = spec.clamp({key: float(value) for key, value in raw.items()})
     except (TypeError, ValueError) as exc:
         raise GameError("Los valores de los controles deben ser números.") from exc
-    result = spec.result(values)
+    try:
+        result = spec.result(values)
+    except formula.FormulaError as exc:  # e.g. a division by zero on a value the save-time check didn't sample
+        raise GameError(str(exc)) from exc
     state["tries"] += 1
     met = spec.target.met(result)
     if met:
@@ -348,16 +365,20 @@ def _quick(spec: QuickSpec, state: dict, payload: dict, attempt_id: int, secret:
 
 
 def finish(activity: Activity, attempt: ActivityAttempt, now: datetime | None = None) -> dict:
-    """Close a play that is over (a quick challenge also when its time ran out). Returns the final score."""
-    _playable(activity, attempt)
+    """Close a play that is over (a quick challenge also when its time ran out). Returns the final score.
+    A play already over is kept even if the activity was edited since: it was graded on the version it played."""
     state = attempt.state
+    if attempt.finished_at is not None:
+        raise GameError("Esta partida ya terminó.", status=409)
+    if not state["done"]:
+        _playable(activity, attempt)
     timed_out = (activity.type == "quick" and state.get("deadline")
                  and (now or utcnow()) > datetime.fromisoformat(state["deadline"]))
     if not state["done"] and not timed_out:
         raise GameError("La partida todavía no termina.", status=409)
     state["done"] = True
     attempt.finished_at = now or utcnow()
-    attempt.score = max(0, min(state["score"], attempt.max_score))
+    attempt.score = _shown(state, attempt)
     flag_modified(attempt, "state")
     return {"score": attempt.score, "max_score": attempt.max_score}
 
@@ -375,8 +396,23 @@ def revealed_lines(data: object) -> list[str]:
     return []
 
 
+def text_hash(text: str) -> str:
+    """Which text a clip says: a clip of an older wording is never played over the new one."""
+    return hashlib.sha256(text.strip().encode()).hexdigest()[:16]
+
+
 def narration_urls(db: Session, activity: Activity, keys: list[str]) -> dict[str, str]:
-    """Signed audio URLs for these lines (those with a voice clip)."""
-    clips = {key: (activity.narration or {}).get(key, {}).get("asset_id") for key in dict.fromkeys(keys)}
+    """Signed audio URLs for these lines (those with a clip that says their current text)."""
+    lines, narration = line_keys(activity), activity.narration or {}
+    clips = {key: clip.get("asset_id") for key in dict.fromkeys(keys)
+             if isinstance(clip := narration.get(key), dict) and key in lines
+             and clip.get("text_hash") == text_hash(lines[key])}
     media = MediaResolver(db).prepare(extra_asset_ids=clips.values())
     return {key: url for key, asset_id in clips.items() if (url := media.url(asset_id))}
+
+
+def image_url(db: Session, activity: Activity) -> str | None:
+    """The signed URL of the picture an inspection is played on."""
+    if not activity.image_asset_id:
+        return None
+    return MediaResolver(db).prepare(extra_asset_ids=[activity.image_asset_id]).url(activity.image_asset_id)

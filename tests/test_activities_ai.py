@@ -116,3 +116,22 @@ def test_writing_a_script_drafts_its_activities_too(client, db, admin, headers, 
     _run(db, worker, rounds=12)
     kinds = [a.type for a in db.query(Activity).filter(Activity.module_id == module.id).order_by(Activity.order)]
     assert kinds == ["decision", "inspection", "simulator"]
+
+
+
+def test_a_draft_the_admin_wrote_or_edited_is_never_replaced(client, db, module, headers, storage, worker):
+    from tests.test_activity_spec import QUICK_ORDER
+
+    mine = client.post(f"/api/v1/modules/{module.id}/activities", headers=headers,
+                       json={"type": "quick", "title": "Mi reto", "spec": QUICK_ORDER}).json()
+    client.post(f"/api/v1/modules/{module.id}/activities/generate", headers=headers)
+    _run(db, worker)
+    proposed = client.get(f"/api/v1/modules/{module.id}/activities", headers=headers).json()
+    edited = proposed[1]
+    client.put(f"/api/v1/activities/{edited['id']}", headers=headers, json={"title": "Ajustada por mí"})
+
+    client.post(f"/api/v1/modules/{module.id}/activities/generate", headers=headers)
+    _run(db, worker)
+    again = client.get(f"/api/v1/modules/{module.id}/activities", headers=headers).json()
+    titles = [a["title"] for a in again]
+    assert titles[:2] == ["Mi reto", "Ajustada por mí"] and len(again) == 2 + 3

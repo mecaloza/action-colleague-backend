@@ -71,11 +71,11 @@ def test_an_inspection_reveals_only_the_zones_tapped():
     sound = engine.move(activity, attempt, {"x": 0.8, "y": 0.2}, SECRET)
     assert sound.result["hit"] == "distractor" and sound.result["zone"]["explanation"].startswith("Esta llanta")
     shoulders = engine.move(activity, attempt, {"x": 0.1, "y": 0.2}, SECRET)
-    assert shoulders.result["hit"] == "problem" and shoulders.result["score"] == 10
+    assert shoulders.result["hit"] == "problem" and shoulders.result["score"] == 6  # the earlier misses cost 1 + 3
     again = engine.move(activity, attempt, {"x": 0.1, "y": 0.2}, SECRET)
-    assert again.result["hit"] == "already" and again.result["score"] == 10
+    assert again.result["hit"] == "already" and again.result["score"] == 6
     center = engine.move(activity, attempt, {"x": 0.5, "y": 0.2}, SECRET)
-    assert center.done and center.result["score"] == 20
+    assert center.done and center.result["score"] == 16
     assert [z["id"] for z in engine.view(activity, attempt, SECRET)["revealed"]] == ["hombros", "centro", "parejo"]
 
 
@@ -140,7 +140,7 @@ def test_matching_scores_streaks_and_the_time_left():
                            now=NOW + timedelta(seconds=10)).result for c in cards]
     assert [r["bonus"] for r in results] == [0, 2, 4, 6]
     assert results[-1]["time_bonus"] == 17  # 35 s left
-    assert attempt.score == 4 * 10 + 12 + 17  # the wrong match cost 2 points before the score had any
+    assert attempt.score == 4 * 10 + 12 + 17 - 2  # the wrong match costs its 2 points, even made first
 
 
 def test_ordering_takes_the_steps_one_by_one():
@@ -186,3 +186,19 @@ def test_every_spoken_line_has_a_key():
     assert set(engine.line_keys(play("inspection", INSPECTION)[0])) == {"intro", "zone.hombros", "zone.centro",
                                                                          "zone.parejo"}
     assert set(engine.line_keys(play("simulator", SIMULATOR)[0])) == {"intro", "success", "fail"}
+
+
+
+def test_a_simulator_value_the_formula_can_not_take_is_a_bad_move_not_a_crash(monkeypatch):
+    from app.services import formula
+    from app.services.activity_spec import SimulatorSpec
+
+    activity, attempt = play("simulator", SIMULATOR)
+
+    def divides_by_zero(self, values):
+        raise formula.FormulaError("La fórmula divide entre cero con algunos valores de los controles.")
+
+    monkeypatch.setattr(SimulatorSpec, "result", divides_by_zero)
+    with pytest.raises(GameError, match="divide entre cero") as error:
+        engine.move(activity, attempt, {"values": {"precio": 6000, "km": 100000}}, SECRET)
+    assert error.value.status == 422

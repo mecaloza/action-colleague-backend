@@ -174,6 +174,8 @@ def submit_quiz(
     record.score = max(record.score or 0, graded["score"])
     if passed:
         record.passed = True
+        # Read after the lock: an activity finished at the same time counts (its request waited or committed).
+        state.best_scores = progress.activity_best_scores(db, enrollment)
         progress.complete_if_done(state, record, has_quiz=True)  # its activities may still be pending
     progress.refresh_enrollment(db, enrollment)
     db.commit()
@@ -198,7 +200,8 @@ def submit_quiz(
 @router.post("/modules/{module_id}/complete", response_model=CompletionResult)
 def complete_module(module_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     enrollment, state, states = _unlocked_module(db, user, module_id)
-    if quiz.evaluation_questions(state.evaluation):
+    # A passed quiz whose module waited for activities that are gone (deleted or unpublished) completes here.
+    if quiz.evaluation_questions(state.evaluation) and not state.passed:
         raise HTTPException(status.HTTP_409_CONFLICT, "Este módulo se completa aprobando su evaluación")
     if state.pending_activities:
         raise HTTPException(status.HTTP_409_CONFLICT, "Completa las actividades del módulo para terminarlo")
@@ -239,10 +242,6 @@ def _activity_secret() -> str:
     return engine.activity_secret(get_settings().jwt_secret)
 
 
-def _engine_errors(exc: engine.GameError) -> HTTPException:
-    return HTTPException(exc.status, str(exc))
-
-
 def _playable_activity(db: Session, user: User, activity_id: int):
     activity = db.get(Activity, activity_id)
     if activity is None or activity.status != "ready":
@@ -276,16 +275,17 @@ def start_activity(
         if attempt is None:
             attempt = ActivityAttempt(activity_id=activity.id, user_id=user.id, enrollment_id=enrollment.id,
                                       version=activity.version, state=engine.start(activity, untimed=payload.untimed),
-                                      max_score=engine.max_score(activity), score=0)
+                                      max_score=engine.max_score(activity, untimed=payload.untimed), score=0)
             db.add(attempt)
             db.flush()
         view = engine.view(activity, attempt, _activity_secret())
     except engine.GameError as exc:
-        raise _engine_errors(exc) from exc
+        raise HTTPException(exc.status, str(exc)) from exc
     db.commit()
     keys = ["intro", *engine.revealed_lines(view)]
     return ActivityPlay(attempt_id=attempt.id, activity_id=activity.id, view=view,
-                        narration=engine.narration_urls(db, activity, keys))
+                        narration=engine.narration_urls(db, activity, keys),
+                        image_url=engine.image_url(db, activity))
 
 
 @router.post("/activity-attempts/{attempt_id}/moves", response_model=ActivityMoveOut)
@@ -297,7 +297,7 @@ def play_move(
     try:
         outcome = engine.move(activity, attempt, payload.move, _activity_secret())
     except engine.GameError as exc:
-        raise _engine_errors(exc) from exc
+        raise HTTPException(exc.status, str(exc)) from exc
     db.commit()
     return ActivityMoveOut(result=outcome.result, done=outcome.done,
                            narration=engine.narration_urls(db, activity, engine.revealed_lines(outcome.result)))
@@ -310,9 +310,11 @@ def finish_activity(attempt_id: int, db: Session = Depends(get_db), user: User =
     try:
         result = engine.finish(activity, attempt)
     except engine.GameError as exc:
-        raise _engine_errors(exc) from exc
-    state.best_scores[activity.id] = max(attempt.score, state.best_scores.get(activity.id, 0))
+        raise HTTPException(exc.status, str(exc)) from exc
+    db.flush()  # this play, finished: counted below
     record = progress.get_or_create_progress(db, enrollment, state.module, lock=True)
+    # Read after the lock: another activity (or the quiz) finished at the same time counts too.
+    state.best_scores = progress.activity_best_scores(db, enrollment)
     progress.complete_if_done(state, record, has_quiz=bool(quiz.evaluation_questions(state.evaluation)))
     progress.refresh_enrollment(db, enrollment)
     db.commit()
