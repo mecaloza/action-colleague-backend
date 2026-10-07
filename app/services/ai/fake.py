@@ -33,15 +33,15 @@ class FakeLLM:
         if schema is designer.QuizDraft:
             return designer.QuizDraft(quiz=self._questions())
         if schema is designer.ActivitiesDraft:
-            return designer.ActivitiesDraft(activities=self._activities(user))
+            return designer.ActivitiesDraft(activities=self._activities())
         raise NotImplementedError(schema.__name__)
 
-    def _activities(self, prompt: str) -> list[designer.ActivityDraft]:
-        """One activity of each kind (an inspection only when the module has an infographic)."""
-        empty = {"situations": [], "infographic": -1, "inspection_prompt": "", "zones": [], "simulator_prompt": "",
-                 "variables": [], "formula": "", "output_label": "", "output_unit": "", "output_decimals": 0,
-                 "target_op": "lte", "target_value": 0, "target_value2": 0, "success_text": "", "fail_text": "",
-                 "hint": "", "quick_mode": "order", "quick_prompt": "", "items": [], "pairs": [], "seconds": 0}
+    def _activities(self) -> list[designer.ActivityDraft]:
+        """One activity of each kind."""
+        empty = {"situations": [], "inspection_prompt": "", "scene": "cards", "verdicts": [], "inspect_items": [],
+                 "simulator_prompt": "", "variables": [], "formula": "", "output_label": "", "output_unit": "",
+                 "output_decimals": 0, "target_op": "lte", "target_value": 0, "target_value2": 0,
+                 "success_text": "", "fail_text": "", "hint": "", "quick_mode": "order", "quick_prompt": "", "items": [], "pairs": [], "seconds": 0}
         choice = designer.ChoiceDraft
         decision = designer.ActivityDraft(**{**empty, "type": "decision", "title": "Cliente que solo pide precio",
             "intro": "Atiende al cliente.", "situations": [
@@ -52,11 +52,19 @@ class FakeLLM:
                     choice(text="Le muestro el costo por km.", points=6, feedback="Ve el ahorro.", next_situation=-1),
                     choice(text="Le hablo de la marca.", points=1, feedback="Sin números no convence.", next_situation=-1)]),
             ]})
-        inspection = designer.ActivityDraft(**{**empty, "type": "inspection", "title": "Encuentra el desgaste",
-            "intro": "Mira la infografía.", "infographic": 0, "inspection_prompt": "Encuentra los 2 problemas.",
-            "zones": [designer.ZoneDraft(label="Hombros", region="top_left", is_problem=True, explanation="Baja presión."),
-                      designer.ZoneDraft(label="Centro", region="top_center", is_problem=True, explanation="Exceso de presión."),
-                      designer.ZoneDraft(label="Parejo", region="top_right", is_problem=False, explanation="Está bien.")]})
+        tire = designer.ItemDraft
+        fact = designer.FactDraft
+        inspection = designer.ActivityDraft(**{**empty, "type": "inspection", "title": "Revisa la unidad",
+            "intro": "Revisa cada llanta y decide.", "scene": "truck", "inspection_prompt": "Revisa las 4 llantas.",
+            "verdicts": ["Sigue rodando", "Reencauchar", "Retirar"], "inspect_items": [
+                tire(label="Llanta 1", facts=[fact(label="Profundidad", value="12 mm")], look="even", answer=0,
+                     explanation="Desgaste parejo y buena profundidad."),
+                tire(label="Llanta 2", facts=[fact(label="Profundidad", value="4 mm")], look="shoulders", answer=1,
+                     explanation="Hombros gastados: baja presión; el casco aún sirve."),
+                tire(label="Llanta 3", facts=[fact(label="Profundidad", value="9 mm")], look="bulge", answer=2,
+                     explanation="Un chipote es una ruptura interna: se retira."),
+                tire(label="Llanta 4", facts=[fact(label="Profundidad", value="11 mm")], look="even", answer=0,
+                     explanation="Está bien: sigue rodando.")]})
         simulator = designer.ActivityDraft(**{**empty, "type": "simulator", "title": "Baja el costo por km",
             "intro": "Mueve los controles.", "simulator_prompt": "Llega a menos de $0.05 por km.",
             "variables": [designer.VariableDraft(key="precio", label="Precio", unit="MXN", min=4000, max=12000,
@@ -69,8 +77,7 @@ class FakeLLM:
         quick = designer.ActivityDraft(**{**empty, "type": "quick", "title": "Revisión en patio",
             "intro": "Contra reloj.", "quick_mode": "order", "quick_prompt": "Ordena la revisión.", "seconds": 45,
             "items": ["Medir presión en frío", "Revisar desgaste", "Leer el DOT", "Recomendar"]})
-        has_infographic = "(este módulo no tiene infografías)" not in prompt
-        return [decision, *([inspection] if has_infographic else []), simulator, quick]
+        return [decision, inspection, simulator, quick]
 
     def _outline(self, prompt: str) -> designer.CourseOutline:
         brief = prompt.split("BRIEF DEL ADMINISTRADOR:", 1)[-1].split("AUDIENCIA:", 1)[0].strip()

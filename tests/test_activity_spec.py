@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from app.services import formula
-from app.services.activity_spec import SpecError, parse_spec, ready_problems
+from app.services.activity_spec import SpecError, parse_spec
 
 CASES = json.loads((Path(__file__).parent / "fixtures" / "formula_cases.json").read_text())
 
@@ -30,14 +30,23 @@ DECISION = {
     ]
 }
 INSPECTION = {
-    "prompt": "Encuentra los dos problemas de desgaste.",
-    "zones": [
-        {"id": "hombros", "label": "Hombros gastados", "x": 0.05, "y": 0.1, "w": 0.2, "h": 0.3, "is_problem": True,
-         "explanation": "Desgaste en ambos hombros: baja presión o sobrecarga.", "placed": True},
-        {"id": "centro", "label": "Centro gastado", "x": 0.4, "y": 0.1, "w": 0.2, "h": 0.3, "is_problem": True,
-         "explanation": "Desgaste en el centro: exceso de presión.", "placed": True},
-        {"id": "parejo", "label": "Desgaste parejo", "x": 0.7, "y": 0.1, "w": 0.2, "h": 0.3, "is_problem": False,
-         "explanation": "Esta llanta está bien: desgaste uniforme.", "placed": True},
+    "prompt": "Revisa las 4 llantas antes de que salga la unidad.",
+    "scene": "truck",
+    "verdicts": [{"id": "rodar", "label": "Sigue rodando"}, {"id": "reencauchar", "label": "Reencauchar"},
+                 {"id": "retirar", "label": "Retirar"}],
+    "items": [
+        {"id": "l1", "label": "Llanta 1 · direccional izquierda", "look": "even", "answer": "rodar",
+         "facts": [{"label": "Profundidad", "value": "12 mm"}, {"label": "Presión", "value": "110 psi"}],
+         "explanation": "Desgaste parejo y buena profundidad: sigue rodando."},
+        {"id": "l2", "label": "Llanta 2 · direccional derecha", "look": "shoulders", "answer": "reencauchar",
+         "facts": [{"label": "Profundidad", "value": "4 mm"}, {"label": "Presión", "value": "80 psi"}],
+         "explanation": "Hombros gastados: rodó con baja presión. El casco sirve para reencauchar."},
+        {"id": "l3", "label": "Llanta 3 · tracción izquierda", "look": "bulge", "answer": "retirar",
+         "facts": [{"label": "Profundidad", "value": "9 mm"}],
+         "explanation": "Un chipote es una ruptura interna: se retira de inmediato."},
+        {"id": "l4", "label": "Llanta 4 · tracción derecha", "look": "even", "answer": "rodar",
+         "facts": [{"label": "Profundidad", "value": "11 mm"}],
+         "explanation": "Está bien: desgaste uniforme."},
     ],
 }
 SIMULATOR = {
@@ -101,27 +110,28 @@ def test_a_conversation_is_at_most_four_steps_deep():
 
 
 @pytest.mark.parametrize("change, message", [
-    (lambda s: s["zones"][2].update(is_problem=True), "al menos 1 zona sin problema"),
-    (lambda s: s["zones"][1].update(is_problem=False), "al menos 2 zonas con un problema"),
-    (lambda s: s["zones"][0].update(x=0.9), "se sale de la imagen"),
-    (lambda s: s["zones"][0].update(w=0.01), "w"),
-    (lambda s: s["zones"].pop(), "zones"),
+    (lambda s: s["items"][0].update(answer="cambiar"), "no es una de las decisiones"),
+    (lambda s: [item.update(answer="rodar") for item in s["items"]], "al menos 2 decisiones distintas"),
+    (lambda s: s["items"].pop(), "por pares"),
+    (lambda s: s["items"][1].update(id="l1"), "mismo identificador"),
+    (lambda s: s["verdicts"][1].update(id="rodar"), "mismo identificador"),
+    (lambda s: s.update(verdicts=s["verdicts"][:1]), "verdicts"),
+    (lambda s: s["items"][0].update(facts=[]), "facts"),
+    (lambda s: s["items"][0].update(look="pinchada"), "look"),
+    (lambda s: s["items"][0].update(look="none"), "cómo se ve"),
+    (lambda s: s["items"][0]["facts"].append({"label": "Profundidad", "value": "1 mm"}), "mismo nombre"),
 ])
-def test_an_inspection_has_problems_and_distractors_inside_the_picture(change, message):
+def test_an_inspection_decides_on_each_item_among_its_verdicts(change, message):
     spec = copy.deepcopy(INSPECTION)
     change(spec)
     with pytest.raises(SpecError, match=message):
         parse_spec("inspection", spec)
 
 
-def test_an_inspection_is_published_only_with_its_picture_and_every_zone_placed():
+def test_cards_take_any_number_of_items_tires_go_in_pairs():
     spec = copy.deepcopy(INSPECTION)
-    spec["zones"][0]["placed"] = False
-    parsed = parse_spec("inspection", spec)
-    assert ready_problems("inspection", parsed, has_image=False) == [
-        "Falta la imagen sobre la que se inspecciona.", "Ubica cada zona sobre la imagen y confírmala."]
-    assert ready_problems("inspection", parse_spec("inspection", copy.deepcopy(INSPECTION)), has_image=True) == []
-    assert ready_problems("decision", parse_spec("decision", copy.deepcopy(DECISION)), has_image=False) == []
+    spec["items"].pop()
+    assert parse_spec("inspection", {**spec, "scene": "cards"}).scene == "cards"
 
 
 @pytest.mark.parametrize("change, message", [

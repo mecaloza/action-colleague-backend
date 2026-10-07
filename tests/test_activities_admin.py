@@ -64,31 +64,16 @@ def test_editing_what_is_played_makes_a_new_version_but_publishing_does_not(clie
     assert same["version"] == 2  # nothing changed
 
 
-def test_an_inspection_is_published_only_on_its_picture_with_every_zone_placed(client, db, module, headers):
-    unplaced = copy.deepcopy(INSPECTION)
-    unplaced["zones"][0]["placed"] = False
-    activity = _create(client, headers, module, "inspection", unplaced).json()
-    assert set(activity["problems"]) == {"Falta la imagen sobre la que se inspecciona.",
-                                         "Ubica cada zona sobre la imagen y confírmala."}
-    refused = client.put(f"/api/v1/activities/{activity['id']}", headers=headers, json={"status": "ready"})
-    assert refused.status_code == 409 and "No se puede publicar" in refused.json()["detail"]
+def test_an_inspection_is_published_without_a_picture_and_a_photo_never_changes_the_play(client, db, module, headers):
+    activity = _create(client, headers, module, "inspection", INSPECTION, status="ready").json()
+    assert activity["status"] == "ready" and activity["problems"] == [] and activity["max_score"] == 52
 
-    picture = MediaAsset(kind="image", status="ready", bucket="b", path="courses/1/visuals/x.png", mime_type="image/png")
-    db.add(picture)
+    photo = MediaAsset(kind="image", status="ready", bucket="b", path="courses/1/visuals/x.png", mime_type="image/png")
+    db.add(photo)
     db.commit()
-    with_picture = client.put(f"/api/v1/activities/{activity['id']}/image", headers=headers,
-                              json={"asset_id": picture.id}).json()
-    assert with_picture["problems"] == ["Ubica cada zona sobre la imagen y confírmala."]
-    placed = client.put(f"/api/v1/activities/{activity['id']}", headers=headers,
-                        json={"spec": copy.deepcopy(INSPECTION), "status": "ready"}).json()
-    assert placed["status"] == "ready" and placed["problems"] == []
-
-    other = MediaAsset(kind="image", status="ready", bucket="b", path="courses/1/visuals/y.png", mime_type="image/png")
-    db.add(other)
-    db.commit()
-    moved = client.put(f"/api/v1/activities/{activity['id']}/image", headers=headers, json={"asset_id": other.id})
-    assert moved.status_code == 409  # a published inspection can't lose its zones' places
-    assert db.get(Activity, activity["id"]).image_asset_id == picture.id
+    with_photo = client.put(f"/api/v1/activities/{activity['id']}/image", headers=headers,
+                            json={"asset_id": photo.id}).json()
+    assert with_photo["image_asset_id"] == photo.id and with_photo["version"] == activity["version"]
 
 
 def test_an_admin_tries_an_activity_without_counting_for_anyone(client, db, module, headers):

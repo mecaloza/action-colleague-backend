@@ -13,7 +13,7 @@ from app.schemas.media import JobOut
 from app.services import activities as engine
 from app.services import progress
 from app.services import studio
-from app.services.activity_spec import SpecError, parse_spec, ready_problems
+from app.services.activity_spec import SpecError, parse_spec
 from app.services.media import MediaResolver, discard_assets
 from app.services.media_views import job_out
 from app.worker import queue
@@ -34,17 +34,12 @@ def _activity_or_404(db: Session, activity_id: int) -> Activity:
     return activity
 
 
-def _image_ready(db: Session, activity: Activity) -> bool:
-    asset = db.get(MediaAsset, activity.image_asset_id) if activity.image_asset_id else None
-    return bool(asset and asset.status == "ready")
-
-
-def _problems(db: Session, activity: Activity) -> list[str]:
+def _problems(activity: Activity) -> list[str]:
     try:
-        spec = parse_spec(activity.type, activity.spec)
-    except SpecError as exc:
+        parse_spec(activity.type, activity.spec)
+    except SpecError as exc:  # edited by hand: a spec saved through the API always validates
         return [str(exc)]
-    return ready_problems(activity.type, spec, _image_ready(db, activity))
+    return []
 
 
 def _admin_view(db: Session, activity: Activity, media: MediaResolver | None = None) -> ActivityAdmin:
@@ -53,7 +48,7 @@ def _admin_view(db: Session, activity: Activity, media: MediaResolver | None = N
         id=activity.id, module_id=activity.module_id, order=activity.order, type=activity.type,
         title=activity.title, intro=activity.intro, spec=activity.spec, version=activity.version,
         status=activity.status, image_asset_id=activity.image_asset_id, image_url=media.url(activity.image_asset_id),
-        voice_status=activity.voice_status, max_score=_max_score(activity), problems=_problems(db, activity),
+        voice_status=activity.voice_status, max_score=_max_score(activity), problems=_problems(activity),
         updated_at=activity.updated_at,
     )
 
@@ -72,8 +67,8 @@ def _validated_spec(activity_type: str, data: dict) -> dict:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
 
 
-def _publishable(db: Session, activity: Activity) -> None:
-    if activity.status == "ready" and (problems := _problems(db, activity)):
+def _publishable(activity: Activity) -> None:
+    if activity.status == "ready" and (problems := _problems(activity)):
         raise HTTPException(status.HTTP_409_CONFLICT, "No se puede publicar todavía: " + " ".join(problems))
 
 
@@ -94,7 +89,7 @@ def create_activity(module_id: int, payload: ActivityCreate, db: Session = Depen
                         order=max((a.order for a in module.activities), default=0) + 1)
     db.add(activity)
     db.flush()
-    _publishable(db, activity)
+    _publishable(activity)
     if activity.status == "ready":
         studio.queue_activity_voice(db, activity)
     db.commit()
@@ -130,7 +125,7 @@ def update_activity(activity_id: int, payload: ActivityUpdate, db: Session = Dep
     unpublished = payload.status == "draft" and activity.status == "ready"
     if payload.status is not None:
         activity.status = payload.status
-    _publishable(db, activity)
+    _publishable(activity)
     if unpublished:  # learners who only waited for it complete the module
         progress.recheck_module(db, activity.module)
     if activity.status == "ready" and (published or changed):  # its lines, voiced (unchanged ones are reused)
@@ -180,12 +175,7 @@ def set_activity_image(activity_id: int, payload: ActivityImage, db: Session = D
         asset = db.get(MediaAsset, payload.asset_id)
         if asset is None or asset.kind != "image" or asset.status != "ready":
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Elige una imagen ya subida")
-    if payload.asset_id != activity.image_asset_id:
-        activity.image_asset_id = payload.asset_id
-        activity.version += 1  # the zones were placed on the other picture
-        if activity.type == "inspection":  # they must be placed again on this one
-            activity.spec = {**activity.spec, "zones": [{**zone, "placed": False} for zone in activity.spec["zones"]]}
-    _publishable(db, activity)
+    activity.image_asset_id = payload.asset_id  # a reference photo: not part of what is graded
     db.commit()
     return _admin_view(db, activity)
 
