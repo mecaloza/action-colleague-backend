@@ -32,7 +32,45 @@ class FakeLLM:
             return self._module(user)
         if schema is designer.QuizDraft:
             return designer.QuizDraft(quiz=self._questions())
+        if schema is designer.ActivitiesDraft:
+            return designer.ActivitiesDraft(activities=self._activities(user))
         raise NotImplementedError(schema.__name__)
+
+    def _activities(self, prompt: str) -> list[designer.ActivityDraft]:
+        """One activity of each kind (an inspection only when the module has an infographic)."""
+        empty = {"situations": [], "infographic": -1, "inspection_prompt": "", "zones": [], "simulator_prompt": "",
+                 "variables": [], "formula": "", "output_label": "", "output_unit": "", "output_decimals": 0,
+                 "target_op": "lte", "target_value": 0, "target_value2": 0, "success_text": "", "fail_text": "",
+                 "hint": "", "quick_mode": "order", "quick_prompt": "", "items": [], "pairs": [], "seconds": 0}
+        choice = designer.ChoiceDraft
+        decision = designer.ActivityDraft(**{**empty, "type": "decision", "title": "Cliente que solo pide precio",
+            "intro": "Atiende al cliente.", "situations": [
+                designer.SituationDraft(speaker="Cliente", situation="Quiero la llanta más barata.", choices=[
+                    choice(text="Le pregunto por su ruta.", points=8, feedback="Entiendes su operación.", next_situation=1),
+                    choice(text="Le doy la más barata.", points=2, feedback="El costo por km sube.", next_situation=-1)]),
+                designer.SituationDraft(speaker="Cliente", situation="Hago carretera con mucha carga.", choices=[
+                    choice(text="Le muestro el costo por km.", points=6, feedback="Ve el ahorro.", next_situation=-1),
+                    choice(text="Le hablo de la marca.", points=1, feedback="Sin números no convence.", next_situation=-1)]),
+            ]})
+        inspection = designer.ActivityDraft(**{**empty, "type": "inspection", "title": "Encuentra el desgaste",
+            "intro": "Mira la infografía.", "infographic": 0, "inspection_prompt": "Encuentra los 2 problemas.",
+            "zones": [designer.ZoneDraft(label="Hombros", region="top_left", is_problem=True, explanation="Baja presión."),
+                      designer.ZoneDraft(label="Centro", region="top_center", is_problem=True, explanation="Exceso de presión."),
+                      designer.ZoneDraft(label="Parejo", region="top_right", is_problem=False, explanation="Está bien.")]})
+        simulator = designer.ActivityDraft(**{**empty, "type": "simulator", "title": "Baja el costo por km",
+            "intro": "Mueve los controles.", "simulator_prompt": "Llega a menos de $0.05 por km.",
+            "variables": [designer.VariableDraft(key="precio", label="Precio", unit="MXN", min=4000, max=12000,
+                                                 step=500, default=6000),
+                          designer.VariableDraft(key="km", label="Kilómetros", unit="km", min=60000, max=250000,
+                                                 step=10000, default=100000)],
+            "formula": "precio / km", "output_label": "Costo por km", "output_unit": "MXN/km", "output_decimals": 3,
+            "target_op": "lte", "target_value": 0.05, "success_text": "¡Lo lograste!", "fail_text": "Aún no.",
+            "hint": "Más kilómetros bajan el costo."})
+        quick = designer.ActivityDraft(**{**empty, "type": "quick", "title": "Revisión en patio",
+            "intro": "Contra reloj.", "quick_mode": "order", "quick_prompt": "Ordena la revisión.", "seconds": 45,
+            "items": ["Medir presión en frío", "Revisar desgaste", "Leer el DOT", "Recomendar"]})
+        has_infographic = "(este módulo no tiene infografías)" not in prompt
+        return [decision, *([inspection] if has_infographic else []), simulator, quick]
 
     def _outline(self, prompt: str) -> designer.CourseOutline:
         brief = prompt.split("BRIEF DEL ADMINISTRADOR:", 1)[-1].split("AUDIENCIA:", 1)[0].strip()

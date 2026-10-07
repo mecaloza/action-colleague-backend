@@ -9,9 +9,13 @@ from app.core.config import get_settings
 from app.db.models import Activity, ActivityAttempt, MediaAsset, User
 from app.schemas.activities import ActivityAdmin, ActivityCreate, ActivityImage, ActivityOrder, ActivityUpdate
 from app.schemas.learn import ActivityMoveIn, ActivityMoveOut, ActivityPlay
+from app.schemas.media import JobOut
 from app.services import activities as engine
+from app.services import studio
 from app.services.activity_spec import SpecError, parse_spec, ready_problems
 from app.services.media import MediaResolver
+from app.services.media_views import job_out
+from app.worker import queue
 
 router = APIRouter(tags=["activities"], dependencies=[Depends(require_admin)])
 
@@ -93,6 +97,15 @@ def create_activity(module_id: int, payload: ActivityCreate, db: Session = Depen
     _publishable(db, activity)
     db.commit()
     return _admin_view(db, activity)
+
+
+@router.post("/modules/{module_id}/activities/generate", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
+def generate_activities(module_id: int, db: Session = Depends(get_db)):
+    """The AI drafts 2 or 3 activities from the module's script (its earlier drafts are replaced)."""
+    module = module_or_404(db, module_id)
+    studio.queue_activities(db, module)
+    db.commit()
+    return job_out(queue.active_with_key(db, f"activities:{module.id}"))
 
 
 @router.put("/activities/{activity_id}", response_model=ActivityAdmin)
