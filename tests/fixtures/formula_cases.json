@@ -1,0 +1,24 @@
+{
+  "valid": [
+    {"formula": "precio / km", "variables": {"precio": 6000, "km": 100000}, "result": 0.06},
+    {"formula": "(precio + renovado) / (km * (1 + extra / 100))", "variables": {"precio": 9000, "renovado": 3000, "km": 200000, "extra": 25}, "result": 0.048},
+    {"formula": "-precio + 2 * km", "variables": {"precio": 10, "km": 7}, "result": 4},
+    {"formula": "min(precio, km) + max(precio, km) / 2", "variables": {"precio": 3, "km": 8}, "result": 7},
+    {"formula": "precio - -km", "variables": {"precio": 1, "km": 2}, "result": 3},
+    {"formula": ".5 * precio", "variables": {"precio": 4}, "result": 2},
+    {"formula": "precio / km / 2", "variables": {"precio": 8, "km": 2}, "result": 2}
+  ],
+  "invalid": [
+    {"formula": "precio ** 2", "variables": ["precio"]},
+    {"formula": "__import__('os')", "variables": ["precio"]},
+    {"formula": "precio + costo", "variables": ["precio"]},
+    {"formula": "precio +", "variables": ["precio"]},
+    {"formula": "(precio", "variables": ["precio"]},
+    {"formula": "precio; 1", "variables": ["precio"]},
+    {"formula": "pow(precio, 2)", "variables": ["precio"]},
+    {"formula": "min(precio)", "variables": ["precio"]},
+    {"formula": "precio precio", "variables": ["precio"]},
+    {"formula": "", "variables": ["precio"]}
+  ],
+  "division_by_zero": {"formula": "precio / (km - km)", "variables": {"precio": 1, "km": 2}}
+}

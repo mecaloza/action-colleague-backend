@@ -1,5 +1,6 @@
 """All ORM models; importing this package registers every table on `Base.metadata`."""
 
+from app.db.models.activity import Activity, ActivityAttempt
 from app.db.models.course import Course, Module
 from app.db.models.enrollment import Enrollment, ModuleProgress
 from app.db.models.evaluation import Evaluation, EvaluationAttempt
@@ -8,6 +9,8 @@ from app.db.models.media import MediaAsset, UserVideo
 from app.db.models.user import RefreshToken, User
 
 __all__ = [
+    "Activity",
+    "ActivityAttempt",
     "Course",
     "Enrollment",
     "Evaluation",
