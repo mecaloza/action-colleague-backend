@@ -4,6 +4,7 @@ AI studio jobs.
 - ai.outline:       brief + course materials -> proposed outline (stored in the course settings).
 - ai.module_draft:  outline entry -> storyboard (slides + narration), reading summary and quiz.
 - ai.quiz:          a module's content -> suggested questions (returned for review, not saved).
+(Interactive activities: app/worker/jobs/activities.py.)
 """
 
 import logging
@@ -142,6 +143,7 @@ def draft_module(ctx: JobContext) -> dict:
         if questions and module.evaluation is None:  # a quiz the admin already has is never overwritten
             db.add(Evaluation(module_id=module.id, spec=questions))
         studio.queue_visuals(db, module)  # its infographics, ready to review with the script
+        studio.queue_activities(db, module)  # then its activities, played on those infographics
         db.commit()
     logger.info("module_drafted", extra={"module_id": ctx.module_id, "scenes": len(scenes), "questions": len(questions)})
     return {"scenes": len(scenes), "questions": len(questions)}

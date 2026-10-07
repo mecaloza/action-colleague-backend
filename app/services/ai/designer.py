@@ -13,6 +13,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from app.services.activity_spec import SpecError, parse_spec
 from app.services.ai.llm import LLM
 from app.core.config import get_settings
 from app.services.quiz import validate_questions
@@ -422,6 +423,197 @@ def to_questions(drafts: list[QuestionDraft], limit: int | None = None) -> list[
     for number, question in enumerate(questions, start=1):
         question["id"] = f"q{number}"
     return questions
+
+
+# ── Interactive activities ─────────────────────────────────────────────
+
+REGIONS = {  # where on the picture the AI thinks a zone is: a cell of a 3x3 grid (the admin then places it)
+    "top_left": (0, 0), "top_center": (1, 0), "top_right": (2, 0),
+    "middle_left": (0, 1), "middle_center": (1, 1), "middle_right": (2, 1),
+    "bottom_left": (0, 2), "bottom_center": (1, 2), "bottom_right": (2, 2),
+}
+REGION_MARGIN = 0.03
+
+
+class ChoiceDraft(BaseModel):
+    text: str
+    points: int
+    feedback: str
+    next_situation: int  # index of the situation it leads to; -1 ends the conversation
+
+
+class SituationDraft(BaseModel):
+    speaker: str
+    situation: str
+    choices: list[ChoiceDraft]
+
+
+class ZoneDraft(BaseModel):
+    label: str
+    region: Literal[
+        "top_left", "top_center", "top_right", "middle_left", "middle_center", "middle_right",
+        "bottom_left", "bottom_center", "bottom_right",
+    ]
+    is_problem: bool
+    explanation: str
+
+
+class VariableDraft(BaseModel):
+    key: str
+    label: str
+    unit: str
+    min: float
+    max: float
+    step: float
+    default: float
+
+
+class ActivityDraft(BaseModel):
+    """One activity, flat (every field always present; the ones its type doesn't use stay empty)."""
+
+    type: Literal["decision", "inspection", "simulator", "quick"]
+    title: str
+    intro: str
+    situations: list[SituationDraft]  # decision
+    infographic: int  # inspection: number of the module's infographic it is played on (-1: none)
+    inspection_prompt: str
+    zones: list[ZoneDraft]
+    simulator_prompt: str  # simulator
+    variables: list[VariableDraft]
+    formula: str
+    output_label: str
+    output_unit: str
+    output_decimals: int
+    target_op: Literal["lte", "gte", "between"]
+    target_value: float
+    target_value2: float
+    success_text: str
+    fail_text: str
+    hint: str
+    quick_mode: Literal["match", "order"]  # quick
+    quick_prompt: str
+    items: list[str]
+    pairs: list[PairDraft]
+    seconds: int
+
+
+class ActivitiesDraft(BaseModel):
+    activities: list[ActivityDraft]
+
+
+def activities_prompt(title: str, script: str, materials: str, infographics: list[str], count: int) -> str:
+    listed = "\n".join(f"{n}. {text}" for n, text in enumerate(infographics)) or "(este módulo no tiene infografías)"
+    return f"""Diseña {count} actividades interactivas para practicar lo que enseña el módulo «{title}», justo después
+de su video. Son juegos cortos (2-4 minutos) para colaboradores; cada explicación la dice una voz en off, así que
+escribe frases cortas para ser escuchadas (máximo 2 frases por texto), en segunda persona y sin emojis.
+Elige solo los tipos que encajan con el contenido, como máximo uno de cada tipo:
+
+- "decision" (decisión con cliente): una conversación realista con un cliente o compañero. situations: 2-5
+  situaciones; la primera abre la conversación. Cada una con speaker, situation (lo que dice o pasa, 1-2 frases)
+  y 2-3 choices: text (lo que haría el colaborador), points (0-10: la mejor práctica 6-10, las malas 0-3),
+  feedback (la consecuencia y por qué, 1-2 frases que enseñan) y next_situation (índice de la situación siguiente,
+  siempre mayor que la actual, o -1 si ahí termina). Máximo 4 pasos de profundidad; todas las situaciones deben
+  ser alcanzables.
+- "inspection" (inspección visual): solo si hay una infografía del módulo donde se puedan señalar problemas.
+  infographic: su número en la lista de abajo. inspection_prompt: qué buscar ("Encuentra los 2 problemas…").
+  zones: 3-6 zonas, cada una con label, region (dónde está en la imagen: celda de una cuadrícula 3x3, sin
+  repetir celda), is_problem y explanation (por qué es o no un problema). Al menos 2 problemas y al menos 1 zona
+  correcta para distinguir.
+- "simulator" (simulador con reto): solo si los materiales traen cifras reales para calcular (precios,
+  kilómetros, porcentajes…); nunca inventes cifras. variables: 1-3 controles (key en minúsculas sin acentos,
+  label, unit, min, max, step, default). formula: solo +, -, *, /, paréntesis, min(a,b), max(a,b) y las keys.
+  output_label/output_unit/output_decimals: el resultado. target_op ("lte", "gte" o "between") con target_value
+  (y target_value2 si es between): el reto debe poder cumplirse moviendo los controles y NO cumplirse con los
+  valores por defecto. success_text, fail_text y hint enseñan el porqué.
+- "quick" (reto rápido con tiempo): quick_mode "match" (pairs: 4-6 parejas concepto → definición o causa) u
+  "order" (items: 4-6 pasos en el orden correcto). quick_prompt y seconds (30-90).
+
+title (máximo 60 caracteres) e intro (1 frase que invita a jugar) en todas. Deja vacíos ("", [], 0, -1) los
+campos que el tipo no usa. Usa solo información del guion y de los materiales.
+
+INFOGRAFÍAS DEL MÓDULO:
+{listed}
+
+GUION DEL MÓDULO:
+{_fenced(script[:12_000])}
+
+{_materials_block(materials, 20_000)}"""
+
+
+def _zones(zones: list[ZoneDraft]) -> list[dict]:
+    third = 1 / 3
+    return [
+        {
+            "id": f"z{number}", "label": _clip(zone.label, 80), "is_problem": zone.is_problem,
+            "explanation": _clip(zone.explanation, 600), "placed": False,
+            "x": round(REGIONS[zone.region][0] * third + REGION_MARGIN, 4),
+            "y": round(REGIONS[zone.region][1] * third + REGION_MARGIN, 4),
+            "w": round(third - 2 * REGION_MARGIN, 4), "h": round(third - 2 * REGION_MARGIN, 4),
+        }
+        for number, zone in enumerate(zones, start=1)
+    ]
+
+
+def _activity_spec(draft: ActivityDraft) -> dict:
+    if draft.type == "decision":
+        return {"nodes": [
+            {"id": f"s{index + 1}", "speaker": _clip(situation.speaker, 80) or "Cliente",
+             "situation": _clip(situation.situation, 600),
+             "choices": [
+                 {"id": "abc"[n], "text": _clip(choice.text, 200), "points": max(0, min(10, choice.points)),
+                  "feedback": _clip(choice.feedback, 600),
+                  "next": f"s{choice.next_situation + 1}" if 0 <= choice.next_situation < len(draft.situations) else ""}
+                 for n, choice in enumerate(situation.choices[:3])
+             ]}
+            for index, situation in enumerate(draft.situations[:8])
+        ]}
+    if draft.type == "inspection":
+        return {"prompt": _clip(draft.inspection_prompt, 200), "zones": _zones(draft.zones[:8])}
+    if draft.type == "simulator":
+        return {
+            "prompt": _clip(draft.simulator_prompt, 200), "formula": draft.formula.strip(),
+            "variables": [variable.model_dump() for variable in draft.variables[:4]],
+            "output": {"label": _clip(draft.output_label, 80) or "Resultado", "unit": _clip(draft.output_unit, 30),
+                       "decimals": max(0, min(4, draft.output_decimals))},
+            "target": {"op": draft.target_op, "value": draft.target_value, "value2": draft.target_value2},
+            "success_text": _clip(draft.success_text, 600), "fail_text": _clip(draft.fail_text, 600),
+            "hint": _clip(draft.hint, 600),
+        }
+    return {"mode": draft.quick_mode, "prompt": _clip(draft.quick_prompt, 200),
+            "items": [_clip(item, 80) for item in draft.items[:8]],
+            "pairs": [{"left": _clip(pair.left, 80), "right": _clip(pair.right, 200)} for pair in draft.pairs[:8]],
+            "seconds": max(20, min(120, draft.seconds or 60))}
+
+
+def to_activity(draft: ActivityDraft) -> dict | None:
+    """The draft as an activity to save (as a draft), or None if it doesn't hold up (it is then left out)."""
+    title = _clip(draft.title, 200)
+    if not title:
+        return None
+    try:
+        spec = parse_spec(draft.type, _activity_spec(draft)).model_dump()
+    except SpecError:
+        return None
+    return {"type": draft.type, "title": title, "intro": _clip(draft.intro, 600), "spec": spec,
+            "infographic": draft.infographic if draft.type == "inspection" else -1}
+
+
+def to_activities(drafts: list[ActivityDraft], limit: int) -> list[dict]:
+    """The drafts that hold up, one per type at most, the first `limit` of them."""
+    activities, types = [], set()
+    for draft in drafts:
+        if draft.type not in types and (activity := to_activity(draft)):
+            activities.append(activity)
+            types.add(draft.type)
+    return activities[:limit]
+
+
+def generate_activities(
+    llm: LLM, *, title: str, script: str, materials: str, infographics: list[str], count: int, language: str,
+) -> list[dict]:
+    draft = llm.structured(_system(language), activities_prompt(title, script, materials, infographics, count),
+                           ActivitiesDraft, max_tokens=24000)
+    return to_activities(draft.activities, limit=count)
 
 
 def _system(language: str) -> str:
