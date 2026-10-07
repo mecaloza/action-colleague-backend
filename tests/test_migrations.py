@@ -93,7 +93,7 @@ def test_fresh_database_matches_the_models(database_url):
     run_migrations(database_url)
 
     assert _schema_diff(database_url) == []
-    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0002_course_studio",)]
+    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0003_activities",)]
 
 
 def test_production_like_database_is_stamped_then_upgraded(database_url):
@@ -110,7 +110,7 @@ def test_production_like_database_is_stamped_then_upgraded(database_url):
         5: "ai",
     }
     assert [bool(revoked) for (revoked,) in _fetch(database_url, "SELECT revoked FROM refresh_tokens")] == [True]
-    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0002_course_studio",)]
+    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0003_activities",)]
     assert _schema_diff(database_url) == []
 
 
@@ -137,16 +137,18 @@ def test_new_tables_have_row_level_security_on_postgres(database_url):
 
     rows = _fetch(
         database_url,
-        f"SELECT relname, relrowsecurity FROM pg_class WHERE relname IN ('media_assets', 'jobs', '{VERSION_TABLE}') ORDER BY relname",
+        "SELECT relname, relrowsecurity FROM pg_class WHERE relname IN "
+        f"('media_assets', 'jobs', 'activities', 'activity_attempts', '{VERSION_TABLE}') ORDER BY relname",
     )
-    assert rows == [(VERSION_TABLE, True), ("jobs", True), ("media_assets", True)]
+    assert rows == [(VERSION_TABLE, True), ("activities", True), ("activity_attempts", True), ("jobs", True),
+                    ("media_assets", True)]
 
 
 def test_downgrade_returns_to_the_baseline(database_url):
     run_migrations(database_url)
     command.downgrade(alembic_config(database_url), BASELINE_REVISION)
 
-    assert {"media_assets", "jobs"}.isdisjoint(_table_names(database_url))
+    assert {"media_assets", "jobs", "activities", "activity_attempts"}.isdisjoint(_table_names(database_url))
     assert "source" not in _column_names(database_url, "courses")
 
 

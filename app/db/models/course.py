@@ -64,3 +64,5 @@ class Module(Base):
     course = relationship("Course", back_populates="modules")
     evaluation = relationship("Evaluation", back_populates="module", uselist=False, cascade="all, delete-orphan")
     progress_records = relationship("ModuleProgress", back_populates="module", cascade="all, delete-orphan")
+    activities = relationship("Activity", back_populates="module", cascade="all, delete-orphan",
+                              order_by="Activity.order", passive_deletes=True)
