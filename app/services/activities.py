@@ -3,7 +3,7 @@ The game engine of the interactive activities: what a learner sees, how each mov
 
 Everything is decided here, on the server, from the activity's `spec` and the attempt's `state`. The learner only
 receives what they have already earned: the current situation of a conversation (not where each choice leads), the
-zones they found (not the others), the pairs they matched. Choices and items travel as opaque tokens, different for
+answers to the inspection items they already decided on, the pairs they matched. Choices and items travel as opaque tokens, different for
 every attempt, so a token copied from someone else's play means nothing.
 
 `start` builds a fresh state; `view` shows it; `move` grades one play; `finish` closes the attempt. Narration lines
@@ -35,9 +35,9 @@ from app.services.activity_spec import (
 from app.services import formula
 from app.services.media import MediaResolver
 
-PROBLEM_POINTS = 10  # inspection: a problem found
-DISTRACTOR_PENALTY = 3  # inspection: a sound zone taken for a problem
-MISS_PENALTY = 1  # inspection: a tap on nothing
+INSPECTION_POINTS = 10  # inspection: a right decision
+INSPECTION_STREAK_BONUS = 2  # inspection: per right decision in a row after the first, up to the max
+INSPECTION_MAX_STREAK_BONUS = 6
 SIMULATOR_POINTS = 100  # simulator: the target met at the first try
 SIMULATOR_TRY_COST = 10  # simulator: each extra try
 SIMULATOR_MIN_POINTS = 50
@@ -99,7 +99,7 @@ def max_score(activity: Activity, untimed: bool = False) -> int:
         case DecisionSpec():
             return spec.max_score()
         case InspectionSpec():
-            return PROBLEM_POINTS * len(spec.problems)
+            return sum(_inspection_points(streak) for streak in range(1, len(spec.items) + 1))
         case SimulatorSpec():
             return SIMULATOR_POINTS
         case QuickSpec():
@@ -117,8 +117,8 @@ def line_keys(activity: Activity) -> dict[str, str]:
                 for choice in node.choices:
                     lines[f"{node.id}.{choice.id}"] = choice.feedback
         case InspectionSpec():
-            for zone in spec.zones:
-                lines[f"zone.{zone.id}"] = zone.explanation
+            for item in spec.items:
+                lines[f"item.{item.id}"] = item.explanation
         case SimulatorSpec():
             lines.update(success=spec.success_text, fail=spec.fail_text)
     return lines
@@ -135,7 +135,7 @@ def start(activity: Activity, now: datetime | None = None, untimed: bool = False
         case DecisionSpec():
             state.update(node=spec.nodes[0].id, path=[])
         case InspectionSpec():
-            state.update(revealed=[], found=0, misses=0)
+            state.update(decided={}, lives=spec.lives, streak=0)
         case SimulatorSpec():
             state.update(tries=0, met=False, last=None)
         case QuickSpec():
@@ -155,9 +155,10 @@ def view(activity: Activity, attempt: ActivityAttempt, secret: str, now: datetim
             return {**base, "step": len(state["path"]) + 1, "path": state["path"],
                     "node": None if state["done"] else _node_view(spec, state["node"], attempt.id, secret)}
         case InspectionSpec():
-            return {**base, "prompt": spec.prompt, "problems": len(spec.problems), "found": state["found"],
-                    "misses": state["misses"], "max_misses": spec.max_misses,
-                    "revealed": [_zone_view(zone) for zone in spec.zones if zone.id in state["revealed"]]}
+            return {**base, "prompt": spec.prompt, "scene": spec.scene, "lives": state["lives"],
+                    "max_lives": spec.lives, "streak": state["streak"],
+                    "verdicts": [verdict.model_dump() for verdict in spec.verdicts],
+                    "items": [_item_view(spec, item, state, reveal=state["done"]) for item in spec.items]}
         case SimulatorSpec():
             return {**base, "prompt": spec.prompt, "hint": spec.hint, "formula": spec.formula,
                     "variables": [variable.model_dump() for variable in spec.variables],
@@ -177,9 +178,19 @@ def _node_view(spec: DecisionSpec, node_id: str, attempt_id: int, secret: str) -
     return {"line": f"{node.id}.situation", "speaker": node.speaker, "situation": node.situation, "choices": choices}
 
 
-def _zone_view(zone) -> dict:
-    return {"id": zone.id, "label": zone.label, "x": zone.x, "y": zone.y, "w": zone.w, "h": zone.h,
-            "is_problem": zone.is_problem, "explanation": zone.explanation, "line": f"zone.{zone.id}"}
+def _item_view(spec: InspectionSpec, item, state: dict, reveal: bool = False) -> dict:
+    """An item as the learner sees it: its facts always; its answer only once decided (or the play is over)."""
+    view = {"id": item.id, "label": item.label, "facts": [fact.model_dump() for fact in item.facts],
+            "look": item.look, "chosen": state["decided"].get(item.id), "outcome": None}
+    if item.id in state["decided"] or reveal:
+        answer = next(verdict for verdict in spec.verdicts if verdict.id == item.answer)
+        view["outcome"] = {"answer": answer.id, "answer_label": answer.label, "explanation": item.explanation,
+                           "line": f"item.{item.id}", "correct": state["decided"].get(item.id) == item.answer}
+    return view
+
+
+def _inspection_points(streak: int) -> int:
+    return INSPECTION_POINTS + min(INSPECTION_MAX_STREAK_BONUS, INSPECTION_STREAK_BONUS * (streak - 1))
 
 
 def _quick_entries(spec: QuickSpec) -> tuple[list[str], list[str]]:
@@ -263,36 +274,29 @@ def _decide(spec: DecisionSpec, state: dict, payload: dict, attempt_id: int, sec
 
 
 def _inspect(spec: InspectionSpec, state: dict, payload: dict) -> Move:
-    try:
-        x, y = float(payload["x"]), float(payload["y"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise GameError("Indica dónde tocaste la imagen.") from exc
-    if not (0 <= x <= 1 and 0 <= y <= 1):
-        raise GameError("El toque cae fuera de la imagen.")
-    touched = sorted((z for z in spec.zones if z.x <= x <= z.x + z.w and z.y <= y <= z.y + z.h),
-                     key=lambda zone: zone.w * zone.h)  # the most precise zone under the finger
-    zone = next((z for z in touched if z.id not in state["revealed"]), None)
-    if zone is None and touched:
-        return Move({"hit": "already", "zone": _zone_view(touched[0])}, done=False)
-    if zone is None:
-        state["misses"] += 1
-        state["score"] -= MISS_PENALTY
-        hit, shown = "none", None
+    item = next((item for item in spec.items if item.id == payload.get("item")), None)
+    if item is None:
+        raise GameError("Ese elemento no es de esta inspección.")
+    verdict = payload.get("verdict")
+    if not any(option.id == verdict for option in spec.verdicts):
+        raise GameError("Esa decisión no es de esta inspección.")
+    if item.id in state["decided"]:
+        raise GameError("Ya decidiste sobre ese elemento.", status=409)
+    state["decided"][item.id] = verdict
+    correct = verdict == item.answer
+    points = 0
+    if correct:
+        state["streak"] += 1
+        points = _inspection_points(state["streak"])
+        state["score"] += points
     else:
-        state["revealed"].append(zone.id)
-        if zone.is_problem:
-            state["found"] += 1
-            state["score"] += PROBLEM_POINTS
-            hit = "problem"
-        else:
-            state["misses"] += 1
-            state["score"] -= DISTRACTOR_PENALTY
-            hit = "distractor"
-        shown = _zone_view(zone)
-    done = state["found"] == len(spec.problems) or state["misses"] >= spec.max_misses
-    result = {"hit": hit, "zone": shown, "found": state["found"], "misses": state["misses"]}
-    if done and state["found"] < len(spec.problems):  # out of tries: show what was left, to learn from it
-        result["missed"] = [_zone_view(z) for z in spec.problems if z.id not in state["revealed"]]
+        state["streak"] = 0
+        state["lives"] -= 1
+    done = len(state["decided"]) == len(spec.items) or state["lives"] == 0
+    result = {"correct": correct, "points": points, "lives": state["lives"], "streak": state["streak"],
+              "item": _item_view(spec, item, state)}
+    if done:  # every answer, those left undecided too (to learn from them)
+        result["items"] = [_item_view(spec, other, state, reveal=True) for other in spec.items]
     return Move(result, done=done)
 
 
@@ -387,7 +391,7 @@ def finish(activity: Activity, attempt: ActivityAttempt, now: datetime | None = 
 
 
 def revealed_lines(data: object) -> list[str]:
-    """The narration keys a response reveals: every "line" in it (the situation, a consequence, a zone...)."""
+    """The narration keys a response reveals: every "line" in it (the situation, a consequence, an item...)."""
     if isinstance(data, dict):
         return [line for key, value in data.items() for line in ([value] if key == "line" else revealed_lines(value))
                 if isinstance(line, str)]
@@ -412,7 +416,7 @@ def narration_urls(db: Session, activity: Activity, keys: list[str]) -> dict[str
 
 
 def image_url(db: Session, activity: Activity) -> str | None:
-    """The signed URL of the picture an inspection is played on."""
+    """The signed URL of the activity's reference photo, if it has one."""
     if not activity.image_asset_id:
         return None
     return MediaResolver(db).prepare(extra_asset_ids=[activity.image_asset_id]).url(activity.image_asset_id)

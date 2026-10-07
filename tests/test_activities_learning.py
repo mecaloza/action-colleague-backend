@@ -175,7 +175,7 @@ def test_finished_plays_count_once_even_if_played_again(client, db, course, lear
                                             ActivityAttempt.finished_at.isnot(None)).count() == 2
 
 
-def test_an_inspection_starts_with_its_picture(client, db, course, learner, storage, tmp_path):
+def test_an_activity_starts_with_its_reference_photo(client, db, course, learner, storage, tmp_path):
     from tests.test_activity_spec import INSPECTION
 
     plain = _modules(course)[0]
@@ -186,12 +186,12 @@ def test_an_inspection_starts_with_its_picture(client, db, course, learner, stor
                        mime_type="image/png")
     db.add(asset)
     db.flush()
-    inspection = Activity(module_id=plain.id, order=3, type="inspection", title="Desgaste", intro="",
+    inspection = Activity(module_id=plain.id, order=3, type="inspection", title="Revisión", intro="",
                           spec=copy.deepcopy(INSPECTION), status="ready", image_asset_id=asset.id)
     db.add(inspection)
     db.commit()
     play = client.post(f"{API}/activities/{inspection.id}/attempts", headers=learner, json={}).json()
-    assert play["image_url"] and play["view"]["revealed"] == []
+    assert play["image_url"] and play["view"]["lives"] == 3
 
 
 

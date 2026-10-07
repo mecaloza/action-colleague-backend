@@ -163,11 +163,11 @@ class ActivityPlay(BaseModel):
     activity_id: int
     view: dict[str, Any]
     narration: dict[str, str]  # line key -> audio URL, for the lines this response reveals
-    image_url: str | None = None  # the picture an inspection is played on
+    image_url: str | None = None  # a reference photo shown during the play, if the activity has one
 
 
 class ActivityMoveIn(BaseModel):
-    # One play: {"choice"} for a decision, {"x", "y"} for an inspection, {"values"} for a simulator,
+    # One play: {"choice"} for a decision, {"item", "verdict"} for an inspection, {"values"} for a simulator,
     # {"card", "answer"?} for a quick challenge. Bounded: a move is a handful of fields.
     move: dict[str, Any] = Field(max_length=8)
 

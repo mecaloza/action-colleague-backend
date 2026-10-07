@@ -45,8 +45,7 @@ def _run(db, worker, rounds=8):
     db.expire_all()
 
 
-def test_the_ai_drafts_activities_on_the_module_s_infographic(client, db, module, headers, storage, worker):
-    client.put(f"/api/v1/modules/{module.id}/storyboard", headers=headers, json={"scenes": SCENES})  # infographics
+def test_the_ai_drafts_activities_from_the_module_s_script(client, db, module, headers, storage, worker):
     job = client.post(f"/api/v1/modules/{module.id}/activities/generate", headers=headers)
     assert job.status_code == 202
     _run(db, worker)
@@ -55,9 +54,9 @@ def test_the_ai_drafts_activities_on_the_module_s_infographic(client, db, module
     assert [a["type"] for a in drafted] == ["decision", "inspection", "simulator"]  # 3 at most, one per type
     assert all(a["status"] == "draft" for a in drafted)
     inspection = drafted[1]
-    assert inspection["image_url"]  # the infographic the script's scene has
-    assert inspection["problems"] == ["Ubica cada zona sobre la imagen y confírmala."]  # the AI only guessed a region
-    assert inspection["spec"]["zones"][0] == {**inspection["spec"]["zones"][0], "x": 0.03, "y": 0.03, "placed": False}
+    assert inspection["problems"] == []  # nothing to place by hand: it can be published as it is
+    assert inspection["spec"]["scene"] == "truck" and [v["id"] for v in inspection["spec"]["verdicts"]] == ["v1", "v2", "v3"]
+    assert [item["answer"] for item in inspection["spec"]["items"]] == ["v1", "v2", "v3", "v1"]
 
 
 def test_regenerating_replaces_the_drafts_but_keeps_what_was_published(client, db, module, headers, storage, worker):
@@ -92,7 +91,7 @@ def test_a_module_without_content_gets_no_activities(client, db, admin, headers,
 def test_drafts_that_don_t_hold_up_are_left_out():
     from app.services.ai.fake import FakeLLM
 
-    drafts = FakeLLM()._activities("con infografías")
+    drafts = FakeLLM()._activities()
     broken = drafts[2].model_copy(update={"formula": "precio ** 2"})  # the simulator
     second_decision = drafts[0].model_copy(update={"title": "Otra conversación"})
     kept = designer.to_activities([drafts[0], broken, second_decision, drafts[3]], limit=3)
@@ -135,3 +134,12 @@ def test_a_draft_the_admin_wrote_or_edited_is_never_replaced(client, db, module,
     again = client.get(f"/api/v1/modules/{module.id}/activities", headers=headers).json()
     titles = [a["title"] for a in again]
     assert titles[:2] == ["Mi reto", "Ajustada por mí"] and len(again) == 2 + 3
+
+
+def test_tires_that_don_t_pair_up_are_drafted_as_cards():
+    from app.services.ai.fake import FakeLLM
+
+    inspection = FakeLLM()._activities()[1]
+    odd = inspection.model_copy(update={"inspect_items": inspection.inspect_items[:3]})
+    assert designer.to_activity(odd)["spec"]["scene"] == "cards"
+    assert designer.to_activity(inspection)["spec"]["scene"] == "truck"

@@ -105,8 +105,7 @@ def queue_visuals(db: Session, module: Module) -> None:
 
 
 def queue_activities(db: Session, module: Module) -> None:
-    """Have the module's interactive activities drafted (the "ai.activities" job waits for its infographics,
-    which inspections are played on); the caller commits."""
+    """Have the module's interactive activities drafted (see the "ai.activities" job); the caller commits."""
     from app.worker import queue
 
     queue.enqueue(db, "ai.activities", {}, course_id=module.course_id, module_id=module.id,

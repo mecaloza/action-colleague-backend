@@ -27,7 +27,7 @@ def play(kind: str, spec: dict, attempt_id: int = 1, untimed: bool = False, titl
 def secrets_in(view: dict) -> set[str]:
     """Answer keys that must never reach the learner before they act."""
     text = json.dumps(view, ensure_ascii=False)
-    return {word for word in ('"points"', '"next"', '"is_problem"', '"feedback"', '"explanation"') if word in text}
+    return {word for word in ('"points"', '"next"', '"answer"', '"feedback"', '"explanation"') if word in text}
 
 
 # ── Decisión con cliente ──────────────────────────────────────────────
@@ -58,39 +58,46 @@ def test_a_choice_from_another_play_or_situation_is_refused():
         engine.move(activity, attempt, {"choice": foreign}, SECRET)
 
 
-# ── Inspección visual ─────────────────────────────────────────────────
+# ── Inspección ────────────────────────────────────────────────────────
 
 
-def test_an_inspection_reveals_only_the_zones_tapped():
+def test_an_inspection_reveals_each_answer_only_after_deciding():
     activity, attempt = play("inspection", INSPECTION)
     start = engine.view(activity, attempt, SECRET)
-    assert start["revealed"] == [] and start["problems"] == 2 and secrets_in(start) == set()
+    assert [item["id"] for item in start["items"]] == ["l1", "l2", "l3", "l4"] and start["lives"] == 3
+    assert start["items"][1]["facts"][0] == {"label": "Profundidad", "value": "4 mm"}
+    assert secrets_in(start) == set() and all(item["outcome"] is None for item in start["items"])
+    assert attempt.max_score == 10 + 12 + 14 + 16  # every answer right, in a row
 
-    nothing = engine.move(activity, attempt, {"x": 0.5, "y": 0.9}, SECRET)
-    assert nothing.result["hit"] == "none" and nothing.result["score"] == 0  # never below zero
-    sound = engine.move(activity, attempt, {"x": 0.8, "y": 0.2}, SECRET)
-    assert sound.result["hit"] == "distractor" and sound.result["zone"]["explanation"].startswith("Esta llanta")
-    shoulders = engine.move(activity, attempt, {"x": 0.1, "y": 0.2}, SECRET)
-    assert shoulders.result["hit"] == "problem" and shoulders.result["score"] == 6  # the earlier misses cost 1 + 3
-    again = engine.move(activity, attempt, {"x": 0.1, "y": 0.2}, SECRET)
-    assert again.result["hit"] == "already" and again.result["score"] == 6
-    center = engine.move(activity, attempt, {"x": 0.5, "y": 0.2}, SECRET)
-    assert center.done and center.result["score"] == 16
-    assert [z["id"] for z in engine.view(activity, attempt, SECRET)["revealed"]] == ["hombros", "centro", "parejo"]
+    right = engine.move(activity, attempt, {"item": "l1", "verdict": "rodar"}, SECRET)
+    assert right.result["correct"] and right.result["points"] == 10 and right.result["item"]["outcome"]["line"] == "item.l1"
+    wrong = engine.move(activity, attempt, {"item": "l2", "verdict": "rodar"}, SECRET)
+    assert not wrong.result["correct"] and wrong.result["lives"] == 2 and wrong.result["streak"] == 0
+    assert wrong.result["item"]["outcome"]["answer_label"] == "Reencauchar"
+    assert wrong.result["item"]["chosen"] == "rodar" and wrong.result["score"] == 10
+    with pytest.raises(GameError, match="Ya decidiste") as already:
+        engine.move(activity, attempt, {"item": "l1", "verdict": "retirar"}, SECRET)
+    assert already.value.status == 409
+    engine.move(activity, attempt, {"item": "l3", "verdict": "retirar"}, SECRET)
+    last = engine.move(activity, attempt, {"item": "l4", "verdict": "rodar"}, SECRET)
+    assert last.done and last.result["score"] == 10 + 10 + 12 and last.result["streak"] == 2
+    assert [item["outcome"]["correct"] for item in last.result["items"]] == [True, False, True, True]
 
 
-def test_an_inspection_ends_after_too_many_misses_showing_what_was_left():
-    spec = {**INSPECTION, "max_misses": 2}
-    activity, attempt = play("inspection", spec)
-    engine.move(activity, attempt, {"x": 0.5, "y": 0.9}, SECRET)
-    last = engine.move(activity, attempt, {"x": 0.55, "y": 0.95}, SECRET)
-    assert last.done and {z["id"] for z in last.result["missed"]} == {"hombros", "centro"}
+def test_an_inspection_ends_when_the_lives_run_out_showing_every_answer():
+    activity, attempt = play("inspection", {**INSPECTION, "lives": 1})
+    out = engine.move(activity, attempt, {"item": "l3", "verdict": "rodar"}, SECRET)
+    assert out.done and out.result["lives"] == 0
+    assert {item["id"]: item["outcome"]["answer"] for item in out.result["items"]} == {
+        "l1": "rodar", "l2": "reencauchar", "l3": "retirar", "l4": "rodar"}
+    assert engine.view(activity, attempt, SECRET)["items"][0]["outcome"]["answer"] == "rodar"  # also after a reload
     with pytest.raises(GameError, match="ya terminó"):
-        engine.move(activity, attempt, {"x": 0.1, "y": 0.2}, SECRET)
+        engine.move(activity, attempt, {"item": "l1", "verdict": "rodar"}, SECRET)
 
 
-@pytest.mark.parametrize("payload", [{}, {"x": "a", "y": 0}, {"x": 1.5, "y": 0.5}])
-def test_an_inspection_needs_a_tap_on_the_picture(payload):
+@pytest.mark.parametrize("payload", [{}, {"item": "l9", "verdict": "rodar"}, {"item": "l1", "verdict": "vender"},
+                                     {"item": ["l1"], "verdict": "rodar"}])
+def test_an_inspection_move_names_an_item_and_a_verdict_of_its_own(payload):
     activity, attempt = play("inspection", INSPECTION)
     with pytest.raises(GameError):
         engine.move(activity, attempt, payload, SECRET)
@@ -183,8 +190,8 @@ def test_every_spoken_line_has_a_key():
     keys = engine.line_keys(activity)
     assert keys["intro"] == "Escucha y decide." and keys["inicio.situation"].startswith("Solo quiero")
     assert keys["inicio.pregunta"].startswith("Entiendes") and len(keys) == 1 + 2 + 4
-    assert set(engine.line_keys(play("inspection", INSPECTION)[0])) == {"intro", "zone.hombros", "zone.centro",
-                                                                         "zone.parejo"}
+    assert set(engine.line_keys(play("inspection", INSPECTION)[0])) == {"intro", "item.l1", "item.l2", "item.l3",
+                                                                         "item.l4"}
     assert set(engine.line_keys(play("simulator", SIMULATOR)[0])) == {"intro", "success", "fail"}
 
 

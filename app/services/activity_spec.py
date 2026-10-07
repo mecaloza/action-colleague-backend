@@ -1,8 +1,7 @@
 """
 What each kind of activity holds (answers included) and the rules it must follow to be played.
 
-`parse_spec(type, data)` validates an activity's `spec`; `ready_problems(type, spec)` lists what still keeps a valid
-activity from being published (e.g. inspection zones nobody has placed on the picture yet).
+`parse_spec(type, data)` validates an activity's `spec`: a valid activity can be published.
 """
 
 from itertools import product
@@ -18,12 +17,10 @@ Label = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, ma
 Spoken = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=600)]
 OptionalText = Annotated[str, StringConstraints(strip_whitespace=True, max_length=600)]
 Unit = Annotated[str, StringConstraints(strip_whitespace=True, max_length=30)]
-Fraction = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
 Number = Annotated[float, Field(ge=-1e9, le=1e9, allow_inf_nan=False)]
 
 MAX_DECISION_DEPTH = 4
 MAX_SIMULATOR_CHECKS = 5000  # slider combinations a simulator's formula is checked on when saved
-MIN_ZONE_SIZE = 0.03
 
 
 class SpecError(ValueError):
@@ -103,48 +100,57 @@ class DecisionSpec(BaseModel):
         return best(self.nodes[0].id)
 
 
-# ── Inspección visual ─────────────────────────────────────────────────
+# ── Inspección (un juego: revisar cada elemento y decidir qué hacer) ──
+
+# How a tire is drawn: its wear pattern or damage ("none": not a tire, or nothing to see).
+Look = Literal["none", "even", "center", "shoulders", "one_side", "cupping", "cuts", "bulge"]
+MAX_TRUCK_TIRES = 10  # 5 axles
 
 
-class Zone(BaseModel):
+class Fact(BaseModel):
+    label: Label
+    value: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=60)]
+
+
+class Verdict(BaseModel):
+    id: Key
+    label: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40)]
+
+
+class Item(BaseModel):
     id: Key
     label: Label
-    x: Fraction
-    y: Fraction
-    w: Annotated[float, Field(ge=MIN_ZONE_SIZE, le=1, allow_inf_nan=False)]
-    h: Annotated[float, Field(ge=MIN_ZONE_SIZE, le=1, allow_inf_nan=False)]
-    is_problem: bool
+    facts: list[Fact] = Field(min_length=1, max_length=5)
+    look: Look = "none"
+    answer: Key  # the verdict that is right for it
     explanation: Spoken
-    placed: bool = False  # an admin confirmed where it is on the picture (the AI only guesses a region)
-
-    @model_validator(mode="after")
-    def _inside_the_picture(self) -> "Zone":
-        if self.x + self.w > 1.0001 or self.y + self.h > 1.0001:
-            raise ValueError(f"La zona «{self.label}» se sale de la imagen.")
-        return self
 
 
 class InspectionSpec(BaseModel):
-    """Find the problems on a picture: taps are checked against zones the learner never receives."""
+    """Check each item (a tire on a truck, or a case on a card), read its facts and decide what to do with it.
+    The learner never receives the answers: each decision is graded on the server."""
 
     prompt: Short
-    zones: list[Zone] = Field(min_length=3, max_length=8)
-    max_misses: int = Field(default=5, ge=1, le=10)
+    scene: Literal["truck", "cards"] = "cards"
+    verdicts: list[Verdict] = Field(min_length=2, max_length=4)
+    items: list[Item] = Field(min_length=3, max_length=MAX_TRUCK_TIRES)
+    lives: int = Field(default=3, ge=1, le=5)
 
     @model_validator(mode="after")
-    def _problems_and_distractors(self) -> "InspectionSpec":
-        if len({zone.id for zone in self.zones}) != len(self.zones):
-            raise ValueError("Dos zonas tienen el mismo identificador.")
-        problems = sum(zone.is_problem for zone in self.zones)
-        if problems < 2:
-            raise ValueError("La inspección necesita al menos 2 zonas con un problema.")
-        if problems == len(self.zones):
-            raise ValueError("La inspección necesita al menos 1 zona sin problema, para distinguir.")
+    def _answers_are_verdicts(self) -> "InspectionSpec":
+        verdicts = [verdict.id for verdict in self.verdicts]
+        if len(set(verdicts)) != len(verdicts):
+            raise ValueError("Dos decisiones tienen el mismo identificador.")
+        if len({item.id for item in self.items}) != len(self.items):
+            raise ValueError("Dos elementos tienen el mismo identificador.")
+        for item in self.items:
+            if item.answer not in verdicts:
+                raise ValueError(f"La respuesta de «{item.label}» no es una de las decisiones.")
+        if len({item.answer for item in self.items}) < 2:
+            raise ValueError("Usa al menos 2 decisiones distintas como respuesta: si todas son iguales no hay reto.")
+        if self.scene == "truck" and len(self.items) % 2:
+            raise ValueError("En el camión las llantas van por pares (izquierda y derecha de cada eje).")
         return self
-
-    @property
-    def problems(self) -> list[Zone]:
-        return [zone for zone in self.zones if zone.is_problem]
 
 
 # ── Simulador con reto ────────────────────────────────────────────────
@@ -327,14 +333,3 @@ def parse_spec(activity_type: str, data: dict) -> Spec:
         message = str(error.get("ctx", {}).get("error") or error["msg"]).removeprefix("Value error, ")
         where = ".".join(str(part) for part in error["loc"])
         raise SpecError(message if error["type"] == "value_error" else f"{where}: {message}") from exc
-
-
-def ready_problems(activity_type: str, spec: Spec, has_image: bool) -> list[str]:
-    """What keeps a valid activity from being published."""
-    problems = []
-    if activity_type == "inspection":
-        if not has_image:
-            problems.append("Falta la imagen sobre la que se inspecciona.")
-        if not all(zone.placed for zone in spec.zones):
-            problems.append("Ubica cada zona sobre la imagen y confírmala.")
-    return problems
