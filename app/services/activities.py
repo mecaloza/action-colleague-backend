@@ -17,12 +17,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
-from sqlalchemy.orm import Session
-
 from app.db.models import Activity, ActivityAttempt
-from app.services.media import MediaResolver
 from app.services.activity_spec import (
     DecisionSpec,
     InspectionSpec,
@@ -32,6 +30,7 @@ from app.services.activity_spec import (
     SpecError,
     parse_spec,
 )
+from app.services.media import MediaResolver
 
 PROBLEM_POINTS = 10  # inspection: a problem found
 DISTRACTOR_PENALTY = 3  # inspection: a sound zone taken for a problem

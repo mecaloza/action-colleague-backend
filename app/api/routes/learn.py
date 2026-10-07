@@ -239,10 +239,6 @@ def _activity_secret() -> str:
     return engine.activity_secret(get_settings().jwt_secret)
 
 
-def _engine_errors(exc: engine.GameError) -> HTTPException:
-    return HTTPException(exc.status, str(exc))
-
-
 def _playable_activity(db: Session, user: User, activity_id: int):
     activity = db.get(Activity, activity_id)
     if activity is None or activity.status != "ready":
@@ -281,7 +277,7 @@ def start_activity(
             db.flush()
         view = engine.view(activity, attempt, _activity_secret())
     except engine.GameError as exc:
-        raise _engine_errors(exc) from exc
+        raise HTTPException(exc.status, str(exc)) from exc
     db.commit()
     keys = ["intro", *engine.revealed_lines(view)]
     return ActivityPlay(attempt_id=attempt.id, activity_id=activity.id, view=view,
@@ -297,7 +293,7 @@ def play_move(
     try:
         outcome = engine.move(activity, attempt, payload.move, _activity_secret())
     except engine.GameError as exc:
-        raise _engine_errors(exc) from exc
+        raise HTTPException(exc.status, str(exc)) from exc
     db.commit()
     return ActivityMoveOut(result=outcome.result, done=outcome.done,
                            narration=engine.narration_urls(db, activity, engine.revealed_lines(outcome.result)))
@@ -310,7 +306,7 @@ def finish_activity(attempt_id: int, db: Session = Depends(get_db), user: User =
     try:
         result = engine.finish(activity, attempt)
     except engine.GameError as exc:
-        raise _engine_errors(exc) from exc
+        raise HTTPException(exc.status, str(exc)) from exc
     state.best_scores[activity.id] = max(attempt.score, state.best_scores.get(activity.id, 0))
     record = progress.get_or_create_progress(db, enrollment, state.module, lock=True)
     progress.complete_if_done(state, record, has_quiz=bool(quiz.evaluation_questions(state.evaluation)))

@@ -542,16 +542,17 @@ GUION DEL MÓDULO:
 
 def _zones(zones: list[ZoneDraft]) -> list[dict]:
     third = 1 / 3
-    return [
-        {
+    size = round(third - 2 * REGION_MARGIN, 4)
+    result = []
+    for number, zone in enumerate(zones, start=1):
+        column, row = REGIONS[zone.region]
+        result.append({
             "id": f"z{number}", "label": _clip(zone.label, 80), "is_problem": zone.is_problem,
             "explanation": _clip(zone.explanation, 600), "placed": False,
-            "x": round(REGIONS[zone.region][0] * third + REGION_MARGIN, 4),
-            "y": round(REGIONS[zone.region][1] * third + REGION_MARGIN, 4),
-            "w": round(third - 2 * REGION_MARGIN, 4), "h": round(third - 2 * REGION_MARGIN, 4),
-        }
-        for number, zone in enumerate(zones, start=1)
-    ]
+            "x": round(column * third + REGION_MARGIN, 4), "y": round(row * third + REGION_MARGIN, 4),
+            "w": size, "h": size,
+        })
+    return result
 
 
 def _activity_spec(draft: ActivityDraft) -> dict:

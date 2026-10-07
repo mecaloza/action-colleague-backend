@@ -12,6 +12,7 @@ grammar, so the learner sees the live result the server will confirm.
 """
 
 import math
+import operator
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -21,7 +22,8 @@ MAX_FORMULA_CHARS = 200
 MAX_DEPTH = 32  # nesting of parentheses and signs
 
 _TOKEN = re.compile(r"\s*(?:(\d+(?:\.\d+)?|\.\d+)|([A-Za-z_][A-Za-z0-9_]*)|(.))")
-FUNCTIONS = ("min", "max")
+FUNCTIONS = {"min": min, "max": max}
+_OPERATORS = {"+": operator.add, "-": operator.sub, "*": operator.mul, "/": operator.truediv}
 
 
 class FormulaError(ValueError):
@@ -162,12 +164,12 @@ def evaluate(node: Node, values: dict[str, float]) -> float:
         case Neg(operand):
             result = -evaluate(operand, values)
         case Call(name, left, right):
-            result = (min if name == "min" else max)(evaluate(left, values), evaluate(right, values))
+            result = FUNCTIONS[name](evaluate(left, values), evaluate(right, values))
         case BinOp(op, left, right):
             a, b = evaluate(left, values), evaluate(right, values)
             if op == "/" and b == 0:
                 raise FormulaError("La fórmula divide entre cero con algunos valores de los controles.")
-            result = a + b if op == "+" else a - b if op == "-" else a * b if op == "*" else a / b
+            result = _OPERATORS[op](a, b)
     if not math.isfinite(result):
         raise FormulaError("La fórmula da un resultado que no es un número con algunos valores de los controles.")
     return result

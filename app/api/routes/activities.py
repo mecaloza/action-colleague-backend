@@ -48,12 +48,11 @@ def _problems(db: Session, activity: Activity) -> list[str]:
 
 def _admin_view(db: Session, activity: Activity, media: MediaResolver | None = None) -> ActivityAdmin:
     media = media or MediaResolver(db).prepare(extra_asset_ids=[activity.image_asset_id])
-    problems = _problems(db, activity)
     return ActivityAdmin(
         id=activity.id, module_id=activity.module_id, order=activity.order, type=activity.type,
         title=activity.title, intro=activity.intro, spec=activity.spec, version=activity.version,
         status=activity.status, image_asset_id=activity.image_asset_id, image_url=media.url(activity.image_asset_id),
-        voice_status=activity.voice_status, max_score=_max_score(activity), problems=problems,
+        voice_status=activity.voice_status, max_score=_max_score(activity), problems=_problems(db, activity),
         updated_at=activity.updated_at,
     )
 
