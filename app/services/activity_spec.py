@@ -150,6 +150,10 @@ class InspectionSpec(BaseModel):
             raise ValueError("Usa al menos 2 decisiones distintas como respuesta: si todas son iguales no hay reto.")
         if self.scene == "truck" and len(self.items) % 2:
             raise ValueError("En el camión las llantas van por pares (izquierda y derecha de cada eje).")
+        if self.scene == "truck" and any(item.look == "none" for item in self.items):
+            raise ValueError("En el camión cada llanta necesita cómo se ve (su desgaste o daño).")
+        if any(len({fact.label for fact in item.facts}) != len(item.facts) for item in self.items):
+            raise ValueError("Un elemento tiene dos datos con el mismo nombre.")
         return self
 
 

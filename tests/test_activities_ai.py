@@ -143,3 +143,6 @@ def test_tires_that_don_t_pair_up_are_drafted_as_cards():
     odd = inspection.model_copy(update={"inspect_items": inspection.inspect_items[:3]})
     assert designer.to_activity(odd)["spec"]["scene"] == "cards"
     assert designer.to_activity(inspection)["spec"]["scene"] == "truck"
+    plain = inspection.model_copy(update={"inspect_items": [
+        tire.model_copy(update={"look": "none"}) for tire in inspection.inspect_items]})
+    assert {item["look"] for item in designer.to_activity(plain)["spec"]["items"]} == {"even"}  # drawn on the truck

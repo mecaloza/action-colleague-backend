@@ -6,6 +6,7 @@ canonical slide and question formats and drops anything that does not validate, 
 inventing placeholder content.
 """
 
+import logging
 import math
 import re
 import unicodedata
@@ -34,6 +35,8 @@ from app.services.slides.spec import (
     visible_points,
 )
 from app.services.slides.icons import ICONS
+
+logger = logging.getLogger(__name__)
 
 LANGUAGE_NAMES = {"es": "español latinoamericano", "en": "English", "pt": "português do Brasil"}
 WORDS_PER_MINUTE = 150  # narration pace
@@ -546,6 +549,8 @@ def _inspection_spec(draft: ActivityDraft) -> dict:
               "answer": f"v{item.answer + 1}" if 0 <= item.answer < len(verdicts) else ""}
              for n, item in enumerate(draft.inspect_items[:10])]
     truck = draft.scene == "truck" and len(items) % 2 == 0  # tires go in pairs: else, cards
+    if truck:  # every tire on the truck is drawn: one "with nothing to see" wore evenly
+        items = [{**item, "look": "even" if item["look"] == "none" else item["look"]} for item in items]
     return {"prompt": _clip(draft.inspection_prompt, 200), "scene": "truck" if truck else "cards",
             "verdicts": verdicts, "items": items}
 
@@ -588,7 +593,8 @@ def to_activity(draft: ActivityDraft) -> dict | None:
         return None
     try:
         spec = parse_spec(draft.type, _activity_spec(draft)).model_dump()
-    except SpecError:
+    except SpecError as exc:
+        logger.info("activity_draft_dropped", extra={"type": draft.type, "reason": str(exc)})
         return None
     return {"type": draft.type, "title": title, "intro": _clip(draft.intro, 600), "spec": spec}
 

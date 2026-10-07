@@ -75,9 +75,8 @@ def test_an_inspection_reveals_each_answer_only_after_deciding():
     assert not wrong.result["correct"] and wrong.result["lives"] == 2 and wrong.result["streak"] == 0
     assert wrong.result["item"]["outcome"]["answer_label"] == "Reencauchar"
     assert wrong.result["item"]["chosen"] == "rodar" and wrong.result["score"] == 10
-    with pytest.raises(GameError, match="Ya decidiste") as already:
-        engine.move(activity, attempt, {"item": "l1", "verdict": "retirar"}, SECRET)
-    assert already.value.status == 409
+    again = engine.move(activity, attempt, {"item": "l1", "verdict": "retirar"}, SECRET)  # sent twice
+    assert again.result["repeated"] and again.result["correct"] and again.result["score"] == 10  # the first stands
     engine.move(activity, attempt, {"item": "l3", "verdict": "retirar"}, SECRET)
     last = engine.move(activity, attempt, {"item": "l4", "verdict": "rodar"}, SECRET)
     assert last.done and last.result["score"] == 10 + 10 + 12 and last.result["streak"] == 2

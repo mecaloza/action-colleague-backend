@@ -3,7 +3,8 @@ The game engine of the interactive activities: what a learner sees, how each mov
 
 Everything is decided here, on the server, from the activity's `spec` and the attempt's `state`. The learner only
 receives what they have already earned: the current situation of a conversation (not where each choice leads), the
-answers to the inspection items they already decided on, the pairs they matched. Choices and quick cards travel as
+answers to the inspection items they already decided on (all of them once the play is over: a lost inspection
+teaches what was missed, so its replay is practice more than a test), the pairs they matched. Choices and quick cards travel as
 opaque tokens, different for every attempt, so a token copied from someone else's play means nothing.
 
 `start` builds a fresh state; `view` shows it; `move` grades one play; `finish` closes the attempt. Narration lines
@@ -282,8 +283,10 @@ def _inspect(spec: InspectionSpec, state: dict, payload: dict) -> Move:
     verdict = payload.get("verdict")
     if not any(option.id == verdict for option in spec.verdicts):
         raise GameError("Esa decisión no es de esta inspección.")
-    if item.id in state["decided"]:
-        raise GameError("Ya decidiste sobre ese elemento.", status=409)
+    if item.id in state["decided"]:  # sent twice (a retry, a double tap): the first decision stands
+        return Move({"repeated": True, "correct": state["decided"][item.id] == item.answer, "points": 0,
+                     "lives": state["lives"], "streak": state["streak"], "item": _item_view(spec, item, state)},
+                    done=False)
     state["decided"][item.id] = verdict
     correct = verdict == item.answer
     points = 0

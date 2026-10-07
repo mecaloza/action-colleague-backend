@@ -118,6 +118,8 @@ def test_a_conversation_is_at_most_four_steps_deep():
     (lambda s: s.update(verdicts=s["verdicts"][:1]), "verdicts"),
     (lambda s: s["items"][0].update(facts=[]), "facts"),
     (lambda s: s["items"][0].update(look="pinchada"), "look"),
+    (lambda s: s["items"][0].update(look="none"), "cómo se ve"),
+    (lambda s: s["items"][0]["facts"].append({"label": "Profundidad", "value": "1 mm"}), "mismo nombre"),
 ])
 def test_an_inspection_decides_on_each_item_among_its_verdicts(change, message):
     spec = copy.deepcopy(INSPECTION)
