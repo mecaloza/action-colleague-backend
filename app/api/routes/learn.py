@@ -1,4 +1,4 @@
-"""Learner endpoints: my courses, the course player, quizzes and module completion."""
+"""Learner endpoints: my courses, the course player, quizzes, interactive activities and module completion."""
 
 import json
 
@@ -8,8 +8,13 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
 from app.core.config import get_settings
-from app.db.models import Course, Enrollment, EvaluationAttempt, Module, User
+from app.db.models import Activity, ActivityAttempt, Course, Enrollment, EvaluationAttempt, Module, User
 from app.schemas.learn import (
+    ActivityFinishOut,
+    ActivityMoveIn,
+    ActivityMoveOut,
+    ActivityPlay,
+    ActivityStart,
     AttemptCreate,
     AttemptResult,
     CompletionResult,
@@ -19,6 +24,7 @@ from app.schemas.learn import (
     PositionUpdate,
     QuestionResult,
 )
+from app.services import activities as engine
 from app.services import progress, quiz
 from app.services.learner_views import course_player_detail, learner_course
 from app.services.media import MediaResolver
@@ -168,7 +174,7 @@ def submit_quiz(
     record.score = max(record.score or 0, graded["score"])
     if passed:
         record.passed = True
-        progress.mark_completed(record)
+        progress.complete_if_done(state, record, has_quiz=True)  # its activities may still be pending
     progress.refresh_enrollment(db, enrollment)
     db.commit()
 
@@ -183,8 +189,8 @@ def submit_quiz(
         attempts_used=attempt_number,
         attempts_remaining=max(max_attempts - attempt_number, 0),
         results=_learner_results(graded["results"], reveal),
-        module_completed=passed,
-        next_module_id=_next_module_id(states, module_id) if passed else None,
+        module_completed=bool(record.completed),
+        next_module_id=_next_module_id(states, module_id) if record.completed else None,
         course_completed=enrollment.status == "completed",
     )
 
@@ -194,6 +200,8 @@ def complete_module(module_id: int, db: Session = Depends(get_db), user: User = 
     enrollment, state, states = _unlocked_module(db, user, module_id)
     if quiz.evaluation_questions(state.evaluation):
         raise HTTPException(status.HTTP_409_CONFLICT, "Este módulo se completa aprobando su evaluación")
+    if state.pending_activities:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Completa las actividades del módulo para terminarlo")
     record = progress.get_or_create_progress(db, enrollment, state.module)
     progress.mark_completed(record)
     progress.refresh_enrollment(db, enrollment)
@@ -222,3 +230,112 @@ def save_position(
     )
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ── Interactive activities ────────────────────────────────────────────
+
+
+def _activity_secret() -> str:
+    return engine.activity_secret(get_settings().jwt_secret)
+
+
+def _lines(data: object) -> list[str]:
+    """The narration keys a response reveals: every "line" in it (the situation, a consequence, a zone...)."""
+    if isinstance(data, dict):
+        return [line for key, value in data.items() for line in ([value] if key == "line" else _lines(value))
+                if isinstance(line, str)]
+    if isinstance(data, list):
+        return [line for item in data for line in _lines(item)]
+    return []
+
+
+def _narration(db: Session, activity: Activity, keys: list[str]) -> dict[str, str]:
+    """Signed audio URLs for these lines (those with a voice clip)."""
+    clips = {key: (activity.narration or {}).get(key, {}).get("asset_id") for key in dict.fromkeys(keys)}
+    media = MediaResolver(db).prepare(extra_asset_ids=clips.values())
+    return {key: url for key, asset_id in clips.items() if (url := media.url(asset_id))}
+
+
+def _engine_errors(exc: engine.GameError) -> HTTPException:
+    return HTTPException(exc.status, str(exc))
+
+
+def _playable_activity(db: Session, user: User, activity_id: int):
+    activity = db.get(Activity, activity_id)
+    if activity is None or activity.status != "ready":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, NO_ACCESS)
+    enrollment, state, states = _unlocked_module(db, user, activity.module_id)
+    return activity, enrollment, state, states
+
+
+def _own_attempt(db: Session, user: User, attempt_id: int) -> ActivityAttempt:
+    # Locked: two taps at once can't both score the same zone or the same pair.
+    attempt = db.query(ActivityAttempt).filter(ActivityAttempt.id == attempt_id).with_for_update().first()
+    if attempt is None or attempt.user_id != user.id or attempt.enrollment_id is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, NO_ACCESS)
+    return attempt
+
+
+@router.post("/activities/{activity_id}/attempts", response_model=ActivityPlay)
+def start_activity(
+    activity_id: int, payload: ActivityStart, db: Session = Depends(get_db), user: User = Depends(get_current_user)
+):
+    """Start a play, or resume the one left open on the same version (a reload doesn't restart the game)."""
+    activity, enrollment, _, _ = _playable_activity(db, user, activity_id)
+    attempt = (
+        db.query(ActivityAttempt)
+        .filter(ActivityAttempt.activity_id == activity.id, ActivityAttempt.enrollment_id == enrollment.id,
+                ActivityAttempt.version == activity.version, ActivityAttempt.finished_at.is_(None))
+        .order_by(ActivityAttempt.id.desc())
+        .first()
+    )
+    try:
+        if attempt is None:
+            attempt = ActivityAttempt(activity_id=activity.id, user_id=user.id, enrollment_id=enrollment.id,
+                                      version=activity.version, state=engine.start(activity, untimed=payload.untimed),
+                                      max_score=engine.max_score(activity), score=0)
+            db.add(attempt)
+            db.flush()
+        view = engine.view(activity, attempt, _activity_secret())
+    except engine.GameError as exc:
+        raise _engine_errors(exc) from exc
+    db.commit()
+    keys = ["intro", *_lines(view)]
+    return ActivityPlay(attempt_id=attempt.id, activity_id=activity.id, view=view,
+                        narration=_narration(db, activity, keys))
+
+
+@router.post("/activity-attempts/{attempt_id}/moves", response_model=ActivityMoveOut)
+def play_move(
+    attempt_id: int, payload: ActivityMoveIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)
+):
+    attempt = _own_attempt(db, user, attempt_id)
+    activity, _, _, _ = _playable_activity(db, user, attempt.activity_id)
+    try:
+        outcome = engine.move(activity, attempt, payload.move, _activity_secret())
+    except engine.GameError as exc:
+        raise _engine_errors(exc) from exc
+    db.commit()
+    return ActivityMoveOut(result=outcome.result, done=outcome.done,
+                           narration=_narration(db, activity, _lines(outcome.result)))
+
+
+@router.post("/activity-attempts/{attempt_id}/finish", response_model=ActivityFinishOut)
+def finish_activity(attempt_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    attempt = _own_attempt(db, user, attempt_id)
+    activity, enrollment, state, states = _playable_activity(db, user, attempt.activity_id)
+    try:
+        result = engine.finish(activity, attempt)
+    except engine.GameError as exc:
+        raise _engine_errors(exc) from exc
+    state.best_scores[activity.id] = max(attempt.score, state.best_scores.get(activity.id, 0))
+    record = progress.get_or_create_progress(db, enrollment, state.module, lock=True)
+    progress.complete_if_done(state, record, has_quiz=bool(quiz.evaluation_questions(state.evaluation)))
+    progress.refresh_enrollment(db, enrollment)
+    db.commit()
+    return ActivityFinishOut(
+        **result,
+        module_completed=bool(record.completed),
+        next_module_id=_next_module_id(states, state.module.id) if record.completed else None,
+        course_completed=enrollment.status == "completed",
+    )

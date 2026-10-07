@@ -3,17 +3,18 @@ Learner progress: which modules are unlocked or completed, and the enrollment's 
 
 Modules unlock sequentially: a module is available once every previous module is completed.
 A module with an evaluation is completed by passing it; a module without one is completed
-explicitly by the learner (after watching or reading it). This is the only place that decides.
+explicitly by the learner (after watching or reading it). Either way, a module with interactive
+activities also needs each of them played to the end (any score). This is the only place that decides.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from sqlalchemy import case, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, contains_eager, selectinload
 
-from app.db.models import Course, Enrollment, Evaluation, Module, ModuleProgress
+from app.db.models import Activity, ActivityAttempt, Course, Enrollment, Evaluation, Module, ModuleProgress
 from app.services.metrics import percentage
 
 
@@ -23,6 +24,12 @@ class ModuleState:
     progress: ModuleProgress | None
     evaluation: Evaluation | None
     unlocked: bool
+    activities: list[Activity] = field(default_factory=list)  # the published ones, in order
+    best_scores: dict[int, int] = field(default_factory=dict)  # finished activity id -> best score
+
+    @property
+    def pending_activities(self) -> list[Activity]:
+        return [activity for activity in self.activities if activity.id not in self.best_scores]
 
     @property
     def completed(self) -> bool:
@@ -66,6 +73,31 @@ def evaluations_by_module(db: Session, modules: list[Module]) -> dict[int, Evalu
     return {evaluation.module_id: evaluation for evaluation in evaluations}
 
 
+def ready_activities(db: Session, modules: list[Module]) -> dict[int, list[Activity]]:
+    """The published activities of these modules, by module id, in their order."""
+    if not modules:
+        return {}
+    rows = (
+        db.query(Activity)
+        .filter(Activity.module_id.in_([m.id for m in modules]), Activity.status == "ready")
+        .order_by(Activity.order, Activity.id)
+    )
+    by_module: dict[int, list[Activity]] = {}
+    for activity in rows:
+        by_module.setdefault(activity.module_id, []).append(activity)
+    return by_module
+
+
+def activity_best_scores(db: Session, enrollment: Enrollment) -> dict[int, int]:
+    """The learner's best score in each activity they played to the end."""
+    rows = (
+        db.query(ActivityAttempt.activity_id, func.max(ActivityAttempt.score))
+        .filter(ActivityAttempt.enrollment_id == enrollment.id, ActivityAttempt.finished_at.isnot(None))
+        .group_by(ActivityAttempt.activity_id)
+    )
+    return {activity_id: int(best or 0) for activity_id, best in rows}
+
+
 def module_states(
     db: Session, enrollment: Enrollment, evaluations: dict[int, Evaluation] | None = None
 ) -> list[ModuleState]:
@@ -74,12 +106,15 @@ def module_states(
     records = {record.module_id: record for record in enrollment.module_progress}
     if evaluations is None:
         evaluations = evaluations_by_module(db, modules)
+    activities = ready_activities(db, modules)
+    best = activity_best_scores(db, enrollment) if activities else {}
     states: list[ModuleState] = []
     unlocked = True
     for module in modules:
         record = records.get(module.id)
         # What the learner already completed stays open, even if a reorder put it after a pending module.
-        state = ModuleState(module, record, evaluations.get(module.id), unlocked or bool(record and record.completed))
+        state = ModuleState(module, record, evaluations.get(module.id), unlocked or bool(record and record.completed),
+                            activities.get(module.id, []), best)
         states.append(state)
         unlocked = unlocked and state.completed
     return states
@@ -89,8 +124,10 @@ def preview_states(db: Session, course: Course) -> list[ModuleState]:
     """Every module unlocked and no progress: the course as an admin previews it."""
     modules = ordered_modules(course)
     evaluations = evaluations_by_module(db, modules)
+    activities = ready_activities(db, modules)
     return [
-        ModuleState(module=module, progress=None, evaluation=evaluations.get(module.id), unlocked=True)
+        ModuleState(module=module, progress=None, evaluation=evaluations.get(module.id), unlocked=True,
+                    activities=activities.get(module.id, []))
         for module in modules
     ]
 
@@ -116,6 +153,15 @@ def get_or_create_progress(db: Session, enrollment: Enrollment, module: Module, 
     except IntegrityError:  # created by a concurrent request (unique enrollment + module)
         record = query.one()
     return record
+
+
+def complete_if_done(state: ModuleState, record: ModuleProgress, has_quiz: bool) -> bool:
+    """Complete the module once nothing is left: its quiz passed (if it has one) and every activity played.
+    A module without a quiz completes here only through its activities (else the learner marks it done)."""
+    if state.pending_activities or (has_quiz and not record.passed) or (not has_quiz and not state.activities):
+        return False
+    mark_completed(record)
+    return True
 
 
 def mark_completed(record: ModuleProgress) -> None:

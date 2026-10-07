@@ -6,11 +6,13 @@ from app.db.models import Course, Enrollment
 from app.schemas.learn import (
     LearnerCourse,
     LearnerCourseDetail,
+    LearnerActivitySummary,
     LearnerCourseInfo,
     LearnerEnrollment,
     LearnerModule,
     QuizSummary,
 )
+from app.services import activities as activity_engine
 from app.services import quiz
 from app.services.media import MediaResolver
 from app.services.metrics import percentage
@@ -72,7 +74,23 @@ def _learner_module(state: ModuleState, media: MediaResolver) -> LearnerModule:
         content_text=(module.content_text or "") if unlocked else None,
         last_position_seconds=(state.progress.last_position_seconds or 0) if state.progress else 0,
         quiz=quiz_summary(state),
+        activities=_activity_summaries(state) if unlocked else [],
     )
+
+
+def _activity_summaries(state: ModuleState) -> list[LearnerActivitySummary]:
+    return [
+        LearnerActivitySummary(
+            id=activity.id,
+            type=activity.type,
+            title=activity.title,
+            intro=activity.intro,
+            finished=activity.id in state.best_scores,
+            best_score=state.best_scores.get(activity.id),
+            max_score=activity_engine.max_score(activity),
+        )
+        for activity in state.activities
+    ]
 
 
 def _learner_enrollment(enrollment: Enrollment) -> LearnerEnrollment:
