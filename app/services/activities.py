@@ -7,8 +7,9 @@ answers to the inspection items they already decided on (all of them once the pl
 teaches what was missed, so its replay is practice more than a test), the pairs they matched. Choices and quick cards travel as
 opaque tokens, different for every attempt, so a token copied from someone else's play means nothing.
 
-`start` builds a fresh state; `view` shows it; `move` grades one play; `finish` closes the attempt. Narration lines
-are named by keys (`line_keys`) that the voice job and the learner's player share.
+`start` builds a fresh state; `view` shows it; `move` grades one play; `finish` closes the attempt. An open attempt
+the learner comes back to is picked up only while it can go on (`resumable`). Narration lines are named by keys
+(`line_keys`) that the voice job and the learner's player share.
 """
 
 import hashlib
@@ -154,6 +155,7 @@ def view(activity: Activity, attempt: ActivityAttempt, secret: str, now: datetim
             "max_score": attempt.max_score, "done": state["done"]}
     match spec:
         case DecisionSpec():
+            # The steps taken, as told after each choice: who spoke, the points won and the best ones on offer.
             return {**base, "step": len(state["path"]) + 1, "path": state["path"],
                     "node": None if state["done"] else _node_view(spec, state["node"], attempt.id, secret)}
         case InspectionSpec():
@@ -265,12 +267,15 @@ def _decide(spec: DecisionSpec, state: dict, payload: dict, attempt_id: int, sec
         _token(secret, attempt_id, f"choice:{node.id}", c.id), token)), None)
     if choice is None:
         raise GameError("Esa opción no es de esta situación.")
+    # What the best answer to this situation was worth: told only now, so the learner sees how close they were.
+    best = max(option.points for option in node.choices)
     state["score"] += choice.points
-    state["path"].append({"situation": node.situation, "choice": choice.text, "feedback": choice.feedback,
-                          "points": choice.points, "line": f"{node.id}.{choice.id}"})
+    state["path"].append({"situation": node.situation, "speaker": node.speaker, "choice": choice.text,
+                          "feedback": choice.feedback, "points": choice.points, "best_points": best,
+                          "line": f"{node.id}.{choice.id}"})
     if choice.next:
         state["node"] = choice.next
-    result = {"choice": choice.text, "feedback": choice.feedback, "points": choice.points,
+    result = {"choice": choice.text, "feedback": choice.feedback, "points": choice.points, "best_points": best,
               "line": f"{node.id}.{choice.id}",
               "next": _node_view(spec, choice.next, attempt_id, secret) if choice.next else None}
     return Move(result, done=not choice.next)
@@ -385,11 +390,36 @@ def finish(activity: Activity, attempt: ActivityAttempt, now: datetime | None = 
                  and (now or utcnow()) > datetime.fromisoformat(state["deadline"]))
     if not state["done"] and not timed_out:
         raise GameError("La partida todavía no termina.", status=409)
-    state["done"] = True
-    attempt.finished_at = now or utcnow()
-    attempt.score = _shown(state, attempt)
-    flag_modified(attempt, "state")
+    close(attempt, now)
     return {"score": attempt.score, "max_score": attempt.max_score}
+
+
+def close(attempt: ActivityAttempt, now: datetime | None = None) -> None:
+    """End a play with the score it has, as a finished play (what `finish` does once it is allowed)."""
+    attempt.state["done"] = True
+    attempt.finished_at = now or utcnow()
+    attempt.score = _shown(attempt.state, attempt)
+    flag_modified(attempt, "state")
+
+
+def resumable(activity: Activity, attempt: ActivityAttempt, now: datetime | None = None) -> bool:
+    """Whether an open play can go on: started on the current version, not over yet and, a quick challenge with a
+    clock, still within its time (plus the grace a late move gets). Any other open play is stale."""
+    state = attempt.state
+    if attempt.finished_at is not None or attempt.version != activity.version or state["done"]:
+        return False
+    deadline = state.get("deadline") if activity.type == "quick" else None
+    if not deadline:
+        return True
+    return (now or utcnow()) <= datetime.fromisoformat(deadline) + timedelta(seconds=QUICK_GRACE_SECONDS)
+
+
+def played(attempt: ActivityAttempt) -> bool:
+    """Whether a play had at least one move: a choice, a decision, a try, a match or a mistake (or it is over).
+    A stale play with a move is closed with its score (it counts, as when the clock runs out); one without, deleted."""
+    state = attempt.state
+    return bool(state["done"] or state.get("path") or state.get("decided") or state.get("tries")
+                or state.get("solved") or state.get("mistakes"))
 
 
 # ── Narration ─────────────────────────────────────────────────────────

@@ -9,7 +9,7 @@ import pytest
 from app.db.models import Activity, ActivityAttempt
 from app.services import activities as engine
 from app.services.activities import GameError
-from tests.test_activity_spec import DECISION, INSPECTION, QUICK_MATCH, QUICK_ORDER, SIMULATOR
+from tests.test_activity_spec import DECISION, INSPECTION, QUICK_MATCH, QUICK_ORDER, SIMULATOR, VALID
 
 SECRET = engine.activity_secret("test-secret")
 NOW = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
@@ -27,7 +27,8 @@ def play(kind: str, spec: dict, attempt_id: int = 1, untimed: bool = False, titl
 def secrets_in(view: dict) -> set[str]:
     """Answer keys that must never reach the learner before they act."""
     text = json.dumps(view, ensure_ascii=False)
-    return {word for word in ('"points"', '"next"', '"answer"', '"feedback"', '"explanation"') if word in text}
+    keys = ('"points"', '"best_points"', '"next"', '"answer"', '"feedback"', '"explanation"')
+    return {word for word in keys if word in text}
 
 
 # ── Decisión con cliente ──────────────────────────────────────────────
@@ -48,6 +49,22 @@ def test_a_conversation_shows_only_the_current_situation_and_scores_each_choice(
     last = engine.move(activity, attempt, {"choice": cpk}, SECRET)
     assert last.done and last.result["score"] == 10 == attempt.max_score
     assert engine.finish(activity, attempt, now=NOW) == {"score": 10, "max_score": 10}
+
+
+def test_a_choice_tells_what_the_best_answer_was_worth_only_once_made():
+    activity, attempt = play("decision", DECISION)
+    ask = next(c["token"] for c in engine.view(activity, attempt, SECRET)["node"]["choices"]
+               if c["text"].startswith("¿Qué ruta"))
+    step = engine.move(activity, attempt, {"choice": ask}, SECRET)
+    assert step.result["points"] == step.result["best_points"] == 6  # the best answer: shown in green
+    assert secrets_in(step.result["next"]) == set()  # nothing yet of the situation ahead
+
+    brand = next(c["token"] for c in step.result["next"]["choices"] if c["text"].startswith("Le hablo"))
+    last = engine.move(activity, attempt, {"choice": brand}, SECRET)
+    assert (last.result["points"], last.result["best_points"]) == (1, 4)
+    # A reload shows the steps taken as they were told: who spoke, the points and the best ones.
+    path = engine.view(activity, attempt, SECRET)["path"]
+    assert [(s["speaker"], s["points"], s["best_points"]) for s in path] == [("Cliente", 6, 6), ("Cliente", 1, 4)]
 
 
 def test_a_choice_from_another_play_or_situation_is_refused():
@@ -173,6 +190,56 @@ def test_a_quick_challenge_after_its_deadline_is_over():
 
 
 # ── Any activity ──────────────────────────────────────────────────────
+
+
+def test_an_open_play_goes_on_only_on_its_version_before_it_ends_and_within_its_time():
+    activity, attempt = play("quick", QUICK_MATCH)  # 45 s from NOW
+    grace = timedelta(seconds=45 + engine.QUICK_GRACE_SECONDS)
+    assert engine.resumable(activity, attempt, now=NOW + grace)  # a late move would still count
+    assert not engine.resumable(activity, attempt, now=NOW + grace + timedelta(seconds=1))
+    untimed_activity, untimed = play("quick", QUICK_MATCH, untimed=True)
+    assert engine.resumable(untimed_activity, untimed, now=NOW + timedelta(days=2))
+
+    conversation, talk = play("decision", DECISION)
+    assert engine.resumable(conversation, talk, now=NOW)
+    conversation.version = 2
+    assert not engine.resumable(conversation, talk, now=NOW)  # edited since: it must start again
+    conversation.version = 1
+    price = next(c["token"] for c in engine.view(conversation, talk, SECRET)["node"]["choices"]
+                 if c["text"].startswith("Le doy"))
+    engine.move(conversation, talk, {"choice": price}, SECRET)
+    assert not engine.resumable(conversation, talk, now=NOW)  # over: nothing left to play
+
+
+def _first_move(kind: str, view: dict) -> dict:
+    """Any move of each kind (right or wrong: a mistake is a move too)."""
+    match kind:
+        case "decision":
+            return {"choice": view["node"]["choices"][0]["token"]}
+        case "inspection":
+            return {"item": view["items"][0]["id"], "verdict": view["verdicts"][-1]["id"]}
+        case "simulator":
+            return {"values": {"precio": 12000, "km": 60000}}
+        case "quick":
+            return {"card": view["cards"][0]["token"], "answer": view["answers"][0]["token"]}
+
+
+@pytest.mark.parametrize("kind", list(VALID))
+def test_a_play_counts_as_played_from_its_first_move(kind):
+    activity, attempt = play(kind, VALID[kind])
+    assert not engine.played(attempt)
+    engine.move(activity, attempt, _first_move(kind, engine.view(activity, attempt, SECRET, now=NOW)), SECRET, now=NOW)
+    assert engine.played(attempt)
+
+
+def test_a_stale_play_is_closed_with_the_score_it_has():
+    activity, attempt = play("quick", QUICK_MATCH)
+    pairs = _pairs(engine.view(activity, attempt, SECRET, now=NOW))
+    card = next(iter(pairs))
+    engine.move(activity, attempt, {"card": card, "answer": pairs[card]}, SECRET, now=NOW)
+    later = NOW + timedelta(minutes=5)
+    engine.close(attempt, now=later)
+    assert (attempt.finished_at, attempt.score, attempt.state["done"]) == (later, 10, True)
 
 
 def test_a_play_on_an_edited_activity_must_start_again():

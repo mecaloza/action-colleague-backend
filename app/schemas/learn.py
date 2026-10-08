@@ -39,6 +39,7 @@ class LearnerActivitySummary(BaseModel):
     finished: bool
     best_score: int | None = None
     max_score: int
+    resumable: bool  # an open play that can go on: starting the activity picks it up where it was left
 
 
 class LearnerModule(BaseModel):
@@ -164,6 +165,7 @@ class ActivityPlay(BaseModel):
     view: dict[str, Any]
     narration: dict[str, str]  # line key -> audio URL, for the lines this response reveals
     image_url: str | None = None  # a reference photo shown during the play, if the activity has one
+    resumed: bool = False  # the open play, picked up where it was left (an admin's preview always starts anew)
 
 
 class ActivityMoveIn(BaseModel):

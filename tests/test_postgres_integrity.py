@@ -8,8 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from sqlalchemy import text
 
-from app.db.models import Enrollment, Evaluation, EvaluationAttempt, ModuleProgress, User
+from app.db.models import ActivityAttempt, Enrollment, Evaluation, EvaluationAttempt, ModuleProgress, User
 from tests.conftest import QueryCounter, auth_headers
+from tests.test_activity_spec import DECISION
 
 QUESTION = {"id": "q1", "type": "true_false", "prompt": "El casco es obligatorio", "correct": True, "explanation": ""}
 
@@ -318,6 +319,93 @@ def test_deleting_a_module_waits_for_a_submission_in_flight(client, db, session_
     assert not errors, errors  # foreign key violation on evaluations, before
     db.expire_all()
     assert db.query(EvaluationAttempt).count() == 0 and db.query(Evaluation).count() == 0
+
+
+@pytest.mark.parametrize("moved", [False, True])
+def test_two_taps_on_start_close_a_stale_play_once(
+    client, db, session_factory, admin, collaborator, monkeypatch, moved
+):
+    """A play left open on an older version: both requests find it and want to close it (deleted if untouched,
+    counted if it had a move). The second waits for the first one's lock and finds nothing left to close."""
+    from app.api.routes import learn
+    from app.schemas.learn import ActivityStart
+    from app.services import activities
+
+    admin_headers = auth_headers(client, admin.email)
+    _, (module_id,) = _course(client, admin_headers, collaborator, quiz=False)
+    activity = client.post(f"/api/v1/modules/{module_id}/activities", headers=admin_headers,
+                           json={"type": "decision", "title": "Cliente", "spec": DECISION, "status": "ready"}).json()
+    learner = auth_headers(client, collaborator.email)
+    play = client.post(f"/api/v1/learn/activities/{activity['id']}/attempts", headers=learner, json={}).json()
+    if moved:
+        client.post(f"/api/v1/learn/activity-attempts/{play['attempt_id']}/moves", headers=learner,
+                    json={"move": {"choice": play["view"]["node"]["choices"][0]["token"]}})
+    client.put(f"/api/v1/activities/{activity['id']}", headers=admin_headers, json={"title": "Cliente difícil"})
+    paused, release = threading.Event(), threading.Event()
+    played, closing = activities.played, []
+
+    def slow_played(attempt):
+        closing.append(attempt.id)
+        if not paused.is_set():  # the first request holds the stale play's lock
+            paused.set()
+            release.wait(5)
+        return played(attempt)
+
+    monkeypatch.setattr(activities, "played", slow_played)
+
+    def start(session):
+        learn.start_activity(activity["id"], ActivityStart(), db=session, user=session.get(User, collaborator.id))
+
+    errors = _race(session_factory, start, start, paused=paused, release=release)
+
+    assert not errors, errors
+    assert closing == [play["attempt_id"]]  # without the lock, both close it: deleted (or counted) twice
+    db.expire_all()
+    stale = db.get(ActivityAttempt, play["attempt_id"])
+    if moved:
+        assert stale.finished_at is not None and db.query(Enrollment).one().status == "completed"
+    else:
+        assert stale is None
+
+
+def test_deleting_an_activity_waits_for_a_start_closing_its_stale_play(
+    client, db, session_factory, admin, collaborator, monkeypatch
+):
+    """The start holds the stale play and its new play needs the activity (a foreign key); the delete holds the
+    activity and its cascade needs that play. Both lock the activity first, so the delete waits: no deadlock."""
+    from app.api.routes import activities as admin_activities
+    from app.api.routes import learn
+    from app.schemas.learn import ActivityStart
+    from app.services import activities
+
+    admin_headers = auth_headers(client, admin.email)
+    _, (module_id,) = _course(client, admin_headers, collaborator, quiz=False)
+    activity = client.post(f"/api/v1/modules/{module_id}/activities", headers=admin_headers,
+                           json={"type": "decision", "title": "Cliente", "spec": DECISION, "status": "ready"}).json()
+    client.post(f"/api/v1/learn/activities/{activity['id']}/attempts", headers=auth_headers(client, collaborator.email),
+                json={})
+    client.put(f"/api/v1/activities/{activity['id']}", headers=admin_headers, json={"title": "Cliente difícil"})
+    paused, release = threading.Event(), threading.Event()
+    played = activities.played
+
+    def slow_played(attempt):
+        paused.set()  # the start holds the stale play
+        release.wait(5)
+        return played(attempt)
+
+    monkeypatch.setattr(activities, "played", slow_played)
+
+    errors = _race(
+        session_factory,
+        lambda s: learn.start_activity(activity["id"], ActivityStart(), db=s, user=s.get(User, collaborator.id)),
+        lambda s: admin_activities.delete_activity(activity["id"], db=s),
+        paused=paused,
+        release=release,
+    )
+
+    assert not errors, errors  # DeadlockDetected, before
+    db.expire_all()
+    assert db.query(ActivityAttempt).count() == 0  # the new play went with the activity
 
 
 def test_modules_added_at_once_by_two_admins_both_count(client, db, session_factory, admin, collaborator, monkeypatch):
