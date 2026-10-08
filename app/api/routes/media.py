@@ -33,8 +33,8 @@ from app.schemas.media import (
     UploadCreate,
     UploadCreated,
 )
-from app.services.course_views import course_detail, module_admin
-from app.services.media import MediaResolver, discard_assets
+from app.services.course_views import course_detail, module_out
+from app.services.media import discard_assets
 from app.services.media_views import asset_out, assets_out, job_out
 from app.services.storage import LocalStorage, StorageError, get_storage, read_local_token
 from app.worker import queue
@@ -221,10 +221,6 @@ def get_asset(asset_id: str, db: Session = Depends(get_db)):
     return asset_out(db, _asset_or_404(db, asset_id))
 
 
-def _module_out(db: Session, module: Module) -> ModuleAdmin:
-    return module_admin(module, MediaResolver(db).prepare(modules=[module]), module.evaluation)
-
-
 @router.delete("/modules/{module_id}/video", response_model=ModuleAdmin)
 def remove_module_video(module_id: int, db: Session = Depends(get_db)):
     module = module_or_404(db, module_id)
@@ -235,7 +231,7 @@ def remove_module_video(module_id: int, db: Session = Depends(get_db)):
         module.generation_status, module.generation_error = "pending", None
     db.flush()
     discard_assets(db, removed)
-    return _module_out(db, module)
+    return module_out(db, module)
 
 
 @router.delete("/modules/{module_id}/document", response_model=ModuleAdmin)
@@ -245,7 +241,7 @@ def remove_module_document(module_id: int, db: Session = Depends(get_db)):
     module.document_asset_id = None
     db.flush()
     discard_assets(db, removed)
-    return _module_out(db, module)
+    return module_out(db, module)
 
 
 @router.put("/courses/{course_id}/cover", response_model=CourseDetail)

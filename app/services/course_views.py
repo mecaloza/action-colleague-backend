@@ -14,7 +14,7 @@ from app.schemas.courses import (
     EvaluationSummary,
     ModuleAdmin,
 )
-from app.services import quiz
+from app.services import quiz, revisions
 from app.services.media import MediaResolver
 from app.services.metrics import percentage
 from app.services.progress import completed_enrollments, evaluations_by_module, ordered_modules
@@ -83,9 +83,12 @@ def course_summary(course: Course, counts: CourseCounts, cover_url: str | None) 
     )
 
 
-def module_admin(module: Module, media: MediaResolver, evaluation: Evaluation | None) -> ModuleAdmin:
+def module_admin(
+    module: Module, media: MediaResolver, evaluation: Evaluation | None, revision_pending: bool = False
+) -> ModuleAdmin:
     questions = quiz.evaluation_questions(evaluation)
     storyboard = module.storyboard or {}
+    ai_video = module.source == "ai" and bool(module.video_asset_id)
     return ModuleAdmin(
         id=module.id,
         course_id=module.course_id,
@@ -103,6 +106,8 @@ def module_admin(module: Module, media: MediaResolver, evaluation: Evaluation | 
         duration_seconds=module.duration_seconds,
         scene_count=len(storyboard.get("scenes", [])),
         video_warning=(storyboard.get("render") or {}).get("warning") if module.source == "ai" else None,
+        stale_scene_ids=revisions.stale_scene_ids(storyboard) if ai_video else [],
+        revision_pending=revision_pending,
         evaluation=(
             EvaluationSummary(
                 question_count=len(questions),
@@ -116,14 +121,21 @@ def module_admin(module: Module, media: MediaResolver, evaluation: Evaluation | 
     )
 
 
+def module_out(db: Session, module: Module) -> ModuleAdmin:
+    """One module as the editor shows it (e.g. right after it changed)."""
+    pending = module.id in revisions.pending_modules(db, [module.id])
+    return module_admin(module, MediaResolver(db).prepare(modules=[module]), module.evaluation, pending)
+
+
 def course_detail(db: Session, course: Course) -> CourseDetail:
     modules = ordered_modules(course)
     evaluations = evaluations_by_module(db, modules)
     media = MediaResolver(db).prepare(modules=modules, extra_asset_ids=[course.cover_asset_id])
     counts = course_counts(db, [course.id])[course.id]
     summary = course_summary(course, counts, media.url(course.cover_asset_id))
+    pending = revisions.pending_modules(db, [module.id for module in modules])
     return CourseDetail(
         **summary.model_dump(),
         settings=CourseSettings.model_validate(course.settings or {}),
-        modules=[module_admin(module, media, evaluations.get(module.id)) for module in modules],
+        modules=[module_admin(module, media, evaluations.get(module.id), module.id in pending) for module in modules],
     )

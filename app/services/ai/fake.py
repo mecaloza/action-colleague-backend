@@ -5,6 +5,7 @@ They produce schema-valid, deterministic content quickly, so every flow — outl
 quiz, narration, presenter, rendering — runs end to end with real FFmpeg and no network.
 """
 
+import json
 import re
 import subprocess
 import tempfile
@@ -24,8 +25,13 @@ def _topic(text: str) -> str:
     return " ".join(words[:5]).capitalize() or "Tema del curso"
 
 
+def _fenced_after(prompt: str, marker: str) -> str:
+    """The data block (between <<< and >>>) that follows `marker` in a prompt."""
+    return re.search(rf"{marker}[^\n]*\n<<<\n(.*?)\n>>>", prompt, re.S).group(1)
+
+
 class FakeLLM:
-    def structured(self, system, user, schema, max_tokens=8000):
+    def structured(self, system, user, schema, max_tokens=8000, usage=None):
         if schema is designer.CourseOutline:
             return self._outline(user)
         if schema is designer.ModuleDraft:
@@ -34,7 +40,41 @@ class FakeLLM:
             return designer.QuizDraft(quiz=self._questions())
         if schema is designer.ActivitiesDraft:
             return designer.ActivitiesDraft(activities=self._activities())
+        if schema is designer.StoryboardPatchDraft:
+            return self._storyboard_patch(user)
         raise NotImplementedError(schema.__name__)
+
+    def _storyboard_patch(self, prompt: str) -> designer.StoryboardPatchDraft:
+        """Retitles the scenes in scope ("Revisado: …"; without a scope, the first one). When the observation
+        mentions the narration ("narración") it also adds a sentence to theirs, the infographic ("infografía") asks
+        for another version of their visual, and the reading ("lectura") adds a line to it."""
+        scenes = json.loads(_fenced_after(prompt, "GUION ACTUAL"))
+        reading = _fenced_after(prompt, "LECTURA ACTUAL")
+        scope = prompt.split("ESCENAS EN ALCANCE:", 1)[1].split("\n", 1)[0].strip()
+        observation = prompt.split("OBSERVACIÓN DEL ADMINISTRADOR:", 1)[1].lower()
+        ids = [scenes[0]["id"]] if scope == "todas" else [scene_id.strip() for scene_id in scope.split(",")]
+        by_id = {scene["id"]: scene for scene in scenes}
+        changes = []
+        for scene_id in filter(by_id.__contains__, ids):
+            scene = by_id[scene_id]
+            fields, narration, visual = ["title"], scene.get("narration", ""), "keep"
+            if "narraci" in observation:
+                fields.append("narration")
+                narration = f"{narration} Revisa este punto con cuidado."
+            if "infograf" in observation:
+                fields.append("visual")
+                visual = "new_version"
+            changes.append(designer.SceneChangeDraft(
+                action="update", scene_id=scene_id, fields=fields, visual_action=visual,
+                scene=self._scene(scene.get("layout", "bullets"), f"Revisado: {scene.get('title', '')}", narration),
+                reason="Así lo pidió la observación.",
+            ))
+        changed_reading = "lectura" in observation
+        return designer.StoryboardPatchDraft(
+            summary=f"Ajusté {len(changes)} escena(s) según la observación.", changes=changes,
+            reading_changed=changed_reading, reading_summary=f"{reading}\n- Revisado." if changed_reading else "",
+            affected_question_ids=[], unresolved="",
+        )
 
     def _activities(self) -> list[designer.ActivityDraft]:
         """One activity of each kind."""

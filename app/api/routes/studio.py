@@ -44,7 +44,7 @@ from app.schemas.studio import (
     StoryboardScene,
     VoiceOut,
 )
-from app.services import studio
+from app.services import revisions, studio
 from app.services.course_views import ACTIVE_GENERATION, course_detail
 from app.services.media_views import job_out
 from app.services.progress import ordered_modules, refresh_course_enrollments
@@ -53,11 +53,10 @@ from app.services.slides.render import is_hero, render_png
 from app.services.slides.spec import SceneVisual, Slide, SlideContext
 from app.services.storage import StorageError, get_storage
 from app.services.video.avatar import AvatarError, get_avatar_provider
-from app.services.video.visuals import VisualRequest, cache_path, get_visuals
+from app.services.video.visuals import VisualRequest, cache_path, get_visuals, scene_prompt
 from app.services.video.voice import VoiceError, get_voice_provider
 from app.worker import queue
 from app.worker.jobs.recording import enqueue_transcription, voice_available
-from app.worker.jobs.render import scene_prompt
 
 router = APIRouter(tags=["studio"], dependencies=[Depends(require_admin)])
 logger = logging.getLogger(__name__)
@@ -291,7 +290,9 @@ def lint_storyboard(module_id: int, payload: StoryboardDraft, db: Session = Depe
 
 
 @router.put("/modules/{module_id}/storyboard", response_model=StoryboardOut)
-def save_storyboard(module_id: int, payload: Storyboard, db: Session = Depends(get_db)):
+def save_storyboard(
+    module_id: int, payload: Storyboard, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+):
     module = module_or_404(db, module_id)
     db.refresh(module, with_for_update=True)
     # A job would overwrite these edits, or produce the video of the old script.
@@ -304,7 +305,11 @@ def save_storyboard(module_id: int, payload: Storyboard, db: Session = Depends(g
     ids = [scene.id for scene in payload.scenes]
     if len(set(ids)) != len(ids):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Hay escenas repetidas")
+    before = revisions.script_content(module)
     module.storyboard = {**(module.storyboard or {}), "scenes": [scene.model_dump() for scene in payload.scenes]}
+    # Kept as a change of its own (nothing when the save changed nothing), so it can be undone.
+    revisions.record(db, module, source="manual", before=before, after=revisions.script_content(module),
+                     user_id=admin.id)
     studio.queue_visuals(db, module)  # a new or changed infographic is made now, for the preview
     db.commit()
     return _storyboard_out(db, module)

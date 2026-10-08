@@ -6,6 +6,7 @@ canonical slide and question formats and drops anything that does not validate, 
 inventing placeholder content.
 """
 
+import json
 import logging
 import math
 import re
@@ -119,10 +120,37 @@ class QuizDraft(BaseModel):
     quiz: list[QuestionDraft]
 
 
+# A change to a script names what it changes in each scene; the server takes only those fields (see
+# app.services.revisions, which also maps each one to the slide's keys).
+SceneField = Literal["layout", "title", "subtitle", "points", "icons", "icon", "stat", "quote", "comparison", "chart",
+                     "narration", "visual"]
+
+
+class SceneChangeDraft(BaseModel):
+    action: Literal["update", "insert_after", "delete"]
+    scene_id: str  # update / delete: that scene; insert_after: the scene the new one follows ("" = first)
+    fields: list[SceneField]  # update: the fields taken from `scene` (the others keep what the scene has)
+    scene: SceneDraft  # the new values of those fields; a new scene in full
+    visual_action: Literal["keep", "new_version", "new_prompt"]
+    reason: str  # one sentence for the admin
+
+
+class StoryboardPatchDraft(BaseModel):
+    """A change to a module's script by an admin's observation: only the scenes it touches, never the whole script."""
+
+    summary: str
+    changes: list[SceneChangeDraft]
+    reading_changed: bool
+    reading_summary: str  # the whole new reading, when it changes
+    affected_question_ids: list[str]  # the quiz's questions the new script may contradict
+    unresolved: str  # what the observation asks that could not be done, and why
+
+
 # ── Prompts ───────────────────────────────────────────────────────────
 
 # The offline FakeLLM reads a few markers back from these prompts ("BRIEF DEL ADMINISTRADOR:", "AUDIENCIA:",
-# "Exactamente N módulos", "MÓDULO N:", "lista vacía"): keep them when rewording.
+# "Exactamente N módulos", "MÓDULO N:", "lista vacía"; a revision's "GUION ACTUAL", "LECTURA ACTUAL",
+# "ESCENAS EN ALCANCE:" and "OBSERVACIÓN DEL ADMINISTRADOR:"): keep them when rewording.
 
 _SYSTEM = (
     "Eres un diseñador instruccional senior que crea cursos corporativos breves, prácticos y memorables. "
@@ -172,6 +200,50 @@ def _scenes_text(scenes: list[dict]) -> str:
 def _scene_count(minutes: int) -> int:
     """How many scenes a module of this duration needs, given the narration of each."""
     return max(MIN_SCENES, min(MAX_SCENES, round(minutes * WORDS_PER_MINUTE / WORDS_PER_SCENE)))
+
+
+# How every scene is written. The module's prompt and a revision's share them: a revised scene follows the same rules
+# as the scenes around it.
+_SCENE_RULES = """Cada escena es lo que se ve + lo que el presentador dice mientras se ve. El curso debe
+ENSEÑAR a hacer el trabajo: datos concretos (cifras, rangos, frecuencias, especificaciones), procedimientos paso a
+paso, cómo reconocer un problema, errores comunes y su costo. Nada genérico ("revisa regularmente"): di cuánto,
+cada cuándo, cómo y por qué. Usa los datos de los materiales; si das un dato que no está en ellos, que sea un
+estándar conocido del sector, y dilo así en la narración.
+- La primera escena usa layout "cover" (título del módulo + subtítulo con el beneficio para quien aprende).
+- La última usa "closing" (título + 3 conclusiones accionables en points).
+- Incluye SIEMPRE un caso práctico: layout "case" con points = [situación, diagnóstico, solución, resultado]
+  (en ese orden, sin escribir la etiqueta: la pantalla ya la pone; cada uno 1-2 frases con datos: tipo de flota, cifras, qué se observó, qué se hizo, qué mejoró).
+  La narración lo cuenta como una historia real del trabajo y cierra con la lección.
+- Para los conceptos técnicos clave (2-4 por módulo) usa layout "visual" con visual_kind "infographic": la
+  infografía ES la explicación (p. ej. cómo se desgasta la llanta según la presión, qué mide el indicador LCI, cómo
+  funciona una técnica). visual_prompt: describe la infografía EN EL IDIOMA DEL CURSO con sus textos exactos
+  (título, etiquetas, 2-4 partes comparadas o pasos), qué dibujo técnico muestra cada parte y qué se resalta.
+  title: el tema de la infografía. La narración recorre la infografía parte por parte.
+- Si hay cifras para comparar, usa "chart" (chart_labels + chart_values con los números exactos + chart_unit;
+  2-6 barras). Si hay una cuenta que el asesor debe saber hacer, usa "calculation": points = los pasos con
+  números reales del tema (forma: "Opción A: precio ÷ km de vida = costo por km"; las cifras salen de los
+  materiales o del caso, nunca de este ejemplo) y stat_value + stat_label = el resultado. Si los materiales no
+  traen precios, usa un ejemplo con cifras redondas y realistas del mercado y dilo en la narración ("por ejemplo");
+  nunca índices abstractos (1.00 ÷ 1.00) que no enseñan a hacer la cuenta.
+- En el resto alterna: "bullets" (3-4 points), "steps" (3-5 pasos), "comparison" (left/right 3-4 points cada
+  lado, p. ej. «Correcto» vs «Incorrecto»), "stat" (una cifra real) y, poco, "statement".
+- Texto en pantalla breve: title máx. 60 caracteres, cada point máx. 90 caracteres (en "case" y "calculation"
+  hasta 160). La pantalla resume; la narración explica.
+- narration: 70-140 palabras por escena, natural, en segunda persona, con ejemplos concretos del trabajo, sin leer
+  literalmente la diapositiva, sin marcas como [pausa] ni emojis. Debe fluir de una escena a la siguiente.
+- Los points aparecen en pantalla uno a uno cuando la narración los menciona: nómbralos en el mismo orden,
+  usando sus palabras clave.
+- icons (solo "bullets" y "closing"): un ícono por cada point, en el mismo orden, que represente esa idea;
+  icon: el de "statement" o "stat".
+  Usa solo nombres de esta lista ("" si ninguno encaja): {icons}.
+- visual_kind de las demás escenas: "none" (el diseño de marca) casi siempre. Solo si un proceso físico se entiende
+  mejor en movimiento, "clip" con visual_prompt EN INGLÉS describiendo ese proceso concreto (máximo {max_clips} por
+  módulo). No uses visuales decorativos que no expliquen nada del tema.
+- Deja vacíos ("" o []) los campos que el layout no usa."""
+
+
+def scene_rules(max_clips: int) -> str:
+    return _SCENE_RULES.format(icons=", ".join(ICONS), max_clips=max_clips)
 
 
 def outline_prompt(
@@ -233,42 +305,7 @@ Puntos clave: {"; ".join(module.key_points)}
 Duración objetivo: {module.estimated_minutes} minutos: la narración de todas las escenas suma unas
 {module.estimated_minutes * WORDS_PER_MINUTE} palabras ({WORDS_PER_MINUTE} por minuto). No te quedes corto: es lo que dura el video.
 
-ESCENAS ({scenes} aprox.). Cada escena es lo que se ve + lo que el presentador dice mientras se ve. El curso debe
-ENSEÑAR a hacer el trabajo: datos concretos (cifras, rangos, frecuencias, especificaciones), procedimientos paso a
-paso, cómo reconocer un problema, errores comunes y su costo. Nada genérico ("revisa regularmente"): di cuánto,
-cada cuándo, cómo y por qué. Usa los datos de los materiales; si das un dato que no está en ellos, que sea un
-estándar conocido del sector, y dilo así en la narración.
-- La primera escena usa layout "cover" (título del módulo + subtítulo con el beneficio para quien aprende).
-- La última usa "closing" (título + 3 conclusiones accionables en points).
-- Incluye SIEMPRE un caso práctico: layout "case" con points = [situación, diagnóstico, solución, resultado]
-  (en ese orden, sin escribir la etiqueta: la pantalla ya la pone; cada uno 1-2 frases con datos: tipo de flota, cifras, qué se observó, qué se hizo, qué mejoró).
-  La narración lo cuenta como una historia real del trabajo y cierra con la lección.
-- Para los conceptos técnicos clave (2-4 por módulo) usa layout "visual" con visual_kind "infographic": la
-  infografía ES la explicación (p. ej. cómo se desgasta la llanta según la presión, qué mide el indicador LCI, cómo
-  funciona una técnica). visual_prompt: describe la infografía EN EL IDIOMA DEL CURSO con sus textos exactos
-  (título, etiquetas, 2-4 partes comparadas o pasos), qué dibujo técnico muestra cada parte y qué se resalta.
-  title: el tema de la infografía. La narración recorre la infografía parte por parte.
-- Si hay cifras para comparar, usa "chart" (chart_labels + chart_values con los números exactos + chart_unit;
-  2-6 barras). Si hay una cuenta que el asesor debe saber hacer, usa "calculation": points = los pasos con
-  números reales del tema (forma: "Opción A: precio ÷ km de vida = costo por km"; las cifras salen de los
-  materiales o del caso, nunca de este ejemplo) y stat_value + stat_label = el resultado. Si los materiales no
-  traen precios, usa un ejemplo con cifras redondas y realistas del mercado y dilo en la narración ("por ejemplo");
-  nunca índices abstractos (1.00 ÷ 1.00) que no enseñan a hacer la cuenta.
-- En el resto alterna: "bullets" (3-4 points), "steps" (3-5 pasos), "comparison" (left/right 3-4 points cada
-  lado, p. ej. «Correcto» vs «Incorrecto»), "stat" (una cifra real) y, poco, "statement".
-- Texto en pantalla breve: title máx. 60 caracteres, cada point máx. 90 caracteres (en "case" y "calculation"
-  hasta 160). La pantalla resume; la narración explica.
-- narration: 70-140 palabras por escena, natural, en segunda persona, con ejemplos concretos del trabajo, sin leer
-  literalmente la diapositiva, sin marcas como [pausa] ni emojis. Debe fluir de una escena a la siguiente.
-- Los points aparecen en pantalla uno a uno cuando la narración los menciona: nómbralos en el mismo orden,
-  usando sus palabras clave.
-- icons (solo "bullets" y "closing"): un ícono por cada point, en el mismo orden, que represente esa idea;
-  icon: el de "statement" o "stat".
-  Usa solo nombres de esta lista ("" si ninguno encaja): {", ".join(ICONS)}.
-- visual_kind de las demás escenas: "none" (el diseño de marca) casi siempre. Solo si un proceso físico se entiende
-  mejor en movimiento, "clip" con visual_prompt EN INGLÉS describiendo ese proceso concreto (máximo {max_clips} por
-  módulo). No uses visuales decorativos que no expliquen nada del tema.
-- Deja vacíos ("" o []) los campos que el layout no usa.
+ESCENAS ({scenes} aprox.). {scene_rules(max_clips)}
 
 reading_summary: resumen en Markdown para leer (5-10 líneas, con viñetas).
 
@@ -294,6 +331,69 @@ Solo con información del contenido.
 
 CONTENIDO DEL MÓDULO:
 {_fenced(content[:30_000])}"""
+
+
+def revision_prompt(
+    outline: CourseOutline, module: OutlineModule, number: int, tone: str, materials: str, scenes: list[dict],
+    reading: str, questions: list[tuple[str, str]], scene_ids: list[str] | None, observation: str,
+) -> str:
+    """A change to a module's script by an observation. What stays the same from one change to the next comes first
+    (the provider reuses a prompt's beginning it already read), the script after it and the observation last."""
+    questions_block = ""
+    if questions:
+        listed = "\n".join(f"{question_id}: {prompt}" for question_id, prompt in questions)
+        questions_block = f"\nPREGUNTAS DE LA EVALUACIÓN (id: enunciado):\n{_fenced(listed)}\n"
+    return f"""Ajusta el guion en escenas del módulo {number} de un curso según la observación del administrador.
+No lo reescribas: propón solo los cambios que la observación necesita; el resto del guion queda exactamente igual.
+
+{_materials_block(materials, 40_000)}
+
+CURSO: {outline.title} — {outline.description}
+AUDIENCIA: {outline.audience}
+TONO: {tone or "profesional y cercano"}
+MÓDULO {number}: {module.title}
+Resumen: {module.summary}
+Objetivos: {"; ".join(module.objectives)}
+Puntos clave: {"; ".join(module.key_points)}
+
+REGLAS DE LAS ESCENAS (con ellas se escribió el guion; lo que cambies también las cumple):
+{scene_rules(get_settings().max_clips_per_module)}
+
+CÓMO RESPONDER:
+- changes: un cambio por cada escena que tocas.
+  · "update": cambia campos de la escena scene_id. fields dice cuáles; solo esos se toman de scene (los demás
+    pueden ir vacíos). Campos: "title", "subtitle", "points" (en "bullets" y "closing", con sus icons), "icons",
+    "icon", "stat" (stat_value y stat_label), "quote" (quote_author), "comparison" (left_* y right_*), "chart"
+    (chart_labels, chart_values y chart_unit), "layout" (otro diseño: la diapositiva completa sale de scene),
+    "narration" y "visual".
+  · "insert_after": agrega una escena completa después de scene_id ("" para ponerla primera).
+  · "delete": quita la escena scene_id.
+  No agregues ni quites escenas salvo que la observación lo pida: cambia quién presenta cada escena siguiente.
+- visual_action: "keep" si el visual de la escena no cambia; "new_version" para otra versión de la misma
+  infografía o imagen (se ve mal, tiene textos raros o tapa al presentador); "new_prompt" para un visual nuevo,
+  descrito en visual_kind, visual_query y visual_prompt de scene. Si no es "keep", incluye "visual" en fields.
+- Cambia solo lo que la observación pide. Si cambias los points, ajusta la narración para que los nombre en el
+  mismo orden (e incluye "narration"); una narración nueva sigue teniendo 70-140 palabras.
+- Si ESCENAS EN ALCANCE no dice "todas", cambia solo esas escenas: los cambios a otras se descartan.
+- reason: una frase para el administrador con qué cambiaste en esa escena y por qué.
+- reading_changed: true solo si la lectura del módulo debe cambiar (la observación lo pide o quedaría en
+  contradicción con el guion); entonces reading_summary es la lectura completa nueva, en Markdown. Si no, "".
+- affected_question_ids: los ids de las preguntas de la evaluación que quedarían en contradicción con el guion
+  nuevo ([] si ninguna).
+- summary: 1-3 frases para el administrador con lo que cambiaste.
+- unresolved: lo que la observación pide y no pudiste hacer, y por qué ("" si hiciste todo). Nunca inventes datos
+  que no estén en los materiales para cumplirla.
+
+GUION ACTUAL (JSON: cada escena con su número, su id y los campos que usa; los vacíos no aparecen):
+{_fenced(storyboard_json(scenes))}
+
+LECTURA ACTUAL (Markdown; vacía si no hay):
+{_fenced(reading)}
+{questions_block}
+ESCENAS EN ALCANCE: {", ".join(scene_ids) if scene_ids else "todas"}
+
+OBSERVACIÓN DEL ADMINISTRADOR:
+{observation.strip()}"""
 
 
 # ── Conversions ───────────────────────────────────────────────────────
@@ -386,6 +486,43 @@ def to_scenes(drafts: list[SceneDraft], max_clips: int = 2) -> list[dict]:
             "narration": _clip(scene.narration, MAX_NARRATION_CHARS), "visual": visual.model_dump(),
         })
     return scenes
+
+
+def draft_of(scene: dict) -> SceneDraft:
+    """A stored scene in the model's own words (what `to_scenes` reads): where a change to it starts. Raises
+    ValueError when the stored scene doesn't validate."""
+    slide = Slide.model_validate(scene.get("slide") or {})
+    visual = SceneVisual.model_validate(scene.get("visual") or {})
+    return SceneDraft(
+        layout=slide.layout, title=slide.title, subtitle=slide.subtitle, points=slide.points, icons=slide.icons,
+        icon=slide.icon, stat_value=slide.stat_value, stat_label=slide.stat_label, quote_author=slide.quote_author,
+        left_heading=slide.left.heading, left_points=slide.left.points, right_heading=slide.right.heading,
+        right_points=slide.right.points, chart_labels=slide.chart_labels, chart_values=slide.chart_values,
+        chart_unit=slide.chart_unit, narration=scene.get("narration") or "", visual_kind=visual.kind,
+        visual_query=visual.query, visual_prompt=visual.prompt,
+    )
+
+
+def _blank(value) -> bool:
+    return value is None or value == "" or isinstance(value, list) and all(
+        isinstance(item, str) and not item.strip() for item in value
+    )
+
+
+def storyboard_json(scenes: list[dict]) -> str:
+    """A stored script as the model reads it to change it: every scene with its number, its id and each field it
+    uses, named as the model writes them back (empty ones left out)."""
+    entries = []
+    for number, scene in enumerate(scenes, start=1):
+        try:
+            fields = draft_of(scene).model_dump()
+        except ValueError:  # edited by hand into something the slides don't accept: its narration still counts
+            fields = {"narration": scene.get("narration") or ""}
+        if fields.get("visual_kind") == "none":
+            del fields["visual_kind"]
+        entries.append({"number": number, "id": scene.get("id", ""),
+                        **{key: value for key, value in fields.items() if not _blank(value)}})
+    return json.dumps(entries, ensure_ascii=False)
 
 
 _MD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
@@ -648,3 +785,17 @@ def generate_module(
 def generate_quiz(llm: LLM, *, title: str, content: str, count: int, language: str) -> list[dict]:
     draft = llm.structured(_system(language), quiz_prompt(title, content, count), QuizDraft, max_tokens=16000)
     return to_questions(draft.quiz, limit=count)
+
+
+def generate_storyboard_patch(
+    llm: LLM, outline: CourseOutline, module: OutlineModule, number: int, *, language: str, tone: str, materials: str,
+    scenes: list[dict], reading: str, questions: list[tuple[str, str]], scene_ids: list[str] | None,
+    observation: str, usage: dict | None = None,
+) -> StoryboardPatchDraft:
+    return llm.structured(
+        _system(language),
+        revision_prompt(outline, module, number, tone, materials, scenes, reading, questions, scene_ids, observation),
+        StoryboardPatchDraft,
+        max_tokens=24000,  # a short answer, but the model reasons over the whole script before it
+        usage=usage,
+    )

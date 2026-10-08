@@ -9,7 +9,8 @@ Recordings, captions and the previous app's media.
   its v1 API lives, or from the public buckets the app used), then processes them like any upload;
   marks the ones that are lost; converts old evaluations to the canonical format; issues the
   certificates missing for what was completed before they existed, and the points of what learners
-  did before points existed.
+  did before points existed; records which scenes the AI videos made before show (to tell which
+  scenes were edited since).
 """
 
 import logging
@@ -29,7 +30,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.db.models import Enrollment, Evaluation, Job, MediaAsset, Module, ModuleProgress
-from app.services import certificates, legacy_heygen, points, quiz
+from app.services import certificates, legacy_heygen, points, quiz, revisions
 from app.services.legacy_heygen import RETIRED_ON as HEYGEN_RETIRED_ON
 from app.services.media import SIGNED_URL_SECONDS, discard_assets
 from app.services.storage import Storage, StorageError, get_storage
@@ -579,9 +580,10 @@ def migrate_legacy(ctx: JobContext) -> dict | Reschedule:
         dated = _step(db, _date_old_completions)
         issued = _step(db, certificates.backfill)  # after the dates: a certificate's snapshot keeps them
         scored = _step(db, points.backfill)  # after the dates too: points are dated when they were earned
+        recorded = _step(db, revisions.backfill_video_scenes)
         videos = _migrate_videos(db)  # right after: HeyGen's v1 API retires on 2026-10-31
     summary = {"videos": dict(videos), "evaluations_converted": converted, "completions_dated": dated,
-               "certificates_issued": issued, "points_backfilled": scored}
+               "certificates_issued": issued, "points_backfilled": scored, "video_scenes_recorded": recorded}
     logger.info("legacy_migration_pass", extra=summary)
     if videos["lost"]:
         logger.warning("legacy_videos_lost", extra={"modules": videos["lost"]})

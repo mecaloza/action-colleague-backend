@@ -39,7 +39,14 @@ from app.schemas.learn import LearnerCourseDetail
 from app.schemas.media import PURPOSES_NEEDING_MODULE
 from app.services import certificates, legacy_data, paths, progress, quiz
 from app.services import settings as platform
-from app.services.course_views import ACTIVE_GENERATION, course_counts, course_detail, course_summary, module_admin
+from app.services.course_views import (
+    ACTIVE_GENERATION,
+    course_counts,
+    course_detail,
+    course_summary,
+    module_admin,
+    module_out,
+)
 from app.services.learner_views import course_player_detail
 from app.services.media import MediaResolver, discard_assets
 from app.services.storage import StorageError, get_storage
@@ -308,7 +315,7 @@ def update_module(module_id: int, payload: ModuleUpdate, db: Session = Depends(g
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(module, field, value)
     db.commit()
-    return module_admin(module, MediaResolver(db).prepare(modules=[module]), module.evaluation)
+    return module_out(db, module)
 
 
 @router.delete("/modules/{module_id}", status_code=status.HTTP_204_NO_CONTENT)

@@ -9,6 +9,7 @@ import pytest
 from PIL import Image
 
 from app.db.models import Course, Job, MediaAsset, Module
+from app.services import revisions
 from app.services.ai.fake import FakeAvatar, FakeVoice
 from app.services.slides.render import BUBBLE_BOX
 from app.services.slides.render import render as render_slide
@@ -170,6 +171,23 @@ def test_a_failed_presenter_still_produces_the_video(client, db, admin_headers, 
     module = db.get(Module, drafted_module.id)
     assert module.generation_status == "completed" and module.video_asset_id
     assert "sin créditos" in module.storyboard["render"]["warning"]
+
+
+def test_the_video_knows_which_scenes_were_edited_after_it(client, db, admin_headers, drafted_module, storage, worker):
+    client.post(f"/api/v1/modules/{drafted_module.id}/render", headers=admin_headers)
+    _run_until_done(db, worker)
+
+    def stale():
+        return client.get(f"/api/v1/courses/{drafted_module.course_id}", headers=admin_headers).json()["modules"][0][
+            "stale_scene_ids"]
+
+    db.expire_all()
+    assert db.get(Module, drafted_module.id).storyboard["render"]["scene_hashes"] == revisions.video_scenes(SCENES)
+    assert stale() == []
+    storyboard = client.get(f"/api/v1/modules/{drafted_module.id}/storyboard", headers=admin_headers).json()
+    storyboard["scenes"][1]["narration"] = "Una regla: llevarlo siempre puesto."
+    client.put(f"/api/v1/modules/{drafted_module.id}/storyboard", headers=admin_headers, json=storyboard)
+    assert stale() == ["s2"]
 
 
 def test_rerendering_replaces_the_previous_video(client, db, admin_headers, drafted_module, storage, worker):

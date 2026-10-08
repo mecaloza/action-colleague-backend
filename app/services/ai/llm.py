@@ -35,7 +35,10 @@ class LLMError(RuntimeError):
 
 
 class LLM(Protocol):
-    def structured(self, system: str, user: str, schema: type[T], max_tokens: int = 8000) -> T: ...
+    def structured(
+        self, system: str, user: str, schema: type[T], max_tokens: int = 8000, usage: dict | None = None
+    ) -> T:
+        """`usage`, when given, gets the tokens the call used (`prompt_tokens`, `completion_tokens`)."""
 
 
 class OpenAILLM:
@@ -43,7 +46,7 @@ class OpenAILLM:
         self.client = openai.OpenAI(api_key=api_key, max_retries=2, timeout=180)
         self.model = model
 
-    def structured(self, system, user, schema, max_tokens=8000):
+    def structured(self, system, user, schema, max_tokens=8000, usage=None):
         try:
             completion = self.client.chat.completions.parse(
                 model=self.model,
@@ -72,16 +75,13 @@ class OpenAILLM:
         message = completion.choices[0].message
         if message.refusal or message.parsed is None:
             raise LLMError("El modelo no pudo generar este contenido.", permanent=True)
-        usage = completion.usage
-        logger.info(
-            "llm_completion",
-            extra={
-                "model": self.model,
-                "schema": schema.__name__,
-                "prompt_tokens": getattr(usage, "prompt_tokens", None),
-                "completion_tokens": getattr(usage, "completion_tokens", None),
-            },
-        )
+        tokens = {
+            "prompt_tokens": getattr(completion.usage, "prompt_tokens", None),
+            "completion_tokens": getattr(completion.usage, "completion_tokens", None),
+        }
+        logger.info("llm_completion", extra={"model": self.model, "schema": schema.__name__, **tokens})
+        if usage is not None:
+            usage.update(tokens)
         return message.parsed
 
 

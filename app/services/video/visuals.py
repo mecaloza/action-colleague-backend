@@ -87,6 +87,24 @@ def cache_path(course_id: int, request: VisualRequest) -> str:
     return f"courses/{course_id}/visuals/{request.key()}.{request.extension}"
 
 
+def scene_prompt(scene: dict) -> str:
+    """What a generated visual shows: its description, or (keywords alone make a poor prompt) the slide's title
+    with its search keywords."""
+    visual = scene.get("visual") or {}
+    prompt, query = (visual.get("prompt") or "").strip(), (visual.get("query") or "").strip()
+    if prompt or not query:
+        return prompt
+    title = ((scene.get("slide") or {}).get("title") or "").strip()
+    return f"{title}. {query}" if title else query
+
+
+def scene_request(scene: dict) -> VisualRequest:
+    """What a stored scene's visual is made from, as asked first (the video may fall back to a cheaper kind)."""
+    visual = scene.get("visual") or {}
+    return VisualRequest(visual.get("kind") or "none", visual.get("query") or "", scene_prompt(scene),
+                         int(visual.get("variant") or 0))
+
+
 @dataclass
 class ClipStatus:
     done: bool

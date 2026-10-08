@@ -112,6 +112,10 @@ class ModuleAdmin(BaseModel):
     duration_seconds: float | None = None
     scene_count: int = 0
     video_warning: str | None = None  # e.g. the AI video came out without its presenter, and why
+    # The AI video doesn't show these scenes as the script has them now (edited, added or moved since it was made;
+    # last, those it shows that the script no longer has): it needs producing again.
+    stale_scene_ids: list[str] = Field(default_factory=list)
+    revision_pending: bool = False  # a change the AI proposed (or is proposing) waits for the admin's review
     evaluation: EvaluationSummary | None = None
     updated_at: UtcDatetime | None = None
 
