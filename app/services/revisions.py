@@ -366,7 +366,7 @@ class Production:
         return cls(
             presenters, bool(module.video_asset_id or module.video_url), voices, (avatar, co_avatar)[:presenters],
             settings.get("avatar_engine") or get_settings().heygen_engine,
-            video_cache.Kept(((module.storyboard or {}).get("render") or {}).get("cache")),
+            video_cache.Kept(_render_of(module).get("cache")),
         )
 
     def narration_keys(self, scenes: list[dict]) -> list[str]:
