@@ -121,7 +121,9 @@ class PersonStep(BaseModel):
 
 class PathPerson(BaseModel):
     user: PathPersonUser
-    source: str
+    source: str  # how they got it; by hand ('manual') it stays whatever their profile
+    # False while their profile gives them the path (whatever the source): removing it by hand answers 409.
+    removable: bool
     assigned_at: UtcDatetime | None = None
     due_at: UtcDatetime | None = None
     completed_at: UtcDatetime | None = None

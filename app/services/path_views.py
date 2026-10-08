@@ -135,7 +135,7 @@ def path_detail(db: Session, path: LearningPath) -> PathDetail:
 def path_people(db: Session, path: LearningPath, user_ids: list[int] | None = None) -> list[PathPerson]:
     """Who takes the path and how far each one got, course by course (a handful of reads for any number)."""
     query = (
-        db.query(PathAssignment, User)
+        db.query(PathAssignment, User, paths.backed_by_profile())
         .join(User, User.id == PathAssignment.user_id)
         .filter(PathAssignment.path_id == path.id)
         .populate_existing()  # completion and deadlines are written in bulk, never into the session
@@ -146,14 +146,15 @@ def path_people(db: Session, path: LearningPath, user_ids: list[int] | None = No
     if not rows:
         return []
     steps = paths.path_steps(db, [path.id])[path.id]
-    journeys = paths.journeys(db, [user.id for _, user in rows], course_ids=[s.course_id for s in steps], modules=True)
-    profile_ids = {user.profile_id for _, user in rows if user.profile_id}
+    journeys = paths.journeys(db, [user.id for _, user, _ in rows], course_ids=[s.course_id for s in steps],
+                              modules=True)
+    profile_ids = {user.profile_id for _, user, _ in rows if user.profile_id}
     profiles = {
         p.id: ProfileRef(id=p.id, name=p.name) for p in db.query(JobProfile).filter(JobProfile.id.in_(profile_ids))
     } if profile_ids else {}
     now = paths.utcnow()
     people = []
-    for assignment, user in rows:
+    for assignment, user, by_profile in rows:
         journey = journeys[user.id]
         assigned = paths.assigned_path(path, assignment, steps)
         current = journey.current(assigned)
@@ -168,6 +169,7 @@ def path_people(db: Session, path: LearningPath, user_ids: list[int] | None = No
                     profile=profiles.get(user.profile_id),
                 ),
                 source=assignment.source,
+                removable=not by_profile,
                 assigned_at=assignment.assigned_at,
                 due_at=assignment.due_at,
                 completed_at=journey.completed_at(assigned),

@@ -21,7 +21,7 @@ from app.schemas.participants import (
     ParticipantUser,
     QuestionAnalytics,
 )
-from app.services import legacy_data, progress, quiz
+from app.services import legacy_data, paths, progress, quiz
 from app.services.metrics import percentage
 
 router = APIRouter(prefix="/courses/{course_id}", tags=["participants"], dependencies=[Depends(require_admin)])
@@ -122,13 +122,20 @@ def add_participants(
 
 @router.delete("/participants/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 def remove_participant(course_id: int, user_id: int, db: Session = Depends(get_db)):
-    """Unassigns the person; their attempts and progress in this course are deleted."""
+    """Unassigns the person; their attempts and progress in this course are deleted. Not while one of their published
+    learning paths has the course: the courses after it would stay locked."""
     course_or_404(db, course_id)
     enrollment = (
         db.query(Enrollment).filter(Enrollment.course_id == course_id, Enrollment.user_id == user_id).first()
     )
     if not enrollment:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "La persona no está inscrita en este curso")
+    path = paths.path_with_course(db, user_id, course_id)
+    if path is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Esta persona tiene este curso por la ruta «{path.title}». Quítale la ruta para retirarla del curso.",
+        )
     legacy_data.delete_certificates(db, [enrollment.id])
     db.delete(enrollment)
     db.commit()

@@ -67,6 +67,7 @@ def _set_profiles(db: Session, path: LearningPath, profile_ids: set[int]) -> boo
             insert(LearningPathProfile),
             [{"path_id": path.id, "profile_id": profile_id} for profile_id in sorted(profile_ids - current)],
         )
+        paths.hold_profiles(db, profile_ids - current)
     return True
 
 
@@ -121,10 +122,12 @@ def update_path(
     if profiles_changed:
         path.updated_at = paths.utcnow()  # its own row is untouched otherwise
     db.flush()
-    if paths.settings_of(path).due_days != due_days:
-        paths.recompute_due_dates(db, path)
     if profiles_changed or (path.status == "published" and not was_published):
         paths.sync_path(db, path, assigned_by=admin.id)
+    if paths.settings_of(path).due_days != due_days:
+        # After the sync, which writes enrollments before locking assignments: the order of a learner completing a
+        # course right now (its enrollment, then their assignments).
+        paths.recompute_due_dates(db, path)
     db.commit()
     return path_detail(db, path)
 
@@ -181,7 +184,8 @@ def list_path_people(path_id: int, db: Session = Depends(get_db)):
 def add_path_people(
     path_id: int, payload: PathPeopleAdd, db: Session = Depends(get_db), admin: User = Depends(require_admin)
 ):
-    """Assign the path by hand (anyone active, admins included). Those who already have it keep it as it was."""
+    """Assign the path by hand (anyone active, admins included). Those who already have it keep its date and deadline;
+    by hand from now on, it stays if their profile changes."""
     path = _path(db, path_id, lock=True)
     user_ids = sorted(set(payload.user_ids))
     active = db.query(func.count(User.id)).filter(User.id.in_(user_ids), User.is_active.is_(True)).scalar()

@@ -186,8 +186,8 @@ def test_publishing_gives_the_path_to_the_active_collaborators_of_its_profiles(c
     (person,) = client.get(f"{API}/paths/{path['id']}/people", headers=admin_headers).json()
     assert person["user"] == {"id": ana.id, "name": "Ana", "email": "ana@test.dev", "position": "",
                               "department": "", "profile": {"id": advisor["id"], "name": "Asesor de flotas"}}
-    assert person == {**person, "source": "profile", "status": "not_started", "progress_pct": 0.0,
-                      "current_course_id": first.id, "completed_at": None}
+    assert person == {**person, "source": "profile", "removable": False, "status": "not_started",
+                      "progress_pct": 0.0, "current_course_id": first.id, "completed_at": None}
     assigned_at, due_at = (datetime.fromisoformat(person[key]) for key in ("assigned_at", "due_at"))
     assert due_at - assigned_at == timedelta(days=15)
     assert person["steps"] == [{"course_id": first.id, "status": "available", "progress_pct": 0.0}]  # published only
@@ -209,15 +209,18 @@ def test_people_assigned_by_hand_can_be_removed_but_not_those_of_its_profile(cli
     path = _path(client, admin_headers, [course], profiles=(advisor,))
 
     people = _assign(client, admin_headers, path, dani, admin)
-    assert [(p["user"]["id"], p["source"]) for p in people] == [(admin.id, "manual"), (dani.id, "manual")]
+    assert [(p["user"]["id"], p["source"], p["removable"]) for p in people] == [
+        (admin.id, "manual", True), (dani.id, "manual", True),
+    ]
     assert course.id in _enrolled(db, dani) and course.id in _enrolled(db, admin)
     for user_ids in ([inactive.id], [999]):
         bad = client.post(f"{API}/paths/{path['id']}/people", headers=admin_headers, json={"user_ids": user_ids})
         assert bad.status_code == 422
     assert client.post(f"{API}/paths/{path['id']}/people", headers=admin_headers,
                        json={"user_ids": []}).status_code == 422
-    again = _assign(client, admin_headers, path, ana)  # already has it by profile: kept as it is
-    assert [p["source"] for p in again] == ["profile"]
+    # Hers by profile, now by hand too: it stays if her profile changes, and can't go while her profile gives it.
+    again = _assign(client, admin_headers, path, ana)
+    assert [(p["source"], p["removable"]) for p in again] == [("manual", False)]
 
     assert client.delete(f"{API}/paths/{path['id']}/people/{dani.id}", headers=admin_headers).status_code == 204
     assert _assignments(db, dani) == {} and course.id in _enrolled(db, dani)  # the course and progress stay
@@ -229,6 +232,10 @@ def test_people_assigned_by_hand_can_be_removed_but_not_those_of_its_profile(cli
     assert client.delete(f"{API}/paths/{path['id']}/people/{dani.id}", headers=admin_headers).status_code == 404
     listed = client.get(f"{API}/paths/{path['id']}/people", headers=admin_headers).json()
     assert [p["user"]["id"] for p in listed] == [admin.id, ana.id]
+
+    client.patch(f"{API}/users/{ana.id}", headers=admin_headers, json={"profile_id": None})
+    assert _assignments(db, ana) == {path["id"]: ("manual", False)}
+    assert client.delete(f"{API}/paths/{path['id']}/people/{ana.id}", headers=admin_headers).status_code == 204
 
 
 def test_a_new_profile_brings_its_paths_and_takes_the_old_ones_unless_completed(client, db, admin, admin_headers):
@@ -256,6 +263,44 @@ def test_a_new_profile_brings_its_paths_and_takes_the_old_ones_unless_completed(
     assert client.delete(f"{API}/paths/{done['id']}/people/{ana.id}", headers=admin_headers).status_code == 204
 
 
+def test_a_completed_path_stays_whatever_the_path_gets_after_a_profile_change(client, db, admin, admin_headers):
+    """Her history: a module added to its course or one more course reopen the path only for whoever still takes it
+    (the next sync would drop a reopened one). She is enrolled in the new course all the same."""
+    advisor, manager = _profile(client, admin_headers), _profile(client, admin_headers, "Gerente")
+    ana = _person(db, "ana@test.dev", profile=advisor, can_log_in=True)
+    beto = _person(db, "beto@test.dev", profile=advisor, can_log_in=True)
+    first, second = _courses(db, admin, 2)
+    path = _path(client, admin_headers, [first], profiles=(advisor,))
+    for person in (ana, beto):
+        _complete(client, auth_headers(client, person.email), db, first)
+    client.patch(f"{API}/users/{ana.id}", headers=admin_headers, json={"profile_id": manager["id"]})
+
+    client.post(f"{API}/courses/{first.id}/modules", headers=admin_headers,
+                json={"title": "Nuevo", "content_text": "x"})
+    assert _assignments(db, ana) == {path["id"]: ("profile", True)}
+    assert _assignments(db, beto) == {path["id"]: ("profile", False)}
+    client.put(f"{API}/paths/{path['id']}/courses", headers=admin_headers, json={"course_ids": [first.id, second.id]})
+    client.patch(f"{API}/users/{ana.id}", headers=admin_headers, json={"profile_id": None})
+
+    assert _assignments(db, ana) == {path["id"]: ("profile", True)}
+    assert second.id in _enrolled(db, ana)
+
+
+def test_a_path_completed_while_archived_stays_after_a_profile_change(client, db, admin, admin_headers):
+    advisor, manager = _profile(client, admin_headers), _profile(client, admin_headers, "Gerente")
+    ana = _person(db, "ana@test.dev", profile=advisor, can_log_in=True)
+    (course,) = _courses(db, admin, 1)
+    path = _path(client, admin_headers, [course], profiles=(advisor,))
+    client.patch(f"{API}/paths/{path['id']}", headers=admin_headers, json={"status": "archived"})
+    _complete(client, auth_headers(client, ana.email), db, course)  # an archived path stores nothing
+
+    client.patch(f"{API}/users/{ana.id}", headers=admin_headers, json={"profile_id": manager["id"]})
+
+    assert _assignments(db, ana) == {path["id"]: ("profile", False)}  # kept: its courses are completed
+    client.patch(f"{API}/paths/{path['id']}", headers=admin_headers, json={"status": "published"})
+    assert _assignments(db, ana) == {path["id"]: ("profile", True)}
+
+
 def test_deactivated_people_keep_their_paths_and_get_them_once_active(client, db, admin, admin_headers):
     advisor = _profile(client, admin_headers)
     ana = _person(db, "ana@test.dev", profile=advisor)
@@ -268,6 +313,23 @@ def test_deactivated_people_keep_their_paths_and_get_them_once_active(client, db
 
     assert _assignments(db, ana) == {path["id"]: ("profile", False)}
     assert _assignments(db, beto) == {path["id"]: ("profile", False)}  # active again: their profile's paths
+
+
+def test_admins_keep_no_path_of_their_profile(client, db, admin, admin_headers):
+    """Made admin: the paths their profile gave them go, unless completed; a collaborator again, they come back."""
+    advisor = _profile(client, admin_headers)
+    ana = _person(db, "ana@test.dev", profile=advisor, can_log_in=True)
+    first, second = _courses(db, admin, 2)
+    pending = _path(client, admin_headers, [first], profiles=(advisor,), title="Pendiente")
+    done = _path(client, admin_headers, [second], profiles=(advisor,), title="Hecha")
+    _complete(client, auth_headers(client, ana.email), db, second)
+
+    client.patch(f"{API}/users/{ana.id}", headers=admin_headers, json={"role": "admin"})
+
+    assert _assignments(db, ana) == {done["id"]: ("profile", True)}
+    assert _enrolled(db, ana) == {first.id, second.id}
+    client.patch(f"{API}/users/{ana.id}", headers=admin_headers, json={"role": "collaborator"})
+    assert _assignments(db, ana) == {pending["id"]: ("profile", False), done["id"]: ("profile", True)}
 
 
 def test_deleting_a_profile_keeps_courses_and_completed_paths(client, db, admin, admin_headers):
@@ -303,6 +365,30 @@ def test_unlinking_a_profile_takes_the_path_from_its_people(client, db, admin, a
     assert _assignments(db, gina) == {path["id"]: ("profile", False)}
     unknown = client.patch(f"{API}/paths/{path['id']}", headers=admin_headers, json={"profile_ids": [999]})
     assert unknown.status_code == 422
+
+
+def test_a_course_of_a_path_stays_while_the_person_has_the_path(client, db, admin, admin_headers):
+    """Taken out of one course of their path, the courses after it would stay locked for good."""
+    ana = _person(db, "ana@test.dev")
+    first, second = _courses(db, admin, 2)
+    loose = _course(db, admin, "Suelto")
+    path = _path(client, admin_headers, [first, second], title="Inducción")
+    _assign(client, admin_headers, path, ana)
+    client.post(f"{API}/courses/{loose.id}/participants", headers=admin_headers, json={"user_ids": [ana.id]})
+
+    def unassign(course: Course):
+        return client.delete(f"{API}/courses/{course.id}/participants/{ana.id}", headers=admin_headers)
+
+    blocked = unassign(first)
+    assert blocked.status_code == 409 and blocked.json() == {
+        "detail": "Esta persona tiene este curso por la ruta «Inducción». Quítale la ruta para retirarla del curso."
+    }
+    assert unassign(loose).status_code == 204
+    client.patch(f"{API}/paths/{path['id']}", headers=admin_headers, json={"status": "archived"})
+    assert unassign(second).status_code == 204  # an archived path holds none of its courses
+    assert client.delete(f"{API}/paths/{path['id']}/people/{ana.id}", headers=admin_headers).status_code == 204
+    assert unassign(first).status_code == 204
+    assert _enrolled(db, ana) == set()
 
 
 # ── Paths ─────────────────────────────────────────────────────────────

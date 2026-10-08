@@ -650,3 +650,133 @@ def test_path_deletes_respect_foreign_keys(client, db, admin, collaborator):
     for table in ("learning_paths", "learning_path_courses", "path_assignments"):
         assert _count(db, f"SELECT count(*) FROM {table}") == 0
     assert _count(db, f"SELECT count(*) FROM enrollments WHERE course_id = {kept['id']}") == 1  # kept
+
+
+def _paused_before_commit(call, paused: threading.Event, release: threading.Event):
+    """`call`, with every statement run and only its commit left until `release`."""
+
+    def run(session):
+        real_commit = session.commit
+
+        def commit_later():
+            paused.set()
+            release.wait(5)
+            real_commit()
+
+        session.commit = commit_later
+        call(session)
+
+    return run
+
+
+@pytest.mark.parametrize("first", ["path", "person"])
+@pytest.mark.parametrize("change", ["publish", "link"])
+def test_changing_a_path_while_giving_its_profile_assigns_it(
+    client, db, session_factory, admin, collaborator, change, first
+):
+    """The path published, or linked to the profile, while someone gets that profile: whichever request commits last
+    waited for the other one, and reads what it did."""
+    from app.api.routes import paths as path_routes
+    from app.api.routes import users as user_routes
+    from app.schemas.paths import PathUpdate
+    from app.schemas.users import UserUpdate
+
+    admin_headers = auth_headers(client, admin.email)
+    course, _ = _course(client, admin_headers, collaborator, quiz=False)
+    profile = client.post("/api/v1/profiles", headers=admin_headers, json={"name": "Asesor"}).json()
+    if change == "publish":
+        path = _path_with(client, admin_headers, [course["id"]], profile_ids=[profile["id"]])  # a draft
+        update = PathUpdate(status="published")
+    else:
+        path = _path_with(client, admin_headers, [course["id"]], status="published")
+        update = PathUpdate(profile_ids=[profile["id"]])
+    paused, release = threading.Event(), threading.Event()
+
+    def change_path(session):
+        path_routes.update_path(path["id"], update, db=session, admin=session.get(User, admin.id))
+
+    def give_profile(session):
+        user_routes.update_user(collaborator.id, UserUpdate(profile_id=profile["id"]), db=session,
+                                admin=session.get(User, admin.id))
+
+    one, two = (change_path, give_profile) if first == "path" else (give_profile, change_path)
+    errors = _race(session_factory, _paused_before_commit(one, paused, release), two, paused=paused, release=release)
+
+    assert not errors, errors
+    assert _count(db, f"SELECT count(*) FROM path_assignments WHERE user_id = {collaborator.id}") == 1
+
+
+def test_two_courses_of_a_path_completed_at_once_complete_it(client, db, session_factory, admin, collaborator):
+    """Two tabs: the second completion waits for the first one's, then stores and reports the completed path."""
+    from app.api.routes import learn
+    from app.schemas.paths import PathRef
+
+    admin_headers = auth_headers(client, admin.email)
+    (one, (first,)), (two, (second,)) = (_course(client, admin_headers, collaborator, quiz=False) for _ in range(2))
+    path = _path_with(client, admin_headers, [one["id"], two["id"]], status="published", settings={"sequential": False})
+    client.post(f"/api/v1/paths/{path['id']}/people", headers=admin_headers, json={"user_ids": [collaborator.id]})
+    paused, release = threading.Event(), threading.Event()
+    results = {}
+
+    def complete(module_id: int):
+        def run(session):
+            results[module_id] = learn.complete_module(module_id, db=session, user=session.get(User, collaborator.id))
+
+        return run
+
+    errors = _race(session_factory, _paused_before_commit(complete(first), paused, release), complete(second),
+                   paused=paused, release=release)
+
+    assert not errors, errors
+    assert _count(db, "SELECT count(*) FROM path_assignments WHERE completed_at IS NOT NULL") == 1
+    assert results[second].path_completed == PathRef(id=path["id"], title="Ruta")
+
+
+@pytest.mark.parametrize("change", ["profile", "path"])
+def test_a_course_completed_during_a_sync_never_deadlocks(
+    client, db, session_factory, admin, collaborator, monkeypatch, change
+):
+    """A sync writes enrollments before it locks assignments, the order of a learner completing a course (its
+    enrollment, then their assignments): one of the two waits, never both. The path completed meanwhile stays."""
+    from app.api.routes import learn
+    from app.api.routes import paths as path_routes
+    from app.api.routes import users as user_routes
+    from app.schemas.paths import PathSettings, PathUpdate
+    from app.schemas.users import UserUpdate
+    from app.services import paths
+
+    admin_headers = auth_headers(client, admin.email)
+    course, (module_id,) = _course(client, admin_headers, collaborator, quiz=False)
+    advisor, manager = (
+        client.post("/api/v1/profiles", headers=admin_headers, json={"name": name}).json() for name in ("A", "B")
+    )
+    client.patch(f"/api/v1/users/{collaborator.id}", headers=admin_headers, json={"profile_id": advisor["id"]})
+    path = _path_with(client, admin_headers, [course["id"]], status="published", profile_ids=[advisor["id"]])
+    _path_with(client, admin_headers, [course["id"]], status="published", profile_ids=[manager["id"]])
+    if change == "profile":  # loses the path, gets the other one: the same course in both
+        update = UserUpdate(profile_id=manager["id"])
+        sync = lambda s: user_routes.update_user(collaborator.id, update, db=s, admin=s.get(User, admin.id))  # noqa: E731
+    else:  # one more profile and a deadline, saved at once
+        update = PathUpdate(profile_ids=[advisor["id"], manager["id"]], settings=PathSettings(due_days=10))
+        sync = lambda s: path_routes.update_path(path["id"], update, db=s, admin=s.get(User, admin.id))  # noqa: E731
+    paused, release = threading.Event(), threading.Event()
+    ensure_enrollments = paths.ensure_enrollments
+
+    def slow_ensure_enrollments(*args, **kwargs):
+        paused.set()
+        release.wait(5)
+        ensure_enrollments(*args, **kwargs)
+
+    monkeypatch.setattr(paths, "ensure_enrollments", slow_ensure_enrollments)
+
+    errors = _race(
+        session_factory,
+        sync,
+        lambda s: learn.complete_module(module_id, db=s, user=s.get(User, collaborator.id)),
+        paused=paused,
+        release=release,
+    )
+
+    assert not errors, errors  # DeadlockDetected, locking the assignment before the enrollment
+    assert _count(db, f"SELECT count(*) FROM path_assignments WHERE path_id = {path['id']} "
+                      "AND completed_at IS NOT NULL") == 1

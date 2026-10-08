@@ -2,9 +2,10 @@
 Learning paths: who takes each one, their courses, the order they open in and when a path is completed.
 
 - Assignments. A person takes a path because of their profile (active collaborators of a linked profile, while the
-  path is published; it follows the profile) or because an admin assigned it. Each person of a published path is
-  enrolled in every course of the path. Nothing here ever deletes an enrollment or progress: whoever leaves a path
-  keeps what they did.
+  path is published; it follows the profile, but once completed it stays as history) or because an admin assigned it
+  (it stays whatever their profile). Each person of a published path is enrolled in every course of the path, and
+  keeps those enrollments while they have it. Nothing here ever deletes an enrollment or progress: whoever leaves a
+  path keeps what they did.
 - Locks, computed on read and never stored. In a sequential path a course opens once every earlier published course is
   completed. A course the person already started stays open (a reorder or a new path never takes back what they
   began); courses that are not published are skipped (learners can't open them anyway).
@@ -109,12 +110,16 @@ def _scope(path_ids=None, user_ids=None, course_ids=None) -> list:
 def refresh_completion(db: Session, *, path_ids=None, user_ids=None, course_ids=None) -> list[int]:
     """
     Store which assignments of published paths are completed, and clear the ones that have a course to do again (a
-    course added to the path, a module added to a course): the same rule as an enrollment's. Draft and archived paths
-    keep what they had. Two statements; returns the assignments that just became completed.
+    course added to the path, a module added to a course): the same rule as an enrollment's, except for a completed
+    path kept only as history (its profile no longer gives it: reopened, the next sync would drop it). Draft and
+    archived paths keep what they had. Three statements; returns the assignments that just became completed.
     """
     db.flush()  # the enrollments this request changed are read below
     published = select(LearningPath.id).where(LearningPath.status == "published")
     scope = [PathAssignment.path_id.in_(published), *_scope(path_ids, user_ids, course_ids)]
+    # One at a time per assignment (in id order): of two courses of a path completed at once (two tabs, a learner and
+    # an admin), the second one waits here and then reads the first one's completion, committed.
+    db.execute(select(PathAssignment.id).where(*scope).order_by(PathAssignment.id).with_for_update(of=PathAssignment))
     done = completed_clause()
     completed = db.execute(
         update(PathAssignment)
@@ -123,8 +128,11 @@ def refresh_completion(db: Session, *, path_ids=None, user_ids=None, course_ids=
         .returning(PathAssignment.id),
         execution_options=NO_SYNC,
     ).scalars().all()
+    history = and_(PathAssignment.source == "profile", ~backed_by_profile())
     db.execute(
-        update(PathAssignment).where(*scope, PathAssignment.completed_at.isnot(None), ~done).values(completed_at=None),
+        update(PathAssignment)
+        .where(*scope, PathAssignment.completed_at.isnot(None), ~done, ~history)
+        .values(completed_at=None),
         execution_options=NO_SYNC,
     )
     return completed
@@ -201,26 +209,31 @@ def _add_by_profile(db: Session, *, path_ids=None, user_ids=None, assigned_by: i
     db.execute(insert.on_conflict_do_nothing(index_elements=["path_id", "user_id"]))
 
 
-def _backed_by_profile():
-    """Correlated, per `path_assignments` row: the person's profile is linked to the path."""
+def backed_by_profile():
+    """Correlated, per `path_assignments` row: a profile gives the path to its person (a collaborator whose profile is
+    linked to it; deactivated people keep theirs). The rule of `_add_by_profile` and `backing_profile` too."""
     return (
         exists()
         .where(
             LearningPathProfile.path_id == PathAssignment.path_id,
             User.id == PathAssignment.user_id,
             User.profile_id == LearningPathProfile.profile_id,
+            User.role == "collaborator",
         )
         .correlate(PathAssignment)
     )
 
 
 def _drop_unbacked(db: Session, *, path_ids=None, user_ids=None) -> None:
-    """Assignments given by a profile that no longer brings the path go; completed ones stay (they are history)."""
+    """Assignments given by a profile that no longer gives the path go; completed ones stay (they are history), also
+    those whose courses were completed while the path was not published (stored once it is published again)."""
+    db.flush()
     db.execute(
         delete(PathAssignment).where(
             PathAssignment.source == "profile",
             PathAssignment.completed_at.is_(None),
-            ~_backed_by_profile(),
+            ~completed_clause(),
+            ~backed_by_profile(),
             *_scope(path_ids, user_ids),
         ),
         execution_options=NO_SYNC,
@@ -228,26 +241,64 @@ def _drop_unbacked(db: Session, *, path_ids=None, user_ids=None) -> None:
 
 
 def sync_path(db: Session, path: LearningPath, assigned_by: int | None = None) -> None:
-    """After a path is published, or its profiles or courses change: its people, their enrollments, completion."""
-    refresh_completion(db, path_ids=[path.id])  # before dropping anyone: what is completed stays
+    """After a path is published, or its profiles or courses change: its people, their enrollments, completion. Those
+    who leave go first: no enrollment of theirs is written below (see `sync_user` on the order of locks)."""
     _drop_unbacked(db, path_ids=[path.id])
     if path.status == "published":
         _add_by_profile(db, path_ids=[path.id], assigned_by=assigned_by)
         ensure_enrollments(db, path_ids=[path.id], assigned_by=assigned_by)
-        refresh_completion(db, path_ids=[path.id])  # someone may have completed its courses already
+        refresh_completion(db, path_ids=[path.id])  # completed by someone already, or with a course to do again
+
+
+def hold_profiles(db: Session, profile_ids: Iterable[int]) -> None:
+    """Profiles just linked to a path: whoever is being given one of them right now (`sync_user`) waits for this
+    change, then reads the new link. NO KEY UPDATE: their profile change itself (a foreign key check) doesn't wait."""
+    db.execute(
+        select(JobProfile.id)
+        .where(JobProfile.id.in_(list(profile_ids)))
+        .order_by(JobProfile.id)
+        .with_for_update(key_share=True, of=JobProfile)
+    )
+
+
+def _wait_for_path_changes(db: Session, user: User) -> None:
+    """
+    Read the person's paths only once any change to them in flight is committed: publishing a path of their profile
+    or one it gave them, changing its profiles (`update_path` holds the path's row), linking their profile to another
+    path (`hold_profiles`). That change could not see this person's new profile, nor this sync that change. Paths
+    first, then the profile, the order `update_path` takes them in; shared locks, so syncs of different people never
+    wait for each other.
+    """
+    linked = select(LearningPathProfile.path_id).where(LearningPathProfile.profile_id == user.profile_id)
+    given = select(PathAssignment.path_id).where(PathAssignment.user_id == user.id, PathAssignment.source == "profile")
+    db.execute(
+        select(LearningPath.id)
+        .where(or_(LearningPath.id.in_(linked), LearningPath.id.in_(given)))
+        .order_by(LearningPath.id)
+        .with_for_update(read=True, of=LearningPath)
+    )
+    if user.profile_id is not None:
+        db.execute(
+            select(JobProfile.id).where(JobProfile.id == user.profile_id).with_for_update(read=True, of=JobProfile)
+        )
 
 
 def sync_user(db: Session, user: User, assigned_by: int | None = None) -> None:
-    """After a person's profile, role or active state changes: the paths of their profile, and only those."""
-    refresh_completion(db, user_ids=[user.id])
-    _drop_unbacked(db, user_ids=[user.id])
+    """
+    After a person's profile, role or active state changes: the paths of their profile, and only those. Enrollments
+    are written before any of their assignments is locked, the order of a course they may be completing right now
+    (its enrollment, then their assignments); so the paths they lose go last, their completion stored by then.
+    """
+    _wait_for_path_changes(db, user)  # no assignment locked yet while waiting
     _add_by_profile(db, user_ids=[user.id], assigned_by=assigned_by)
     ensure_enrollments(db, user_ids=[user.id], assigned_by=assigned_by)
     refresh_completion(db, user_ids=[user.id])
+    _drop_unbacked(db, user_ids=[user.id])
 
 
 def assign(db: Session, path: LearningPath, user_ids: list[int], assigned_by: int) -> None:
-    """Assign people by hand. Someone who already has the path keeps it as it was (date, deadline, source)."""
+    """Assign people by hand. Someone who already has the path keeps its date and deadline; one who has it by profile
+    now has it by hand (it stays if their profile changes)."""
     now = utcnow()
     days = settings_of(path).due_days
     rows = [
@@ -256,8 +307,18 @@ def assign(db: Session, path: LearningPath, user_ids: list[int], assigned_by: in
         for user_id in user_ids
     ]
     db.execute(_insert(db)(PathAssignment).values(rows).on_conflict_do_nothing(index_elements=["path_id", "user_id"]))
-    if path.status == "published":
+    published = path.status == "published"
+    if published:
         ensure_enrollments(db, path_ids=[path.id], user_ids=user_ids, assigned_by=assigned_by)
+    # After the enrollments, as in `sync_user`: no assignment is locked while one of them waits.
+    db.execute(
+        update(PathAssignment)
+        .where(PathAssignment.path_id == path.id, PathAssignment.user_id.in_(user_ids),
+               PathAssignment.source == "profile")
+        .values(source="manual", assigned_by=assigned_by),
+        execution_options=NO_SYNC,
+    )
+    if published:
         refresh_completion(db, path_ids=[path.id], user_ids=user_ids)
 
 
@@ -288,11 +349,26 @@ def backing_profile(db: Session, path_id: int, user_id: int) -> JobProfile | Non
     )
 
 
+def path_with_course(db: Session, user_id: int, course_id: int) -> LearningPath | None:
+    """The published path (the first one they got) through which this person takes the course: their enrollment in it
+    can't go while they have the path, or the courses after it would stay locked."""
+    return (
+        db.query(LearningPath)
+        .join(PathAssignment, PathAssignment.path_id == LearningPath.id)
+        .join(LearningPathCourse, LearningPathCourse.path_id == LearningPath.id)
+        .filter(
+            PathAssignment.user_id == user_id,
+            LearningPathCourse.course_id == course_id,
+            LearningPath.status == "published",
+        )
+        .order_by(PathAssignment.assigned_at, PathAssignment.id)
+        .first()
+    )
+
+
 def drop_profile(db: Session, profile_id: int) -> None:
     """Before a profile is deleted: its people keep their courses and completed paths, and lose the rest it gave."""
     user_ids = db.execute(select(User.id).where(User.profile_id == profile_id)).scalars().all()
-    if user_ids:
-        refresh_completion(db, user_ids=user_ids)
     db.execute(update(User).where(User.profile_id == profile_id).values(profile_id=None), execution_options=NO_SYNC)
     db.execute(
         delete(LearningPathProfile).where(LearningPathProfile.profile_id == profile_id), execution_options=NO_SYNC
