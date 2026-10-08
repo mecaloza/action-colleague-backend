@@ -29,6 +29,11 @@ _MESSAGES = {
     ("certificates", "min_score"): "La nota mínima promedio debe ser un número entero entre 0 y 100, o quedar vacía.",
     ("certificates", "signer_name"): "El nombre del firmante debe ser un texto de hasta 200 caracteres.",
     ("certificates", "signer_title"): "El cargo del firmante debe ser un texto de hasta 200 caracteres.",
+    ("ranking", "visible_to_learners"): "Indica si los colaboradores ven el ranking (sí o no).",
+    ("ranking", "show_full_names"): "Indica si el ranking muestra los nombres completos (sí o no).",
+    ("ranking", "points_module"): "Los puntos por módulo completado deben ser un número entero entre 0 y 1000.",
+    ("ranking", "points_course"): "Los puntos por curso completado deben ser un número entero entre 0 y 1000.",
+    ("ranking", "points_path"): "Los puntos por ruta completada deben ser un número entero entre 0 y 1000.",
 }
 _INVALID = "Revisa los parámetros: hay un valor que no es válido."
 

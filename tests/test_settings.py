@@ -1,4 +1,5 @@
-"""The platform's parameters: defaults, partial changes, validation in the admin's words, and evaluation defaults."""
+"""The platform's parameters: defaults, partial changes, validation in the admin's words, evaluation defaults, and what
+learners read of them."""
 
 import logging
 
@@ -17,6 +18,8 @@ DEFAULTS = {
     "evaluations": {"passing_score": 70, "max_attempts": 3},
     "certificates": {"enabled": True, "validity_months": None, "min_score": None, "signer_name": "",
                      "signer_title": ""},
+    "ranking": {"visible_to_learners": True, "show_full_names": True, "points_module": 20, "points_course": 100,
+                "points_path": 200},
 }
 
 
@@ -39,7 +42,8 @@ def test_changes_merge_section_by_section_and_unknown_keys_are_dropped(client, d
     assert first.status_code == 200, first.text
     (logged,) = [record for record in caplog.records if record.getMessage() == "platform_settings_updated"]
     assert (logged.admin_id, logged.sections) == (admin.id, ["certificates"])  # who changed what reaches everyone
-    second = _patch(client, admin_headers, {"general": {"company_name": "Acme", "theme": "x"}, "ranking": {"a": 1}})
+    second = _patch(client, admin_headers, {"general": {"company_name": "Acme", "theme": "x"}, "badges": {"a": 1},
+                                            "ranking": {"a": 1}})
 
     expected = {
         **DEFAULTS,
@@ -69,6 +73,11 @@ def test_changes_merge_section_by_section_and_unknown_keys_are_dropped(client, d
     ({"certificates": {"signer_name": 5}}, "El nombre del firmante debe ser un texto de hasta 200"),
     ({"general": {"company_name": ["Acme"]}}, "El nombre de la empresa debe ser un texto de hasta 200"),
     ({"certificates": "sí"}, "Revisa los parámetros: hay un valor que no es válido."),
+    ({"ranking": {"visible_to_learners": "quizás"}}, "Indica si los colaboradores ven el ranking (sí o no)."),
+    ({"ranking": {"show_full_names": None}}, "Indica si el ranking muestra los nombres completos (sí o no)."),
+    ({"ranking": {"points_module": -1}}, "Los puntos por módulo completado deben ser un número entero entre 0 y"),
+    ({"ranking": {"points_course": 1001}}, "Los puntos por curso completado deben ser un número entero entre 0 y"),
+    ({"ranking": {"points_path": 2.5}}, "Los puntos por ruta completada deben ser un número entero entre 0 y 1000."),
 ])
 def test_wrong_values_are_rejected_in_the_admins_words(client, admin_headers, changes, message):
     _patch(client, admin_headers, {"general": {"company_name": "Acme"}})
@@ -103,6 +112,16 @@ def test_collaborators_cannot_read_or_change_the_parameters(client, collaborator
     headers = auth_headers(client, collaborator.email)
     assert client.get(f"{API}/settings", headers=headers).status_code == 403
     assert _patch(client, headers, {"general": {"company_name": "X"}}).status_code == 403
+
+
+def test_learners_read_only_what_they_need(client, admin_headers, collaborator):
+    headers = auth_headers(client, collaborator.email)
+    assert client.get(f"{API}/learn/settings", headers=headers).json() == {"ranking_visible": True, "company_name": ""}
+
+    _patch(client, admin_headers, {"general": {"company_name": "Acme"}, "ranking": {"visible_to_learners": False}})
+
+    assert client.get(f"{API}/learn/settings", headers=headers).json() == {"ranking_visible": False,
+                                                                           "company_name": "Acme"}
 
 
 # ── Evaluation defaults ───────────────────────────────────────────────

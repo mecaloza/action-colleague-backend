@@ -1,19 +1,24 @@
-"""Admin: team members (collaborators and admins), their profile and each person's courses."""
+"""Admin: team members (collaborators and admins), their profile, each person's courses and overview ("ficha"), and
+giving someone their quiz attempts back."""
+
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_admin
-from app.api.lookups import user_or_404
+from app.api.lookups import module_or_404, user_or_404
 from app.core.security import hash_password
-from app.db.models import Enrollment, JobProfile, RefreshToken, User
+from app.db.models import Enrollment, JobProfile, ModuleProgress, RefreshToken, User
 from app.schemas.learn import LearnerCourse
+from app.schemas.people import PersonOverview, QuizReset
 from app.schemas.profiles import ProfileRef
 from app.schemas.users import Role, UserCreate, UserRow, UserUpdate
-from app.services import certificates, paths, progress
+from app.services import certificates, paths, people, progress, quiz
 from app.services.learner_views import learner_course
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/users", tags=["users"], dependencies=[Depends(require_admin)])
 
 
@@ -122,6 +127,11 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db), admin: User 
     return _rows(db, [user])[0]
 
 
+@router.get("/{user_id}", response_model=UserRow)
+def get_user(user_id: int, db: Session = Depends(get_db)):
+    return _rows(db, [user_or_404(db, user_id)])[0]
+
+
 @router.patch("/{user_id}", response_model=UserRow)
 def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
     user = user_or_404(db, user_id)
@@ -169,3 +179,45 @@ def user_courses(user_id: int, db: Session = Depends(get_db)):
         )
         for e in enrollments
     ]
+
+
+@router.get("/{user_id}/overview", response_model=PersonOverview)
+def user_overview(user_id: int, db: Session = Depends(get_db)):
+    """Everything about a person's learning on one page: their numbers, paths, courses module by module (quiz and
+    activities), certificates and the latest things they did. A fixed number of reads, whatever their size."""
+    return people.overview(db, user_or_404(db, user_id))
+
+
+@router.post("/{user_id}/modules/{module_id}/quiz-reset", response_model=QuizReset)
+def reset_quiz_attempts(
+    user_id: int, module_id: int, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+):
+    """Give a person their attempts at a module's quiz back (out of them, a sequential path would keep them stuck),
+    unless they passed it. What they answered stays in their history, and their next attempt is numbered after it."""
+    user = user_or_404(db, user_id)
+    module = module_or_404(db, module_id)
+    evaluation = module.evaluation
+    if not quiz.evaluation_questions(evaluation):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Este módulo no tiene evaluación")
+    enrollment = (
+        db.query(Enrollment).filter(Enrollment.user_id == user.id, Enrollment.course_id == module.course_id).first()
+    )
+    if enrollment is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Esta persona no está inscrita en el curso")
+    # Locked as a submission locks it: one in flight is counted first, then given back too.
+    record = (
+        db.query(ModuleProgress)
+        .filter(ModuleProgress.enrollment_id == enrollment.id, ModuleProgress.module_id == module.id)
+        .with_for_update()
+        .populate_existing()
+        .first()
+    )
+    if record is not None and record.passed:
+        raise HTTPException(status.HTTP_409_CONFLICT, "La persona ya aprobó esta evaluación.")
+    given_back = (record.attempts or 0) if record is not None else 0
+    if given_back:
+        record.attempts = 0
+    db.commit()
+    logger.info("quiz_attempts_reset", extra={"admin_id": admin.id, "user_id": user.id, "module_id": module.id,
+                                              "attempts_given_back": given_back})
+    return QuizReset(attempts_used=0, max_attempts=quiz.max_attempts(evaluation))

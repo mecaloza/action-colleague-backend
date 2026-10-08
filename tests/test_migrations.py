@@ -60,6 +60,11 @@ def _column_names(url: str, table: str) -> set[str]:
         return {column["name"] for column in inspect(engine).get_columns(table)}
 
 
+def _index_names(url: str, table: str) -> set[str]:
+    with _engine(url) as engine:
+        return {index["name"] for index in inspect(engine).get_indexes(table)}
+
+
 def _schema_diff(url: str) -> list:
     with _engine(url) as engine, engine.connect() as connection:
         context = MigrationContext.configure(connection, opts=COMPARE_OPTIONS)
@@ -68,6 +73,7 @@ def _schema_diff(url: str) -> list:
 
 _PATH_TABLES = ("job_profiles", "learning_paths", "learning_path_profiles", "learning_path_courses", "path_assignments")
 _CERTIFICATE_TABLES = ("app_settings", "learner_certificates")
+_POINTS_TABLES = ("learner_points",)
 
 
 def _legacy_database(url: str) -> None:
@@ -97,7 +103,7 @@ def test_fresh_database_matches_the_models(database_url):
     run_migrations(database_url)
 
     assert _schema_diff(database_url) == []
-    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0005_certificates_settings",)]
+    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0006_points_ranking",)]
 
 
 def test_production_like_database_is_stamped_then_upgraded(database_url):
@@ -114,7 +120,7 @@ def test_production_like_database_is_stamped_then_upgraded(database_url):
         5: "ai",
     }
     assert [bool(revoked) for (revoked,) in _fetch(database_url, "SELECT revoked FROM refresh_tokens")] == [True]
-    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0005_certificates_settings",)]
+    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0006_points_ranking",)]
     assert _schema_diff(database_url) == []
 
 
@@ -140,7 +146,7 @@ def test_new_tables_have_row_level_security_on_postgres(database_url):
     run_migrations(database_url)
 
     tables = ("media_assets", "jobs", "activities", "activity_attempts", *_PATH_TABLES, *_CERTIFICATE_TABLES,
-              VERSION_TABLE)
+              *_POINTS_TABLES, VERSION_TABLE)
     rows = _fetch(
         database_url,
         "SELECT relname, relrowsecurity FROM pg_class WHERE relname IN "
@@ -153,11 +159,29 @@ def test_downgrade_returns_to_the_baseline(database_url):
     run_migrations(database_url)
     command.downgrade(alembic_config(database_url), BASELINE_REVISION)
 
-    assert {"media_assets", "jobs", "activities", "activity_attempts", *_PATH_TABLES, *_CERTIFICATE_TABLES}.isdisjoint(
-        _table_names(database_url)
-    )
+    assert {"media_assets", "jobs", "activities", "activity_attempts", *_PATH_TABLES, *_CERTIFICATE_TABLES,
+            *_POINTS_TABLES}.isdisjoint(_table_names(database_url))
     assert "source" not in _column_names(database_url, "courses")
     assert "profile_id" not in _column_names(database_url, "users")
+    assert _index_names(database_url, "evaluation_attempts") == {"ix_evaluation_attempts_id"}
+
+
+def test_downgrading_the_points_keeps_the_attempts(database_url):
+    """Back to certificates: the ledger and the new indexes go; the attempts they were read from stay."""
+    run_migrations(database_url)
+    _execute(
+        database_url,
+        "INSERT INTO users (id, name, email, password_hash, role) VALUES (1, 'Ana', 'a@x.test', 'h', 'collaborator')",
+        "INSERT INTO learner_points (user_id, source, source_key, points) VALUES (1, 'course', 'course:1', 100)",
+    )
+
+    command.downgrade(alembic_config(database_url), "0005_certificates_settings")
+
+    assert "learner_points" not in _table_names(database_url)
+    assert "ix_evaluation_attempts_enrollment_id" not in _index_names(database_url, "evaluation_attempts")
+    assert "ix_activity_attempts_user_finished" not in _index_names(database_url, "activity_attempts")
+    run_migrations(database_url)  # and up again
+    assert _schema_diff(database_url) == []
 
 
 # --- added in review -------------------------------------------------------------------------

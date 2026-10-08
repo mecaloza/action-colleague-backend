@@ -46,7 +46,10 @@ class ActivityAttempt(Base):
     the learner only ever sees what they have earned."""
 
     __tablename__ = "activity_attempts"
-    __table_args__ = (Index("ix_activity_attempts_enrollment_activity", "enrollment_id", "activity_id"),)
+    __table_args__ = (
+        Index("ix_activity_attempts_enrollment_activity", "enrollment_id", "activity_id"),
+        Index("ix_activity_attempts_user_finished", "user_id", "finished_at"),  # a person's plays, newest first
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     activity_id: Mapped[int] = mapped_column(ForeignKey("activities.id", ondelete="CASCADE"))

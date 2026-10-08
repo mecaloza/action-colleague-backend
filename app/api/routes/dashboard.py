@@ -3,11 +3,22 @@
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_db, require_admin
-from app.db.models import Course, Enrollment, EvaluationAttempt, Module, ModuleProgress, User
+from app.db.models import (
+    ActivityAttempt,
+    Certificate,
+    Course,
+    Enrollment,
+    EvaluationAttempt,
+    LearningPath,
+    Module,
+    ModuleProgress,
+    PathAssignment,
+    User,
+)
 from app.schemas.dashboard import ActivityItem, Dashboard, TopCourse
 from app.services.course_views import ACTIVE_GENERATION
 from app.services.metrics import percentage
@@ -28,21 +39,31 @@ def _naive_utc(value: datetime | None) -> datetime:
 
 
 def _active_learners_30d(db: Session) -> int:
-    """People who took a quiz or completed a module in the last 30 days."""
-    since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=30)  # naive UTC columns
-    took_quiz = db.query(EvaluationAttempt.user_id).filter(EvaluationAttempt.created_at >= since).distinct()
+    """People who took a quiz, completed a module or played an activity in the last 30 days."""
+    since = datetime.now(timezone.utc) - timedelta(days=30)
+    naive_since = since.replace(tzinfo=None)  # older columns are naive UTC
+    took_quiz = db.query(EvaluationAttempt.user_id).filter(EvaluationAttempt.created_at >= naive_since).distinct()
     completed_module = (
         db.query(Enrollment.user_id)
         .join(ModuleProgress, ModuleProgress.enrollment_id == Enrollment.id)
-        .filter(ModuleProgress.completed_at >= since)
+        .filter(ModuleProgress.completed_at >= naive_since)
         .distinct()
     )
-    return len({user_id for (user_id,) in took_quiz} | {user_id for (user_id,) in completed_module})
+    played = (
+        db.query(ActivityAttempt.user_id)
+        .filter(  # an admin's preview is no learning
+            ActivityAttempt.enrollment_id.isnot(None),
+            or_(ActivityAttempt.started_at >= since, ActivityAttempt.finished_at >= since),
+        )
+        .distinct()
+    )
+    return len({user_id for query in (took_quiz, completed_module, played) for (user_id,) in query})
 
 
 def _quiz_activity(attempt: EvaluationAttempt) -> ActivityItem:
     return ActivityItem(
         kind="passed_quiz" if attempt.passed else "failed_quiz",
+        user_id=attempt.user_id,
         user_name=attempt.user.name,
         course_id=attempt.module.course_id,
         course_title=attempt.module.course.title,
@@ -55,6 +76,7 @@ def _quiz_activity(attempt: EvaluationAttempt) -> ActivityItem:
 def _completion_activity(enrollment: Enrollment) -> ActivityItem:
     return ActivityItem(
         kind="completed_course",
+        user_id=enrollment.user_id,
         user_name=enrollment.user.name,
         course_id=enrollment.course_id,
         course_title=enrollment.course.title,
@@ -62,8 +84,34 @@ def _completion_activity(enrollment: Enrollment) -> ActivityItem:
     )
 
 
+def _certificate_activity(certificate: Certificate, user_name: str) -> ActivityItem:
+    by_course = certificate.kind == "course"
+    return ActivityItem(
+        kind="certificate_issued",
+        user_id=certificate.user_id,
+        user_name=user_name,
+        course_id=certificate.course_id if by_course else None,
+        course_title=certificate.title if by_course else "",
+        path_id=None if by_course else certificate.path_id,
+        path_title=None if by_course else certificate.title,
+        certificate_code=certificate.code,
+        at=certificate.issued_at,
+    )
+
+
+def _path_activity(assignment: PathAssignment, user_name: str, path_title: str) -> ActivityItem:
+    return ActivityItem(
+        kind="path_completed",
+        user_id=assignment.user_id,
+        user_name=user_name,
+        path_id=assignment.path_id,
+        path_title=path_title,
+        at=assignment.completed_at,
+    )
+
+
 def _recent_activity(db: Session) -> list[ActivityItem]:
-    """The latest quiz results and course completions together, newest first."""
+    """The latest quiz results, course and path completions and certificates issued together, newest first."""
     attempts = (
         db.query(EvaluationAttempt)
         .options(joinedload(EvaluationAttempt.user), joinedload(EvaluationAttempt.module).joinedload(Module.course))
@@ -79,8 +127,26 @@ def _recent_activity(db: Session) -> list[ActivityItem]:
         .limit(RECENT_COMPLETIONS_LIMIT)
         .all()
     )
+    issued = (
+        db.query(Certificate, User.name)
+        .join(User, User.id == Certificate.user_id)
+        .order_by(Certificate.issued_at.desc(), Certificate.id.desc())
+        .limit(RECENT_COMPLETIONS_LIMIT)
+        .all()
+    )
+    paths_completed = (
+        db.query(PathAssignment, User.name, LearningPath.title)
+        .join(User, User.id == PathAssignment.user_id)
+        .join(LearningPath, LearningPath.id == PathAssignment.path_id)
+        .filter(PathAssignment.completed_at.isnot(None))
+        .order_by(PathAssignment.completed_at.desc(), PathAssignment.id.desc())
+        .limit(RECENT_COMPLETIONS_LIMIT)
+        .all()
+    )
     activity = [_quiz_activity(attempt) for attempt in attempts]
     activity += [_completion_activity(enrollment) for enrollment in completions]
+    activity += [_certificate_activity(certificate, name) for certificate, name in issued]
+    activity += [_path_activity(assignment, name, title) for assignment, name, title in paths_completed]
     activity.sort(key=lambda item: _naive_utc(item.at), reverse=True)
     return activity[:RECENT_ACTIVITY_LIMIT]
 

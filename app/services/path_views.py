@@ -190,8 +190,9 @@ def path_people(db: Session, path: LearningPath, user_ids: list[int] | None = No
     return people
 
 
-def _learner_path(path: paths.AssignedPath, journey: paths.Journey, media: MediaResolver, now: datetime,
-                  certificate: CertificateRef | None) -> LearnerPath:
+def learner_path(path: paths.AssignedPath, journey: paths.Journey, media: MediaResolver, now: datetime,
+                 certificate: CertificateRef | None) -> LearnerPath:
+    """A path as its learner sees it: each course's state and lock, the one to go on with, the deadline."""
     steps = []
     for step in path.steps:
         done, total, pct = journey.module_progress(step.course_id)
@@ -232,4 +233,4 @@ def learner_paths(db: Session, user_id: int) -> list[LearnerPath]:
     )
     earned = certificates.learner_refs(db, user_id, path_ids=[path.id for path in journey.paths]).paths
     now = paths.utcnow()
-    return [_learner_path(path, journey, media, now, earned.get(path.id)) for path in journey.paths]
+    return [learner_path(path, journey, media, now, earned.get(path.id)) for path in journey.paths]

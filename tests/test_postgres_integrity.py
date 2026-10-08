@@ -133,6 +133,9 @@ def test_concurrent_passing_submissions_pass_once(client, db, admin, collaborato
     assert codes.count(200) == 1 and codes.count(409) == 5
     assert db.query(Enrollment).one().status == "completed"
     assert _count(db, "SELECT count(*) FROM learner_certificates") == 1
+    # Its points once too: the quiz's 100, the module's and the course's.
+    assert _count(db, "SELECT string_agg(source || '=' || points, ',' ORDER BY id) FROM learner_points") == (
+        "quiz=100,module=20,course=100")
 
 
 def test_saving_the_position_never_undoes_a_completion(client, db, session_factory, admin, collaborator, monkeypatch):
@@ -609,8 +612,9 @@ def test_a_path_reaches_many_people_in_a_few_statements(client, db, engine, admi
 
 
 def test_bulk_completion_completes_and_reopens_paths_in_a_few_statements(client, db, engine, admin, collaborator):
-    """An admin's module change completes (or reopens) a course for everyone at once: their paths and certificates
-    follow, set-based (5 statements more for the 600 certificates: the parameters, a read and an insert each)."""
+    """An admin's module change completes (or reopens) a course for everyone at once: their paths, certificates and
+    points follow, set-based (5 statements more for the 600 certificates: the parameters, a read and an insert each;
+    2 for the 601 milestones of points: an insert each)."""
     admin_headers = auth_headers(client, admin.email)
     course, module_ids = _course(client, admin_headers, collaborator, modules=3)
     _seed_audience(db, course["id"], module_ids, learners=300)  # the first two modules completed by everyone
@@ -633,6 +637,8 @@ def test_bulk_completion_completes_and_reopens_paths_in_a_few_statements(client,
     issued = "SELECT count(*) FROM learner_certificates WHERE revoked_at IS NULL AND kind = '{}'"
     # The course's: the 300 and the collaborator (enrolled with them, not in the path); none revoked by the reopening.
     assert (_count(db, issued.format("course")), _count(db, issued.format("path"))) == (301, 300)
+    earned = "SELECT count(*) || ' x ' || min(points) FROM learner_points WHERE source = '{}'"
+    assert (_count(db, earned.format("course")), _count(db, earned.format("path"))) == ("301 x 100", "300 x 200")
 
 
 def test_path_deletes_respect_foreign_keys(client, db, admin, collaborator):
@@ -876,3 +882,68 @@ def test_a_course_completed_while_an_admin_approves_its_outline_never_deadlocks(
 
     assert not errors, errors  # DeadlockDetected, with the course locked FOR UPDATE
     assert _count(db, "SELECT count(*) FROM learner_certificates WHERE kind = 'course'") == 1
+
+
+def test_the_points_of_the_past_are_derived_in_a_few_statements(client, db, engine, admin, collaborator):
+    """The maintenance pass over 300 people who completed modules and took quizzes before points existed: set-based
+    (the milestones in three statements, the plays and quizzes read once each and written in batches), and only once."""
+    from app.services import points
+
+    admin_headers = auth_headers(client, admin.email)
+    course, module_ids = _course(client, admin_headers, collaborator, modules=3)
+    _seed_audience(db, course["id"], module_ids, learners=300)  # two modules completed, a quiz failed with 0
+    db.execute(text("UPDATE evaluation_attempts SET score = 40"))
+    db.commit()
+    people = _count(db, "SELECT count(*) FROM enrollments")  # the 300 and the collaborator
+
+    with QueryCounter(engine) as counter:
+        written = points.backfill(db)
+
+    assert written == people * 3  # the two modules of each, and their quiz's 40
+    assert counter.count <= 12, counter.count
+    assert _count(db, "SELECT count(*) FROM learner_points WHERE source = 'module' AND points = 20") == people * 2
+    assert _count(db, "SELECT count(DISTINCT user_id) FROM learner_points WHERE source = 'quiz' AND points = 40") == (
+        people)
+    assert points.backfill(db) == 0
+
+
+def test_rankings_add_up_the_period_in_the_platforms_time_zone(client, db, admin, collaborator, monkeypatch):
+    """On Postgres's timestamptz: the day starts at midnight in the platform's zone, and a path counts its people in
+    its courses and for completing it."""
+    from datetime import datetime, timezone
+
+    from app.services import ranking
+
+    monkeypatch.setattr(ranking, "utcnow", lambda: datetime(2026, 10, 7, 3, 30, tzinfo=timezone.utc))
+    admin_headers = auth_headers(client, admin.email)
+    client.patch("/api/v1/settings", headers=admin_headers, json={"general": {"timezone": "America/Bogota"}})
+    course, _ = _course(client, admin_headers, collaborator, quiz=False)
+    path = _path_with(client, admin_headers, [course["id"]], status="published")
+    client.post(f"/api/v1/paths/{path['id']}/people", headers=admin_headers, json={"user_ids": [collaborator.id]})
+    other = db.execute(text(
+        "INSERT INTO users (name, email, role, password_hash, is_active) "
+        "VALUES ('Otra', 'otra@x.test', 'collaborator', 'x', true) RETURNING id"
+    )).scalar()
+    db.execute(
+        text(
+            "INSERT INTO learner_points (user_id, course_id, path_id, source, source_key, points, earned_at) VALUES "
+            "(:me, :c, NULL, 'activity', 'activity:1', 10, '2026-10-06 00:00:00-05'), "  # today's midnight, there
+            "(:me, :c, NULL, 'activity', 'activity:1', 5, '2026-10-05 23:59:59-05'), "  # yesterday
+            "(:me, NULL, :p, 'path', 'path:' || :p, 200, '2026-10-06 08:00:00-05'), "
+            "(:other, NULL, NULL, 'activity', 'activity:2', 50, '2026-10-06 09:00:00-05')"  # not on the path
+        ),
+        {"me": collaborator.id, "c": course["id"], "p": path["id"], "other": other},
+    )
+    db.commit()
+
+    def ranked(**params) -> list[tuple[int, str, int]]:
+        body = client.get("/api/v1/ranking", headers=admin_headers, params=params).json()
+        return [(item["rank"], item["user"]["name"], item["points"]) for item in body["items"]]
+
+    assert ranked() == [(1, "colab", 210), (2, "Otra", 50)]
+    assert ranked(period="week") == [(1, "colab", 215), (2, "Otra", 50)]
+    assert ranked(path_id=path["id"]) == [(1, "colab", 210)]
+    mine = client.get("/api/v1/learn/ranking", headers=auth_headers(client, collaborator.email),
+                      params={"path_id": path["id"]}).json()
+    assert (mine["starts_at"], mine["me"], mine["total_people"]) == (
+        "2026-10-06T00:00:00-05:00", {"rank": 1, "points": 210}, 1)
