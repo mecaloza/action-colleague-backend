@@ -11,7 +11,7 @@ Learning paths: who takes each one, their courses, the order they open in and wh
   began); courses that are not published are skipped (learners can't open them anyway).
 - Completion. A path is completed once every one of its published courses is (and it has one). It is stored on the
   assignment by the completion transitions of `progress` and derived again on read; storing it issues the path's
-  certificate (`certificates`).
+  certificate (`certificates`) and earns its points (`points`).
 
 Every write is one statement whatever the audience (a profile with hundreds of people, a course in many paths).
 """
@@ -29,6 +29,7 @@ from app.db.models import (
     ActivityAttempt,
     Course,
     Enrollment,
+    EvaluationAttempt,
     JobProfile,
     LearningPath,
     LearningPathCourse,
@@ -39,7 +40,7 @@ from app.db.models import (
     User,
 )
 from app.schemas.paths import CourseRef, PathSettings
-from app.services import certificates
+from app.services import certificates, points
 from app.services.metrics import percentage
 
 NO_SYNC = {"synchronize_session": False}
@@ -115,7 +116,7 @@ def refresh_completion(db: Session, *, path_ids=None, user_ids=None, course_ids=
     course added to the path, a module added to a course): the same rule as an enrollment's, except for a completed
     path kept only as history (its profile no longer gives it: reopened, the next sync would drop it). Draft and
     archived paths keep what they had. Three statements; returns the assignments that just became completed, whose
-    certificates are issued (two more, only then).
+    certificates are issued and points earned (three more, only then).
     """
     db.flush()  # the enrollments this request changed are read below
     published = select(LearningPath.id).where(LearningPath.status == "published")
@@ -139,6 +140,8 @@ def refresh_completion(db: Session, *, path_ids=None, user_ids=None, course_ids=
         execution_options=NO_SYNC,
     )
     certificates.issue_for_assignments(db, completed)
+    if completed:
+        points.award_paths(db, PathAssignment.id.in_(completed))
     return completed
 
 
@@ -589,7 +592,9 @@ def _load_courses(db: Session, journeys: dict[int, Journey], course_ids: set[int
         or_(ModuleProgress.completed.is_(True), ModuleProgress.attempts > 0, ModuleProgress.last_position_seconds > 0),
     )
     played = select(ActivityAttempt.enrollment_id).where(ActivityAttempt.enrollment_id.in_(enrollment_ids))
-    for (enrollment_id,) in db.execute(union(progressed, played)):
+    # The attempts kept, whatever their count says: attempts an admin gave back (a reset) never close a started course.
+    quizzed = select(EvaluationAttempt.enrollment_id).where(EvaluationAttempt.enrollment_id.in_(enrollment_ids))
+    for (enrollment_id,) in db.execute(union(progressed, played, quizzed)):
         states[enrollment_id].started = True
     if modules:
         done = db.execute(

@@ -7,6 +7,7 @@ explicitly by the learner (after watching or reading it). Either way, a module w
 activities also needs each of them played to the end (any score). This is the only place that decides.
 A course locked by a learning path (`paths`) opens no module until it unlocks; completing a course
 completes the learner's paths that were waiting for it, and earns the certificates of both (`certificates`).
+Each module, course and path completed also earns its points, once (`points`).
 """
 
 from dataclasses import dataclass, field
@@ -17,7 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, contains_eager, selectinload
 
 from app.db.models import Activity, ActivityAttempt, Course, Enrollment, Evaluation, Module, ModuleProgress
-from app.services import certificates, paths, quiz
+from app.services import certificates, paths, points, quiz
 from app.services.metrics import percentage
 
 
@@ -103,23 +104,27 @@ def activity_best_scores(db: Session, enrollment: Enrollment) -> dict[int, int]:
 
 def module_states(
     db: Session, enrollment: Enrollment, evaluations: dict[int, Evaluation] | None = None,
-    course_unlocked: bool = True,
+    course_unlocked: bool = True, activities: dict[int, list[Activity]] | None = None,
+    best_scores: dict[int, int] | None = None,
 ) -> list[ModuleState]:
-    """`evaluations` (by module id) can be preloaded for many enrollments at once. A course its learning path still
-    keeps locked (`course_unlocked` False) opens none of its modules, except those already completed."""
+    """`evaluations` and `activities` (by module id), and the enrollment's `best_scores`, can be preloaded for many
+    enrollments at once. A course its learning path still keeps locked (`course_unlocked` False) opens none of its
+    modules, except those already completed."""
     modules = ordered_modules(enrollment.course)
     records = {record.module_id: record for record in enrollment.module_progress}
     if evaluations is None:
         evaluations = evaluations_by_module(db, modules)
-    activities = ready_activities(db, modules)
-    best = activity_best_scores(db, enrollment) if activities else {}
+    if activities is None:
+        activities = ready_activities(db, modules)
+    if best_scores is None:
+        best_scores = activity_best_scores(db, enrollment) if activities else {}
     states: list[ModuleState] = []
     unlocked = course_unlocked
     for module in modules:
         record = records.get(module.id)
         # What the learner already completed stays open, even if a reorder put it after a pending module.
         state = ModuleState(module, record, evaluations.get(module.id), unlocked or bool(record and record.completed),
-                            activities.get(module.id, []), best)
+                            activities.get(module.id, []), best_scores)
         states.append(state)
         unlocked = unlocked and state.completed
     return states
@@ -176,12 +181,15 @@ def recheck_module(db: Session, module: Module) -> None:
     evaluation = evaluations_by_module(db, [module]).get(module.id)
     has_quiz = bool(quiz.evaluation_questions(evaluation))
     waiting = db.query(ModuleProgress).filter(ModuleProgress.module_id == module.id, ModuleProgress.completed.is_(False))
+    completed_any = False
     for record in waiting.order_by(ModuleProgress.id).with_for_update():
         state = ModuleState(module, record, evaluation, True, activities,
                             activity_best_scores(db, record.enrollment) if activities else {})
         if not activities and not has_quiz:
             continue  # nothing left to complete it by itself: the learner marks it done
-        complete_if_done(state, record, has_quiz)
+        completed_any |= complete_if_done(state, record, has_quiz)
+    if completed_any:  # their points, for everyone at once
+        points.award_modules(db, ModuleProgress.module_id == module.id)
     refresh_course_enrollments(db, module.course)
 
 
@@ -216,9 +224,13 @@ def refresh_enrollment(db: Session, enrollment: Enrollment) -> None:
     states = module_states(db, enrollment)
     done = sum(1 for state in states if state.completed)
     _apply_progress(enrollment, done, len(states), any(state.progress for state in states))
-    if (enrollment.status == "completed") != was_completed:  # its certificate, and the paths with this course follow
+    if done:  # the points of the module just completed (each one earns them once)
+        points.award_modules(db, ModuleProgress.enrollment_id == enrollment.id)
+    # Its certificate and points, and the paths with this course follow.
+    if (enrollment.status == "completed") != was_completed:
         if not was_completed:
             certificates.issue_for_enrollments(db, [enrollment.id])
+            points.award_courses(db, Enrollment.id == enrollment.id)
         paths.refresh_completion(db, user_ids=[enrollment.user_id], course_ids=[enrollment.course_id])
 
 
@@ -256,7 +268,9 @@ def refresh_course_enrollments(db: Session, course: Course) -> None:
         completions_changed |= (enrollment.status == "completed") != was_completed
         if enrollment.status == "completed" and not was_completed:
             completed.append(enrollment.id)
-    # Their certificates and the paths with this course follow, for everyone at once.
+    # Their certificates and points, and the paths with this course follow, for everyone at once.
     certificates.issue_for_enrollments(db, completed)
+    if completed:
+        points.award_courses(db, Enrollment.id.in_(completed))
     if completions_changed:
         paths.refresh_completion(db, course_ids=[course.id])

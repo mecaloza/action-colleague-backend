@@ -19,6 +19,7 @@ from app.api.routes import (
     participants,
     paths,
     profiles,
+    ranking,
     settings,
     studio,
     users,
@@ -46,6 +47,7 @@ ROUTERS = (
     profiles,
     settings,
     certificates,
+    ranking,
 )
 
 

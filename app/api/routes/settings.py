@@ -1,4 +1,4 @@
-"""Admin: the platform's parameters ("parámetros"): general, evaluation defaults and certificates."""
+"""Admin: the platform's parameters ("parámetros"): general, evaluation defaults, certificates and ranking."""
 
 import logging
 from typing import Any

@@ -99,7 +99,8 @@ def _learner_module(state: ModuleState, media: MediaResolver, resumable: set[int
     )
 
 
-def _max_score(activity) -> int:
+def max_score(activity) -> int:
+    """The most a play of it can score (0 for a spec that no longer validates)."""
     try:
         return activity_engine.max_score(activity)
     except activity_engine.GameError:  # a spec edited by hand that no longer validates: never break the course
@@ -115,7 +116,7 @@ def _activity_summaries(state: ModuleState, resumable: set[int]) -> list[Learner
             intro=activity.intro,
             finished=activity.id in state.best_scores,
             best_score=state.best_scores.get(activity.id),
-            max_score=_max_score(activity),
+            max_score=max_score(activity),
             resumable=activity.id in resumable,
         )
         for activity in state.activities

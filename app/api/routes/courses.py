@@ -18,6 +18,7 @@ from app.db.models import (
     MediaAsset,
     Module,
     ModuleProgress,
+    PointsEntry,
     User,
     UserVideo,
 )
@@ -186,7 +187,7 @@ def update_course(course_id: int, payload: CourseUpdate, db: Session = Depends(g
 
 @router.delete("/courses/{course_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_course(course_id: int, db: Session = Depends(get_db)):
-    """Deletes the course with its modules, evaluations and participants' results."""
+    """Deletes the course with its modules, evaluations, participants' results and the points earned in it."""
     course = course_or_404(db, course_id)
     no_sync = {"synchronize_session": False}
     media = [course.cover_asset_id, *(asset_id for module in course.modules for asset_id in _module_media(module))]
@@ -194,6 +195,8 @@ def delete_course(course_id: int, db: Session = Depends(get_db)):
     enrollment_ids = [row[0] for row in db.execute(select(Enrollment.id).where(Enrollment.course_id == course_id))]
     legacy_data.delete_certificates(db, enrollment_ids)
     certificates.forget(db, course_id=course_id)  # those earned stay, with their snapshot
+    # The points earned in it go (the foreign key does it too; SQLite doesn't enforce it).
+    db.execute(delete(PointsEntry).where(PointsEntry.course_id == course_id), execution_options=no_sync)
     path_ids = paths.forget_course(db, course_id)
     _purge_modules(db, select(Module.id).where(Module.course_id == course_id))
     db.execute(delete(EvaluationAttempt).where(EvaluationAttempt.enrollment_id.in_(enrollment_ids)), execution_options=no_sync)

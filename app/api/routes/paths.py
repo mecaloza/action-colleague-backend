@@ -12,6 +12,7 @@ from app.db.models import (
     LearningPathCourse,
     LearningPathProfile,
     PathAssignment,
+    PointsEntry,
     User,
 )
 from app.schemas.paths import (
@@ -168,9 +169,10 @@ def put_path_courses(
 
 @router.delete("/{path_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_path(path_id: int, db: Session = Depends(get_db)):
-    """The path, its links and who had it go; everyone keeps their courses, progress and certificates."""
+    """The path, its links, who had it and the points for completing it go; everyone keeps their courses, progress,
+    the points earned in them and their certificates."""
     path = _path(db, path_id, lock=True)
-    for model in (PathAssignment, LearningPathCourse, LearningPathProfile):
+    for model in (PathAssignment, LearningPathCourse, LearningPathProfile, PointsEntry):
         db.execute(delete(model).where(model.path_id == path.id), execution_options=paths.NO_SYNC)
     certificates.forget(db, path_id=path.id)
     db.delete(path)

@@ -2,7 +2,7 @@ import json
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Text, func
+from sqlalchemy import DateTime, ForeignKey, Index, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, JSONList, updated_at_column
@@ -35,11 +35,13 @@ class Evaluation(Base):
 
 class EvaluationAttempt(Base):
     __tablename__ = "evaluation_attempts"
+    # A person's attempts, newest first (their overview, the points of the past).
+    __table_args__ = (Index("ix_evaluation_attempts_user_created", "user_id", "created_at"),)
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     evaluation_id: Mapped[int] = mapped_column(ForeignKey("evaluations.id"))
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
-    enrollment_id: Mapped[int] = mapped_column(ForeignKey("enrollments.id"))
+    enrollment_id: Mapped[int] = mapped_column(ForeignKey("enrollments.id"), index=True)
     module_id: Mapped[int] = mapped_column(ForeignKey("modules.id"))
     answers_json: Mapped[str | None] = mapped_column(Text, default="[]")
     # Per-question grading of the attempt (canonical format).

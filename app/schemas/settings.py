@@ -34,7 +34,7 @@ class _Section(BaseModel):
 
 class GeneralSettings(_Section):
     company_name: Name = ""  # the issuer of the certificates ("" = the platform)
-    timezone: str = DEFAULT_TIMEZONE  # where dates are written (and, later, where "today" starts)
+    timezone: str = DEFAULT_TIMEZONE  # where dates are written, and where the ranking's "today" starts
 
     @field_validator("timezone")
     @classmethod
@@ -60,9 +60,29 @@ class CertificateSettings(_Section):
     signer_title: Name = ""
 
 
+Points = Annotated[int, Field(ge=0, le=1000)]
+
+
+class RankingSettings(_Section):
+    visible_to_learners: bool = True  # collaborators see the ranking (everyone's, and their paths')
+    show_full_names: bool = True  # else "Ana P.": first name and the initial of the next one
+    # Earned once per person when they complete each one (plays and quizzes earn their improvement, 0-100).
+    points_module: Points = 20
+    points_course: Points = 100
+    points_path: Points = 200
+
+
 class PlatformSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     general: GeneralSettings = Field(default_factory=GeneralSettings)
     evaluations: EvaluationDefaults = Field(default_factory=EvaluationDefaults)
     certificates: CertificateSettings = Field(default_factory=CertificateSettings)
+    ranking: RankingSettings = Field(default_factory=RankingSettings)
+
+
+class LearnerSettings(BaseModel):
+    """The parameters a learner's app needs (the rest are the admins')."""
+
+    ranking_visible: bool
+    company_name: str

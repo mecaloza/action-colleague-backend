@@ -8,6 +8,7 @@ from app.db.models.evaluation import Evaluation, EvaluationAttempt
 from app.db.models.job import Job
 from app.db.models.media import MediaAsset, UserVideo
 from app.db.models.path import LearningPath, LearningPathCourse, LearningPathProfile, PathAssignment
+from app.db.models.points import PointsEntry
 from app.db.models.profile import JobProfile
 from app.db.models.settings import AppSettings
 from app.db.models.user import RefreshToken, User
@@ -30,6 +31,7 @@ __all__ = [
     "Module",
     "ModuleProgress",
     "PathAssignment",
+    "PointsEntry",
     "RefreshToken",
     "User",
     "UserVideo",

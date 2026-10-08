@@ -1,10 +1,10 @@
-"""Learner endpoints: my courses, paths and certificates, the course player, quizzes, interactive activities and
-completion."""
+"""Learner endpoints: my courses, paths, certificates and ranking, the course player, quizzes, interactive activities
+and completion."""
 
 import json
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from sqlalchemy import update
+from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
@@ -16,8 +16,10 @@ from app.db.models import (
     Course,
     Enrollment,
     EvaluationAttempt,
+    LearningPath,
     Module,
     ModuleProgress,
+    PathAssignment,
     User,
 )
 from app.schemas.certificates import LearnerCertificate
@@ -38,8 +40,11 @@ from app.schemas.learn import (
     QuestionResult,
 )
 from app.schemas.paths import LearnerPath
+from app.schemas.ranking import LearnerRanking, Period
+from app.schemas.settings import LearnerSettings
 from app.services import activities as engine
-from app.services import certificates, paths, progress, quiz
+from app.services import certificates, paths, points, progress, quiz, ranking
+from app.services import settings as platform
 from app.services.learner_views import course_player_detail, learner_course
 from app.services.media import MediaResolver
 from app.services.path_views import learner_paths
@@ -91,6 +96,13 @@ def _quiz_questions(state: progress.ModuleState) -> list[quiz.Question]:
     if not questions:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Este módulo no tiene evaluación")
     return questions
+
+
+def _last_attempt_number(db: Session, enrollment: Enrollment, module_id: int) -> int:
+    number = db.query(func.max(EvaluationAttempt.attempt_number)).filter(
+        EvaluationAttempt.enrollment_id == enrollment.id, EvaluationAttempt.module_id == module_id
+    ).scalar()
+    return number or 0
 
 
 def _next_module_id(states: list[progress.ModuleState], module_id: int) -> int | None:
@@ -180,6 +192,36 @@ def my_certificates(db: Session = Depends(get_db), user: User = Depends(get_curr
     return [certificates.learner_view(certificate, now) for certificate in rows]
 
 
+@router.get("/settings", response_model=LearnerSettings, dependencies=[Depends(get_current_user)])
+def my_settings(db: Session = Depends(get_db)):
+    """What the app needs of the platform's parameters: whether the ranking is shown, and the company's name."""
+    settings = platform.get_settings(db)
+    return LearnerSettings(ranking_visible=settings.ranking.visible_to_learners,
+                           company_name=settings.general.company_name)
+
+
+@router.get("/ranking", response_model=LearnerRanking)
+def my_ranking(
+    period: Period = "today",
+    path_id: int | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """The top 10 of the period and my place, over every course or in one of my published paths (403 for any other
+    path, mine or not)."""
+    path = None
+    if path_id is not None:
+        path = (
+            db.query(LearningPath)
+            .join(PathAssignment, PathAssignment.path_id == LearningPath.id)
+            .filter(LearningPath.id == path_id, LearningPath.status == "published", PathAssignment.user_id == user.id)
+            .first()
+        )
+        if path is None:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Solo puedes ver el ranking de tus rutas")
+    return ranking.learner_ranking(db, user, period, path)
+
+
 @router.get("/modules/{module_id}/quiz", response_model=LearnerQuiz)
 def get_quiz(module_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _, state, _ = _unlocked_module(db, user, module_id)
@@ -223,7 +265,9 @@ def submit_quiz(
     answers = [answer.model_dump(exclude_none=True) for answer in payload.answers]
     graded = quiz.grade(questions, answers, _token_secret(), quiz.quiz_scope(evaluation.id))
     passed = graded["score"] >= quiz.passing_score(evaluation)
-    attempt_number = used + 1
+    # Numbered after every attempt kept: attempts an admin gave back (a reset) never repeat a number.
+    attempt_number = max(_last_attempt_number(db, enrollment, module_id), used) + 1
+    used += 1
     db.add(
         EvaluationAttempt(
             evaluation_id=evaluation.id,
@@ -237,8 +281,9 @@ def submit_quiz(
             attempt_number=attempt_number,
         )
     )
-    record.attempts = attempt_number
+    record.attempts = used
     record.score = max(record.score or 0, graded["score"])
+    points.award_quiz(db, enrollment, module_id)  # what it improved on the best score
     if passed:
         record.passed = True
         # Read after the lock: an activity finished at the same time counts (its request waited or committed).
@@ -256,8 +301,8 @@ def submit_quiz(
         passed=passed,
         correct=graded["correct"],
         total=graded["total"],
-        attempts_used=attempt_number,
-        attempts_remaining=max(max_attempts - attempt_number, 0),
+        attempts_used=used,
+        attempts_remaining=max(max_attempts - used, 0),
         results=_learner_results(graded["results"], reveal),
         module_completed=bool(record.completed),
         next_module_id=_next_module_id(states, module_id) if record.completed else None,
@@ -339,10 +384,15 @@ def _own_attempt(db: Session, user: User, attempt_id: int) -> ActivityAttempt:
     return attempt
 
 
-def _count_finished_play(db: Session, enrollment: Enrollment, state: progress.ModuleState) -> ModuleProgress:
-    """A play of this module just finished: the module completes if nothing else is left, and the course follows."""
+def _count_finished_play(
+    db: Session, enrollment: Enrollment, state: progress.ModuleState, activity_id: int
+) -> ModuleProgress:
+    """A play of this module's activity just finished (by its last move, `finish`, or a stale one closed on start):
+    its points, then the module completes if nothing else is left, and the course follows."""
     db.flush()  # the finished play first: counted below
     record = progress.get_or_create_progress(db, enrollment, state.module, lock=True)
+    # Under that lock, as every play of the module: two finished at once can't both earn the same improvement.
+    points.award_play(db, enrollment, activity_id)
     # Read after the lock: another activity (or the quiz) finished at the same time counts too.
     state.best_scores = progress.activity_best_scores(db, enrollment)
     progress.complete_if_done(state, record, has_quiz=bool(quiz.evaluation_questions(state.evaluation)))
@@ -368,7 +418,7 @@ def _finish_play(db: Session, activity: Activity, attempt: ActivityAttempt, enro
         engine.finish(activity, attempt)
     except engine.GameError as exc:
         raise HTTPException(exc.status, str(exc)) from exc
-    record = _count_finished_play(db, enrollment, state)
+    record = _count_finished_play(db, enrollment, state, activity.id)
     return _completion(db, enrollment, states, state, bool(record.completed))
 
 
@@ -404,7 +454,7 @@ def start_activity(
             engine.close(play, now)
             closed_any = True
     if closed_any:
-        _count_finished_play(db, enrollment, state)
+        _count_finished_play(db, enrollment, state, activity.id)
     if not resumable:
         # A play is opened with the enrollment locked, last as in every learner request: a second tap on "Empezar"
         # (which found no play to resume either) waits here, then picks up the play this one opens.
