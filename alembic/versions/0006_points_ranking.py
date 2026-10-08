@@ -38,6 +38,7 @@ def upgrade() -> None:
         sa.Column("earned_at", _TIMESTAMP, nullable=False, server_default=_NOW),
     )
     op.create_index("ix_learner_points_id", "learner_points", ["id"])
+    op.create_index("ix_learner_points_earned", "learner_points", ["earned_at"])  # the ranking of every course
     for column in ("user", "course", "path"):
         op.create_index(f"ix_learner_points_{column}_earned", "learner_points", [f"{column}_id", "earned_at"])
     # A module, course or path completed earns its points once per person.

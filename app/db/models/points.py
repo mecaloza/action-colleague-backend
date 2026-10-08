@@ -16,6 +16,7 @@ class PointsEntry(Base):
 
     __tablename__ = "learner_points"
     __table_args__ = (
+        Index("ix_learner_points_earned", "earned_at"),  # the ranking of every course: what was earned since a date
         Index("ix_learner_points_user_earned", "user_id", "earned_at"),
         Index("ix_learner_points_course_earned", "course_id", "earned_at"),
         Index("ix_learner_points_path_earned", "path_id", "earned_at"),

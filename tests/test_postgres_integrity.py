@@ -907,6 +907,57 @@ def test_the_points_of_the_past_are_derived_in_a_few_statements(client, db, engi
     assert points.backfill(db) == 0
 
 
+@pytest.mark.parametrize("first", ["pass", "play"])
+def test_the_maintenance_pass_and_a_play_meanwhile_write_its_past_once(
+    client, db, session_factory, admin, collaborator, monkeypatch, first
+):
+    """An activity played before points existed: the maintenance pass writes its past, and so does its first play
+    since. At once, one waits for the other's commit and reads what it wrote (unlike milestones, plays have no unique
+    row to stop a second copy): its 70 once, whichever comes first, and the replay's 20 % earns nothing."""
+    from datetime import datetime, timezone
+
+    from app.api.routes import learn
+    from app.schemas.learn import ActivityMoveIn
+    from app.services import points, progress
+
+    activity = _activity_course(client, auth_headers(client, admin.email), collaborator)  # its module's only one
+    db.add(ActivityAttempt(activity_id=activity["id"], user_id=collaborator.id, enrollment_id=db.query(Enrollment.id)
+                           .scalar(), version=1, state={"done": True}, score=7, max_score=10,
+                           finished_at=datetime(2026, 3, 2, tzinfo=timezone.utc)))  # 70 %, before points existed
+    db.commit()
+    play = client.post(f"/api/v1/learn/activities/{activity['id']}/attempts",
+                       headers=auth_headers(client, collaborator.email), json={}).json()
+    ending = next(c["token"] for c in play["view"]["node"]["choices"] if c["text"].startswith("Le doy"))  # 20 %
+    paused, release = threading.Event(), threading.Event()
+
+    def pausing(call):
+        def paused_call(*args, **kwargs):
+            if not paused.is_set():
+                paused.set()
+                release.wait(5)
+            return call(*args, **kwargs)
+        return paused_call
+
+    if first == "pass":  # the past read, not written yet
+        monkeypatch.setattr(points, "_past_quizzes", pausing(points._past_quizzes))
+    else:  # the past written, not committed yet
+        monkeypatch.setattr(progress, "complete_if_done", pausing(progress.complete_if_done))
+
+    def maintenance_pass(session):
+        points.backfill(session)
+
+    def last_move(session):
+        user = session.get(User, collaborator.id)
+        learn.play_move(play["attempt_id"], ActivityMoveIn(move={"choice": ending}), db=session, user=user)
+
+    calls = (maintenance_pass, last_move) if first == "pass" else (last_move, maintenance_pass)
+    errors = _race(session_factory, *calls, paused=paused, release=release)
+
+    assert not errors, errors
+    assert _count(db, "SELECT string_agg(source || '=' || points, ',' ORDER BY id) FROM learner_points") == (
+        "activity=70,module=20,course=100")
+
+
 def test_rankings_add_up_the_period_in_the_platforms_time_zone(client, db, admin, collaborator, monkeypatch):
     """On Postgres's timestamptz: the day starts at midnight in the platform's zone, and a path counts its people in
     its courses and for completing it."""

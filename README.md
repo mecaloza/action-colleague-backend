@@ -96,6 +96,7 @@ Cada arranque encola `legacy.migrate` (idempotente, una sola copia activa):
 - Convierte las evaluaciones antiguas (`questions_json`) al formato canónico (`spec`).
 - Pone fecha de finalización a los cursos completados antes de que existiera (la del último módulo completado).
 - Emite los certificados que faltan de cursos y rutas ya completados (con las mismas reglas; nunca repite ni vuelve a emitir uno revocado).
+- Deriva los puntos de lo hecho antes de que existieran, cada uno con su fecha. Una actividad o evaluación que ya ganó puntos desde el deploy no se repite: al ganarlos escribió su pasado.
 - Copia al bucket privado los videos que la app anterior dejó en buckets públicos del proyecto y los procesa como cualquier subida (portada, duración, subtítulos). El archivo original no se toca.
 - Los videos que siguen en HeyGen esperan a que el copiado de abajo los pase a Storage; el trabajo lo vuelve a revisar cada 6 h hasta el apagado de la API de HeyGen.
 

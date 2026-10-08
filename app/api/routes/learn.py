@@ -283,7 +283,7 @@ def submit_quiz(
     )
     record.attempts = used
     record.score = max(record.score or 0, graded["score"])
-    points.award_quiz(db, enrollment, module_id, graded["score"])  # what it improved on the best score
+    points.award_quiz(db, enrollment, module_id)  # what it improved on the best score
     if passed:
         record.passed = True
         # Read after the lock: an activity finished at the same time counts (its request waited or committed).

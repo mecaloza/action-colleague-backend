@@ -312,9 +312,18 @@ def _dated(db, user) -> list[tuple[str, int, datetime]]:
 
 
 def test_the_maintenance_pass_derives_the_past_dated_when_it_happened(
-    client, db, admin, admin_headers, worker, storage, caplog
+    client, db, admin, admin_headers, worker, storage, caplog, monkeypatch
 ):
+    from app.worker.jobs import recording
+
     ana, key = _history(client, db, admin, admin_headers, "ana@test.dev")
+    written_before_the_videos, migrate_videos = [], recording._migrate_videos
+
+    def videos(session):
+        written_before_the_videos.append(session.query(PointsEntry).count())
+        return migrate_videos(session)
+
+    monkeypatch.setattr(recording, "_migrate_videos", videos)
 
     queue.enqueue(db, "legacy.migrate", dedupe_key="legacy-migrate")
     with caplog.at_level(logging.INFO, logger="app.services.points"):
@@ -323,6 +332,8 @@ def test_the_maintenance_pass_derives_the_past_dated_when_it_happened(
     db.expire_all()
     job = db.query(Job).filter(Job.type == "legacy.migrate").one()
     assert job.status == "succeeded" and job.result["points_backfilled"] == 8
+    # Seconds after a deploy, not once every HeyGen video is downloaded: a replay meanwhile finds its past written.
+    assert written_before_the_videos == [8]
     assert _dated(db, ana) == sorted([
         (key["first"], 20, _at(2)), (key["second"], 20, _at(4)), (key["course"], 100, _at(5)),
         (key["path"], 200, _at(6)),
@@ -338,10 +349,10 @@ def test_the_maintenance_pass_derives_the_past_dated_when_it_happened(
 
 def test_the_past_of_someone_who_earned_points_since_the_deploy_still_comes(client, db, admin, admin_headers):
     """Points earned between a deploy and its maintenance pass: the past of everything else is still derived, and
-    what they earned on is not counted twice."""
+    what already has points is left as it is (its first points since wrote its past)."""
     ana, key = _history(client, db, admin, admin_headers, "ana@test.dev")
     db.add(PointsEntry(user_id=ana.id, source="activity", source_key=key["activity"], points=70,
-                       earned_at=_at(20)))  # their best play, beaten right after the deploy
+                       earned_at=_at(20)))  # the activity's points, written since the deploy
     db.commit()
 
     points.backfill(db)
@@ -349,3 +360,61 @@ def test_the_past_of_someone_who_earned_points_since_the_deploy_still_comes(clie
     earned = _dated(db, ana)
     assert [row for row in earned if row[0] == key["activity"]] == [(key["activity"], 70, _at(20))]
     assert sum(row[1] for row in earned) == 70 + 20 + 20 + 100 + 200 + 100
+
+
+def test_a_replay_before_the_maintenance_pass_writes_its_past_and_earns_only_what_it_improves(
+    client, db, admin, admin_headers
+):
+    """Replaying an old activity after a deploy, before its maintenance pass: its past comes first, dated when it
+    happened as the pass would write it, so a replay below the old best earns nothing today (not the old best at
+    once); the pass then adds the rest of the past without that activity twice."""
+    ana, key = _history(client, db, admin, admin_headers, "ana@test.dev")  # their best play: 70 %
+    learner = auth_headers(client, ana.email)
+    activity_id = int(key["activity"].removeprefix("activity:"))
+    deployed = datetime.now(timezone.utc)
+
+    _converse(client, learner, activity_id, *POOR)  # 20 %
+
+    assert [row for row in _dated(db, ana) if row[0] == key["activity"]] == [
+        (key["activity"], 20, _at(1)), (key["activity"], 50, _at(2))]
+    _converse(client, learner, activity_id, *BEST)  # 100 %: 30 more, today
+    points.backfill(db)
+
+    earned = _dated(db, ana)
+    assert [(source_key, gained) for source_key, gained, at in earned if at >= deployed] == [(key["activity"], 30)]
+    assert [row for row in earned if row[2] < deployed] == sorted([
+        (key["first"], 20, _at(2)), (key["second"], 20, _at(4)), (key["course"], 100, _at(5)),
+        (key["path"], 200, _at(6)), (key["activity"], 20, _at(1)), (key["activity"], 50, _at(2)),
+        (key["quiz"], 60, _at(3)), (key["quiz"], 40, _at(4)),
+    ])
+
+
+def test_a_quiz_taken_before_the_maintenance_pass_keeps_the_best_of_its_past(client, db, admin, admin_headers):
+    """A quiz not passed yet whose best was 80 before points existed: an attempt of 40 after a deploy writes that
+    past, dated when it happened, and earns nothing (the quiz is worth 80, not 40, also once the pass comes)."""
+    course = _course(db, admin, "Seguridad")
+    (module,) = _modules(db, course)
+    evaluation = Evaluation(module_id=module.id, spec=QUESTIONS, max_attempts=5, passing_score=90)
+    db.add(evaluation)
+    db.commit()
+    ana = _learner(db)
+    _enroll(client, admin_headers, course, ana)
+    enrollment = db.query(Enrollment).filter(Enrollment.user_id == ana.id).one()
+    db.add_all([
+        ModuleProgress(enrollment_id=enrollment.id, module_id=module.id, attempts=2, score=80, passed=False),
+        *(EvaluationAttempt(evaluation_id=evaluation.id, user_id=ana.id, enrollment_id=enrollment.id,
+                            module_id=module.id, score=score, passed=False, attempt_number=number,
+                            created_at=_naive(_at(day)))
+          for number, (score, day) in enumerate([(60.0, 3), (80.0, 4)], start=1)),
+    ])
+    db.commit()
+    learner = auth_headers(client, ana.email)
+    quizzed = f"quiz:{module.id}"
+
+    assert _answer(client, learner, module, evaluation, correct=2)["score"] == 40
+
+    assert _dated(db, ana) == [(quizzed, 20, _at(4)), (quizzed, 60, _at(3))]
+    assert points.backfill(db) == 0
+    assert _answer(client, learner, module, evaluation)["passed"]  # 100: 20 more, the module and the course
+    assert _ledger(db) == [(quizzed, 60), (quizzed, 20), (quizzed, 20), (f"module:{module.id}", 20),
+                           (f"course:{course.id}", 100)]

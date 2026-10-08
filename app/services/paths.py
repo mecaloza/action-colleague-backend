@@ -29,6 +29,7 @@ from app.db.models import (
     ActivityAttempt,
     Course,
     Enrollment,
+    EvaluationAttempt,
     JobProfile,
     LearningPath,
     LearningPathCourse,
@@ -591,7 +592,9 @@ def _load_courses(db: Session, journeys: dict[int, Journey], course_ids: set[int
         or_(ModuleProgress.completed.is_(True), ModuleProgress.attempts > 0, ModuleProgress.last_position_seconds > 0),
     )
     played = select(ActivityAttempt.enrollment_id).where(ActivityAttempt.enrollment_id.in_(enrollment_ids))
-    for (enrollment_id,) in db.execute(union(progressed, played)):
+    # The attempts kept, whatever their count says: attempts an admin gave back (a reset) never close a started course.
+    quizzed = select(EvaluationAttempt.enrollment_id).where(EvaluationAttempt.enrollment_id.in_(enrollment_ids))
+    for (enrollment_id,) in db.execute(union(progressed, played, quizzed)):
         states[enrollment_id].started = True
     if modules:
         done = db.execute(

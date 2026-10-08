@@ -9,9 +9,12 @@ Points ("puntos"): what learners earn for learning, kept as a ledger (`learner_p
 - Written by the moments that count them, inside their locks: a play finished (`learn`), a quiz submitted, and the
   completion transitions of `progress` and `paths`, next to the certificates: one statement whatever the number of
   people completing at once.
-- What was earned before points existed is derived by the maintenance pass (`backfill`), dated when it happened.
+- What was earned before points existed is derived by the maintenance pass (`backfill`), dated when it happened. A
+  play or a quiz that earns its first points before the pass writes its past first, as the pass would: replaying an
+  old best earns nothing today. The pass and those writes take turns, so a past is never written twice.
 """
 
+import hashlib
 import logging
 from collections.abc import Iterable
 from math import floor
@@ -28,6 +31,8 @@ logger = logging.getLogger(__name__)
 
 _COLUMNS = ["user_id", "course_id", "path_id", "source", "source_key", "points", "earned_at"]
 _BATCH = 500  # rows per insert: far below the database's limit of parameters per statement
+# Advisory locks are database-wide and the database is shared: the key comes from a namespaced name.
+_LOCK_ID = int.from_bytes(hashlib.sha256(b"action-colleague:points").digest()[:8], "big", signed=True)
 
 
 def percent(score: int, max_score: int) -> int:
@@ -71,10 +76,31 @@ def _write_once(db: Session, rows) -> int:
     return max(result.rowcount or 0, 0)
 
 
+def _write(db: Session, entries: list[dict]) -> int:
+    """Rows of improvements, in batches; the points they add up to."""
+    for start in range(0, len(entries), _BATCH):
+        db.execute(insert(PointsEntry), entries[start:start + _BATCH])
+    return sum(entry["points"] for entry in entries)
+
+
+def _take_turns(db: Session, *, alone: bool = False) -> None:
+    """
+    Until the commit: plays and quizzes have no unique row that would stop a second copy of their past, so the
+    maintenance pass (`alone`) and the improvements written live (any number at once) take turns, each one reading
+    what the other wrote. Live, it is taken before the request writes any other points, and the pass takes it before
+    anything else: neither can wait for the other while holding what the other waits for. (Postgres only: SQLite
+    never runs in production.)
+    """
+    if db.get_bind().dialect.name == "postgresql":
+        lock = func.pg_advisory_xact_lock if alone else func.pg_advisory_xact_lock_shared
+        db.execute(select(lock(_LOCK_ID)))
+
+
 # ── Improvements: plays and quizzes ───────────────────────────────────
 
 
 def _earned_so_far(user_id: int, entry_key: str):
+    """What it earned the person (improvements always add something: 0 means it has no row yet)."""
     return (
         select(func.coalesce(func.sum(PointsEntry.points), 0))
         .where(PointsEntry.user_id == user_id, PointsEntry.source_key == entry_key)
@@ -94,31 +120,37 @@ def _improve(db: Session, enrollment: Enrollment, source: str, entry_key: str, b
 
 
 def award_play(db: Session, enrollment: Enrollment, activity_id: int) -> int:
-    """A play of this activity just finished (by its last move, `finish`, or a stale play closed on start): what the
-    learner's best percentage in it improved. Called holding the lock that counts plays of its module. Returns the
-    points earned now."""
+    """A play of this activity just finished (by its last move, `finish`, or a stale play closed on start), flushed:
+    what the learner's best percentage in it improved. Called holding the lock that counts plays of its module.
+    Returns the points written."""
+    _take_turns(db)
     entry_key = key("activity", activity_id)
+    of_this = (ActivityAttempt.enrollment_id == enrollment.id, ActivityAttempt.activity_id == activity_id)
     # Each play's `percent`, in SQL (its maximum depends on the play: a quick challenge without its clock has less).
     best = (
         select(func.max((200 * ActivityAttempt.score + ActivityAttempt.max_score) // (2 * ActivityAttempt.max_score)))
-        .where(
-            ActivityAttempt.enrollment_id == enrollment.id,
-            ActivityAttempt.activity_id == activity_id,
-            ActivityAttempt.finished_at.isnot(None),
-            ActivityAttempt.max_score > 0,
-        )
+        .where(*of_this, ActivityAttempt.finished_at.isnot(None), ActivityAttempt.max_score > 0)
         .scalar_subquery()
     )
     best_percent, earned = db.execute(select(best, _earned_so_far(enrollment.user_id, entry_key))).one()
+    if not earned:  # its first points: every play of it so far, this one included, each dated when it finished
+        return _write(db, _past_plays(db, *of_this))
     return _improve(db, enrollment, "activity", entry_key, min(max(int(best_percent or 0), 0), 100), earned)
 
 
-def award_quiz(db: Session, enrollment: Enrollment, module_id: int, score: float) -> int:
-    """A quiz submission (holding its progress row): what it improved on the learner's best score in the module's quiz
-    (a new quiz in its place included: its points go on from what the old one earned)."""
+def award_quiz(db: Session, enrollment: Enrollment, module_id: int) -> int:
+    """A quiz attempt was just added (holding its progress row): what the learner's best score in the module's quiz
+    improved (a new quiz in its place included: its points go on from what the old one earned). Returns the points
+    written."""
+    _take_turns(db)
+    db.flush()  # the attempt, counted below
     entry_key = key("quiz", module_id)
-    earned = db.execute(select(_earned_so_far(enrollment.user_id, entry_key))).scalar()
-    return _improve(db, enrollment, "quiz", entry_key, whole(score), earned)
+    of_this = (EvaluationAttempt.enrollment_id == enrollment.id, EvaluationAttempt.module_id == module_id)
+    best = select(func.max(EvaluationAttempt.score)).where(*of_this).scalar_subquery()
+    best_score, earned = db.execute(select(best, _earned_so_far(enrollment.user_id, entry_key))).one()
+    if not earned:  # its first points: every attempt so far, this one included, each dated when it was made
+        return _write(db, _past_quizzes(db, *of_this))
+    return _improve(db, enrollment, "quiz", entry_key, whole(best_score or 0), earned)
 
 
 # ── Milestones: modules, courses and paths completed ──────────────────
@@ -184,14 +216,14 @@ def _past_improvements(rows: Iterable, source: str) -> list[dict]:
     return entries
 
 
-def _past_plays(db: Session) -> list[dict]:
-    """Finished plays (never an admin's preview) of activities that earned nothing yet."""
+def _past_plays(db: Session, *conditions) -> list[dict]:
+    """Finished plays (never an admin's preview) meeting `conditions` of activities that earned nothing yet."""
     entry_key = _key_sql("activity", ActivityAttempt.activity_id)
     rows = db.execute(
         select(Enrollment.user_id, Enrollment.course_id, ActivityAttempt.activity_id, ActivityAttempt.score,
                ActivityAttempt.max_score, ActivityAttempt.finished_at)
         .join(Enrollment, Enrollment.id == ActivityAttempt.enrollment_id)
-        .where(ActivityAttempt.finished_at.isnot(None), ActivityAttempt.max_score > 0,
+        .where(ActivityAttempt.finished_at.isnot(None), ActivityAttempt.max_score > 0, *conditions,
                ~_earned("activity", Enrollment.user_id, entry_key))
         .order_by(Enrollment.user_id, ActivityAttempt.activity_id, ActivityAttempt.finished_at, ActivityAttempt.id)
     )
@@ -202,14 +234,14 @@ def _past_plays(db: Session) -> list[dict]:
     )
 
 
-def _past_quizzes(db: Session) -> list[dict]:
-    """Quiz attempts of modules whose quiz earned nothing yet."""
+def _past_quizzes(db: Session, *conditions) -> list[dict]:
+    """Quiz attempts meeting `conditions` of modules whose quiz earned nothing yet."""
     entry_key = _key_sql("quiz", EvaluationAttempt.module_id)
     rows = db.execute(
         select(Enrollment.user_id, Enrollment.course_id, EvaluationAttempt.module_id, EvaluationAttempt.score,
                func.coalesce(EvaluationAttempt.created_at, Enrollment.enrolled_at))
         .join(Enrollment, Enrollment.id == EvaluationAttempt.enrollment_id)
-        .where(EvaluationAttempt.score.isnot(None), ~_earned("quiz", Enrollment.user_id, entry_key))
+        .where(EvaluationAttempt.score.isnot(None), *conditions, ~_earned("quiz", Enrollment.user_id, entry_key))
         .order_by(Enrollment.user_id, EvaluationAttempt.module_id, EvaluationAttempt.created_at, EvaluationAttempt.id)
     )
     return _past_improvements(
@@ -221,14 +253,13 @@ def backfill(db: Session) -> int:
     """
     The points of what learners did before points existed, by the same rules and dated when they did it (the
     maintenance pass of every deploy). Idempotent per person and what earned them: a milestone already earned is
-    skipped, and so is an activity or a quiz that earned anything already (its improvements were counted as they
-    happened, the past ones included). So a learner who earned points between a deploy and this pass still gets the
-    rest of their past.
+    skipped, and so is an activity or a quiz that earned anything already (its first points since wrote its past, see
+    `award_play`). So a learner who earned points between a deploy and this pass still gets the rest of their past.
     """
+    _take_turns(db, alone=True)  # first: plays and quizzes finished meanwhile wait, or are read below
     written = award_modules(db) + award_courses(db) + award_paths(db)
     entries = _past_plays(db) + _past_quizzes(db)
-    for start in range(0, len(entries), _BATCH):
-        db.execute(insert(PointsEntry), entries[start:start + _BATCH])
+    _write(db, entries)
     written += len(entries)
     db.commit()
     if written:

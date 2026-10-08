@@ -24,7 +24,7 @@ from tests.conftest import QueryCounter, auth_headers
 from tests.test_activity_spec import DECISION
 from tests.test_certificates import _answer, _enroll, _learner
 from tests.test_learning_api import QUESTIONS
-from tests.test_paths import _assign, _course, _modules, _path, _person, _profile
+from tests.test_paths import _assign, _course, _modules, _my_courses, _path, _person, _profile
 from tests.test_points import BEST, POOR, _activity, _converse
 
 API = "/api/v1"
@@ -240,6 +240,26 @@ def test_giving_quiz_attempts_back(client, db, admin, admin_headers, caplog):
 
     passed = client.post(reset, headers=admin_headers)
     assert passed.status_code == 409 and passed.json() == {"detail": "La persona ya aprobó esta evaluación."}
+
+
+def test_attempts_given_back_can_be_used_in_a_course_a_sequential_path_keeps_open(client, db, admin, admin_headers):
+    """A course begun by its quiz alone (no module completed, no video) stays open when a path puts a pending course
+    ahead of it; giving its attempts back must not close it again."""
+    first, second = _course(db, admin, "Curso 1"), _course(db, admin, "Curso 2")
+    (module,) = _modules(db, second)
+    evaluation = _quiz(db, module, max_attempts=1, passing_score=90)
+    ana = _learner(db)
+    _enroll(client, admin_headers, second, ana)
+    learner = auth_headers(client, ana.email)
+    assert not _answer(client, learner, module, evaluation, correct=3)["passed"]  # its only attempt
+    _assign(client, admin_headers, _path(client, admin_headers, [first, second], title="Ruta"), ana)  # sequential
+    assert not _my_courses(client, learner)[second.id]["locked"]
+
+    reset = client.post(f"{API}/users/{ana.id}/modules/{module.id}/quiz-reset", headers=admin_headers)
+
+    assert reset.status_code == 200
+    assert not _my_courses(client, learner)[second.id]["locked"]
+    assert _answer(client, learner, module, evaluation)["passed"]
 
 
 def test_giving_attempts_back_needs_a_quiz_and_an_enrollment(client, db, admin, admin_headers):
