@@ -103,6 +103,24 @@ def _conflict_places(conflict: revisions.Conflict, *scripts: dict) -> str:
     return " y ".join(place for place in places if place) or "el guion"
 
 
+def _three_way_or_409(current: dict, base: dict, target: dict, *, known: dict, code: str, message: str) -> dict:
+    """`revisions.three_way` with its refusals as 409s. `message` says where it conflicts with "{places}": the
+    scenes by their number in `current`, or else in `known`."""
+    try:
+        return revisions.three_way(current, base, target)
+    except revisions.Conflict as conflict:
+        raise HTTPException(status.HTTP_409_CONFLICT, {
+            "code": code, "message": message.format(places=_conflict_places(conflict, current, known)),
+            "scene_ids": conflict.scene_ids, "reading": conflict.reading,
+        }) from conflict
+    except revisions.RevisionError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+
+def _applied_out(db: Session, revision: ModuleRevision, render_job: Job | None) -> RevisionApplied:
+    return RevisionApplied(revision=_revision_out(db, revision), render_job=render_job and job_out(render_job))
+
+
 def _supersede(db: Session, module_id: int, statuses: tuple[str, ...], besides: int | None = None) -> None:
     """Older proposals for the module's script give way to the newer change."""
     conditions = [ModuleRevision.module_id == module_id, ModuleRevision.target == "script",
@@ -207,7 +225,7 @@ def apply_revision(
     db.refresh(revision, with_for_update=True)
     if revision.status == "applied":  # a double click: what the first one did
         render_job = queue.active_with_key(db, f"render:{module.id}") if payload.render else None
-        return RevisionApplied(revision=_revision_out(db, revision), render_job=render_job and job_out(render_job))
+        return _applied_out(db, revision, render_job)
     if revision.status == "proposing":
         raise HTTPException(status.HTTP_409_CONFLICT, "La propuesta aún se está preparando; espera a que termine")
     if revision.status != "proposed":
@@ -215,17 +233,10 @@ def apply_revision(
     _require_ai_module(module, "aplicar cambios al guion con IA")
     _require_editable(db, module, "aplica el cambio")
     current = revisions.script_content(module)
-    try:
-        result = revisions.three_way(current, revision.before, revision.after)
-    except revisions.Conflict as conflict:
-        places = _conflict_places(conflict, current, revision.after)
-        raise HTTPException(status.HTTP_409_CONFLICT, {
-            "code": "revision_stale",
-            "message": f"El guion cambió en {places} desde la propuesta; pide el cambio de nuevo.",
-            "scene_ids": conflict.scene_ids, "reading": conflict.reading,
-        }) from conflict
-    except revisions.RevisionError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    result = _three_way_or_409(
+        current, revision.before, revision.after, known=revision.after, code="revision_stale",
+        message="El guion cambió en {places} desde la propuesta; pide el cambio de nuevo.",
+    )
     revisions.write_script(module, result)
     proposed = revision.changes or {}
     reasons = {change["scene_id"]: change.get("reason", "") for change in proposed.get("scenes", [])}
@@ -244,7 +255,7 @@ def apply_revision(
     logger.info("revision_applied", extra={"revision_id": revision.id, "module_id": module.id,
                                            "scenes": len(changes["scenes"]), "rebased": changes["rebased"],
                                            "render": render_job is not None})
-    return RevisionApplied(revision=_revision_out(db, revision), render_job=render_job and job_out(render_job))
+    return _applied_out(db, revision, render_job)
 
 
 @router.post("/revisions/{revision_id}/discard", response_model=Revision)
@@ -282,17 +293,10 @@ def revert_revision(revision_id: int, db: Session = Depends(get_db), admin: User
     _require_ai_module(module, "deshacer cambios del guion")
     _require_editable(db, module, "deshaz el cambio")
     current = revisions.script_content(module)
-    try:
-        restored = revisions.three_way(current, revision.after, revision.before)
-    except revisions.Conflict as conflict:
-        places = _conflict_places(conflict, current, revision.after)
-        raise HTTPException(status.HTTP_409_CONFLICT, {
-            "code": "revision_conflict",
-            "message": f"No se puede deshacer: después cambió {places}. Edítalo a mano o pide otro cambio.",
-            "scene_ids": conflict.scene_ids, "reading": conflict.reading,
-        }) from conflict
-    except revisions.RevisionError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    restored = _three_way_or_409(
+        current, revision.after, revision.before, known=revision.after, code="revision_conflict",
+        message="No se puede deshacer: después cambió {places}. Edítalo a mano o pide otro cambio.",
+    )
     title = (revision.summary or revision.observation or "un cambio").strip()
     undo = revisions.record(
         db, module, source="revert", before=current, after=restored, user_id=admin.id,

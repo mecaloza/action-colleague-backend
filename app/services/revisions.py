@@ -372,12 +372,10 @@ def impact(before: dict, after: dict, production: Production) -> dict:
 
 def describe(before: dict, after: dict, production: Production, reasons: dict[str, str] | None = None) -> dict:
     """The change from `before` to `after` as a revision keeps it (`changes`; see schemas.revisions)."""
-    reading = None
-    if before["reading"] != after["reading"]:
-        reading = {"before": before["reading"], "after": after["reading"]}
     return {
         "scenes": scene_changes(before["scenes"], after["scenes"], reasons),
-        "reading": reading,
+        "reading": {"before": before["reading"], "after": after["reading"]}
+        if before["reading"] != after["reading"] else None,
         "impact": impact(before, after, production),
         "ignored": [],
         "affected_question_ids": [],
