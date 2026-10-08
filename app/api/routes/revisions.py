@@ -244,6 +244,15 @@ def _queue_proposal(
     return RevisionProposal(revision=_revision_out(db, revision), job=job_out(job))
 
 
+def _chosen_ids(chosen: list[str] | None, items: list[dict], message: str) -> list[str]:
+    """The scenes or questions the admin chose (without repeats), 422 `message` when one is no longer there."""
+    chosen = list(dict.fromkeys(chosen or []))
+    present = {item.get("id") for item in items}
+    if any(item_id not in present for item_id in chosen):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, message)
+    return chosen
+
+
 def _propose_script(db: Session, module: Module, payload: RevisionCreate, admin: User) -> RevisionProposal:
     _require_ai_module(module, "pedir cambios al guion con IA")
     db.refresh(module, with_for_update=True)  # two asks at once: one waits and sees the other
@@ -251,12 +260,9 @@ def _propose_script(db: Session, module: Module, payload: RevisionCreate, admin:
     if not content["scenes"]:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"«{module.title}» no tiene guion todavía")
     _require_no_active(db, f"draft:{module.id}", "El guion se está escribiendo; pide el cambio cuando termine")
-    scene_ids = list(dict.fromkeys(payload.scene_ids or []))
-    present = {scene.get("id") for scene in content["scenes"]}
-    if any(scene_id not in present for scene_id in scene_ids):
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT, "Alguna escena elegida ya no está en el guion; vuelve a cargarlo"
-        )
+    scene_ids = _chosen_ids(
+        payload.scene_ids, content["scenes"], "Alguna escena elegida ya no está en el guion; vuelve a cargarlo"
+    )
     scope = {**revisions.empty_scope(), "scene_ids": scene_ids, "qa_issue_id": payload.qa_issue_id}
     return _queue_proposal(db, module, admin, payload, content, scope, key=f"revise:script:{module.id}")
 
@@ -266,13 +272,10 @@ def _propose_quiz(db: Session, module: Module, payload: RevisionCreate, admin: U
     content = quiz_revisions.content(module)
     if not content["questions"]:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"«{module.title}» no tiene evaluación todavía")
-    question_ids = list(dict.fromkeys(payload.question_ids or []))
-    present = {question["id"] for question in content["questions"]}
-    if any(question_id not in present for question_id in question_ids):
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT,
-            "Alguna pregunta elegida ya no está en la evaluación; vuelve a cargarla",
-        )
+    question_ids = _chosen_ids(
+        payload.question_ids, content["questions"],
+        "Alguna pregunta elegida ya no está en la evaluación; vuelve a cargarla",
+    )
     scope = {**revisions.empty_scope(), "question_ids": question_ids, "qa_issue_id": payload.qa_issue_id}
     return _queue_proposal(db, module, admin, payload, content, scope, key=f"revise:quiz:{module.id}")
 

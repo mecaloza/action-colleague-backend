@@ -9,15 +9,14 @@ RevisionTarget = Literal["script", "quiz", "activity"]
 RevisionSource = Literal["observation", "qa", "manual", "regenerate", "revert"]
 RevisionStatus = Literal["proposing", "proposed", "applied", "discarded", "failed", "superseded", "reverted"]
 ChangeAction = Literal["update", "insert", "delete", "move"]  # move: the same content, in another place
-SceneId = Annotated[str, StringConstraints(min_length=1, max_length=40)]
-QuestionId = Annotated[str, StringConstraints(min_length=1, max_length=40)]
+ItemId = Annotated[str, StringConstraints(min_length=1, max_length=40)]  # a scene's or a question's
 
 
 class RevisionCreate(BaseModel):
     target: RevisionTarget = "script"
     observation: str = Field(min_length=1, max_length=4000)
-    scene_ids: list[SceneId] | None = Field(default=None, max_length=40)  # script: none (or empty) = the whole script
-    question_ids: list[QuestionId] | None = Field(default=None, max_length=30)  # quiz: none (or empty) = all of it
+    scene_ids: list[ItemId] | None = Field(default=None, max_length=40)  # script: none (or empty) = the whole script
+    question_ids: list[ItemId] | None = Field(default=None, max_length=30)  # quiz: none (or empty) = all of it
     activity_id: int | None = None  # activity: the one it changes (required for that target)
     qa_issue_id: str | None = Field(default=None, max_length=64)  # the video review's finding it fixes
 

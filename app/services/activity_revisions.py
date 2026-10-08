@@ -182,10 +182,11 @@ def entity_changes(before: dict, after: dict) -> list[dict]:
             added.add(path)
             changes.append({"path": path, "action": "insert", "label": new.label(path), "before": None,
                             "after": new.whole[path]})
-        elif old.values[path] != value or path in moved:
-            action = "update" if old.values[path] != value else "move"
-            changes.append({"path": path, "action": action, "label": new.label(path), "before": old.values[path],
-                            "after": value})
+        else:
+            updated = old.values[path] != value
+            if updated or path in moved:
+                changes.append({"path": path, "action": "update" if updated else "move", "label": new.label(path),
+                                "before": old.values[path], "after": value})
     for path in old.values:
         if path not in new.values and not _inside(path, removed):
             removed.add(path)
