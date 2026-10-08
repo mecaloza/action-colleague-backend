@@ -386,12 +386,18 @@ def finish(activity: Activity, attempt: ActivityAttempt, now: datetime | None = 
         raise GameError("Esta partida ya terminó.", status=409)
     if not state["done"]:
         _playable(activity, attempt)
-    timed_out = (activity.type == "quick" and state.get("deadline")
-                 and (now or utcnow()) > datetime.fromisoformat(state["deadline"]))
+    deadline = _deadline(state)
+    timed_out = deadline is not None and (now or utcnow()) > deadline
     if not state["done"] and not timed_out:
         raise GameError("La partida todavía no termina.", status=409)
     close(attempt, now)
     return {"score": attempt.score, "max_score": attempt.max_score}
+
+
+def _deadline(state: dict) -> datetime | None:
+    """When a timed quick challenge runs out (only its state has one)."""
+    deadline = state.get("deadline")
+    return datetime.fromisoformat(deadline) if deadline else None
 
 
 def close(attempt: ActivityAttempt, now: datetime | None = None) -> None:
@@ -405,18 +411,26 @@ def close(attempt: ActivityAttempt, now: datetime | None = None) -> None:
 def resumable(activity: Activity, attempt: ActivityAttempt, now: datetime | None = None) -> bool:
     """Whether an open play can go on: started on the current version, not over yet and, a quick challenge with a
     clock, still within its time (plus the grace a late move gets). Any other open play is stale."""
-    state = attempt.state
-    if attempt.finished_at is not None or attempt.version != activity.version or state["done"]:
+    if attempt.finished_at is not None or attempt.version != activity.version or attempt.state["done"]:
         return False
-    deadline = state.get("deadline") if activity.type == "quick" else None
-    if not deadline:
-        return True
-    return (now or utcnow()) <= datetime.fromisoformat(deadline) + timedelta(seconds=QUICK_GRACE_SECONDS)
+    deadline = _deadline(attempt.state)
+    return deadline is None or (now or utcnow()) <= deadline + timedelta(seconds=QUICK_GRACE_SECONDS)
+
+
+def open_plays(db: Session, enrollment_id: int, activity_ids: list[int], lock: bool = False) -> list[ActivityAttempt]:
+    """The unfinished plays of an enrollment in these activities, newest first (`lock`: held until the commit)."""
+    query = (
+        db.query(ActivityAttempt)
+        .filter(ActivityAttempt.enrollment_id == enrollment_id, ActivityAttempt.activity_id.in_(activity_ids),
+                ActivityAttempt.finished_at.is_(None))
+        .order_by(ActivityAttempt.id.desc())
+    )
+    return (query.with_for_update() if lock else query).all()
 
 
 def played(attempt: ActivityAttempt) -> bool:
-    """Whether a play had at least one move: a choice, a decision, a try, a match or a mistake (or it is over).
-    A stale play with a move is closed with its score (it counts, as when the clock runs out); one without, deleted."""
+    """Whether a play had at least one move (or it is over). A stale play with a move is closed with its score
+    (it counts, as when the clock runs out); one without, deleted."""
     state = attempt.state
     return bool(state["done"] or state.get("path") or state.get("decided") or state.get("tries")
                 or state.get("solved") or state.get("mistakes"))

@@ -290,24 +290,19 @@ def start_activity(
     # the delete's cascade needs the plays locked below, and the new play needs the activity), then its open plays
     # (a second tap on "Empezar", or a move still in flight, waits and then finds no stale play left to close).
     db.refresh(activity, with_for_update={"read": True, "key_share": True})
-    open_plays = (
-        db.query(ActivityAttempt)
-        .filter(ActivityAttempt.activity_id == activity.id, ActivityAttempt.enrollment_id == enrollment.id,
-                ActivityAttempt.finished_at.is_(None))
-        .order_by(ActivityAttempt.id.desc())
-        .with_for_update()
-        .all()
-    )
+    open_plays = engine.open_plays(db, enrollment.id, [activity.id], lock=True)
     now = engine.utcnow()  # once the locks are held: a wait for them can't make an expired play look alive
     resumable = [play for play in open_plays if engine.resumable(activity, play, now)]
-    stale = [play for play in open_plays if play not in resumable]
-    kept = [play for play in stale if engine.played(play)]
-    for play in stale:
-        if play in kept:
+    closed_any = False
+    for play in open_plays:
+        if play in resumable:
+            continue
+        if engine.played(play):
             engine.close(play, now)
+            closed_any = True
         else:
             db.delete(play)
-    if kept:
+    if closed_any:
         _count_finished_play(db, enrollment, state)
     attempt = resumable[0] if resumable else None  # the newest
     try:

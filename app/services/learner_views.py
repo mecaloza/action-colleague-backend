@@ -2,7 +2,7 @@
 
 from sqlalchemy.orm import Session
 
-from app.db.models import ActivityAttempt, Course, Enrollment
+from app.db.models import Course, Enrollment
 from app.schemas.learn import (
     LearnerCourse,
     LearnerCourseDetail,
@@ -106,11 +106,7 @@ def _resumable_activities(db: Session, enrollment: Enrollment, states: list[Modu
     activities = {activity.id: activity for state in states if state.unlocked for activity in state.activities}
     if not activities:
         return set()
-    plays = db.query(ActivityAttempt).filter(
-        ActivityAttempt.enrollment_id == enrollment.id,
-        ActivityAttempt.activity_id.in_(list(activities)),
-        ActivityAttempt.finished_at.is_(None),
-    )
+    plays = activity_engine.open_plays(db, enrollment.id, list(activities))
     now = activity_engine.utcnow()
     return {play.activity_id for play in plays if activity_engine.resumable(activities[play.activity_id], play, now)}
 
