@@ -42,7 +42,66 @@ class FakeLLM:
             return designer.ActivitiesDraft(activities=self._activities())
         if schema is designer.StoryboardPatchDraft:
             return self._storyboard_patch(user)
+        if schema is designer.QuizPatchDraft:
+            return self._quiz_patch(user)
+        if schema is designer.ActivityPatchDraft:
+            return self._activity_patch(user)
         raise NotImplementedError(schema.__name__)
+
+    def _quiz_patch(self, prompt: str) -> designer.QuizPatchDraft:
+        """Rewords the questions in scope ("Revisado: …"; without a scope, the first one). When the observation
+        mentions the explanation ("explicación"), only their explanation changes (they keep their id); "agrega" also
+        adds a true/false question after the last of them."""
+        questions = json.loads(_fenced_after(prompt, "PREGUNTAS ACTUALES"))
+        scope = prompt.split("PREGUNTAS EN ALCANCE:", 1)[1].split("\n", 1)[0].strip()
+        observation = prompt.split("OBSERVACIÓN DEL ADMINISTRADOR:", 1)[1].lower()
+        ids = [questions[0]["id"]] if scope == "todas" else [question_id.strip() for question_id in scope.split(",")]
+        by_id = {question["id"]: question for question in questions}
+        changes = []
+        for question_id in filter(by_id.__contains__, ids):
+            question = by_id[question_id]
+            if "explicaci" in observation:
+                field, value = "explanation", f"Revisado: {question.get('explanation', '')}".strip()
+            else:
+                field, value = "prompt", f"Revisado: {question['prompt']}"
+            changes.append(designer.QuestionChangeDraft(
+                action="update", question_id=question_id, fields=[field], reason="Así lo pidió la observación.",
+                question=self._question(question["type"], **{field: value}),
+            ))
+        if "agrega" in observation:
+            changes.append(designer.QuestionChangeDraft(
+                action="insert_after", question_id=ids[-1], fields=[], reason="Así lo pidió la observación.",
+                question=self._question("true_false", prompt="Revisado: una pregunta nueva", correct_bool=True,
+                                        explanation="Así lo dice el módulo."),
+            ))
+        return designer.QuizPatchDraft(summary=f"Ajusté {len(changes)} pregunta(s) según la observación.",
+                                       changes=changes, unresolved="")
+
+    def _activity_patch(self, prompt: str) -> designer.ActivityPatchDraft:
+        """Rewords the intro ("Revisado: …") and, in a conversation, adds a sentence to the first choice's feedback
+        (in the other kinds, rewords the instruction). When the observation mentions the title ("título") it is
+        retitled too."""
+        activity = json.loads(_fenced_after(prompt, "ACTIVIDAD ACTUAL"))
+        observation = prompt.split("OBSERVACIÓN DEL ADMINISTRADOR:", 1)[1].lower()
+        spec = activity["spec"]
+        if activity["type"] == "decision":
+            choice = spec["nodes"][0]["choices"][0]
+            choice["feedback"] = f"{choice['feedback']} Revisado."
+        else:
+            spec["prompt"] = f"Revisado: {spec['prompt']}"[:200]
+        title = activity["title"]
+        if re.search(r"t[ií]tulo", observation):
+            title = f"Revisado: {title}"
+        return designer.ActivityPatchDraft(
+            summary="Ajusté la actividad según la observación.", title=title,
+            intro=f"Revisado: {activity['intro']}".strip(), spec_json=json.dumps(spec, ensure_ascii=False),
+            unresolved="",
+        )
+
+    def _question(self, kind: str, **fields) -> designer.QuestionDraft:
+        empty = {"prompt": "", "scenario": "", "options": [], "correct_index": 0, "correct_bool": False, "items": [],
+                 "pairs": [], "answers": [], "hint": "", "explanation": ""}
+        return designer.QuestionDraft(type=kind, **{**empty, **fields})
 
     def _storyboard_patch(self, prompt: str) -> designer.StoryboardPatchDraft:
         """Retitles the scenes in scope ("Revisado: …"; without a scope, the first one). When the observation
@@ -177,18 +236,16 @@ class FakeLLM:
         )
 
     def _questions(self) -> list[designer.QuestionDraft]:
-        empty = {"scenario": "", "options": [], "correct_index": 0, "correct_bool": False, "items": [], "pairs": [],
-                 "answers": [], "hint": ""}
         return [
-            designer.QuestionDraft(**{**empty, "type": "single_choice", "prompt": "¿Cuál es la primera idea clave?",
-                                      "options": ["La primera", "Ninguna", "La última"], "correct_index": 0,
-                                      "explanation": "Es la primera."}),
-            designer.QuestionDraft(**{**empty, "type": "true_false", "prompt": "Hay que hacerlo con prisa.",
-                                      "correct_bool": False, "explanation": "Se hace con cuidado."}),
-            designer.QuestionDraft(**{**empty, "type": "ordering", "prompt": "Ordena los pasos",
-                                      "items": ["Preparar", "Hacer", "Revisar"], "explanation": "Ese es el orden."}),
-            designer.QuestionDraft(**{**empty, "type": "fill_blank", "prompt": "Hay que trabajar con _____.",
-                                      "answers": ["cuidado"], "hint": "c...", "explanation": "Con cuidado."}),
+            self._question("single_choice", prompt="¿Cuál es la primera idea clave?",
+                           options=["La primera", "Ninguna", "La última"], correct_index=0,
+                           explanation="Es la primera."),
+            self._question("true_false", prompt="Hay que hacerlo con prisa.", correct_bool=False,
+                           explanation="Se hace con cuidado."),
+            self._question("ordering", prompt="Ordena los pasos", items=["Preparar", "Hacer", "Revisar"],
+                           explanation="Ese es el orden."),
+            self._question("fill_blank", prompt="Hay que trabajar con _____.", answers=["cuidado"], hint="c...",
+                           explanation="Con cuidado."),
         ]
 
 

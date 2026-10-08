@@ -1,10 +1,11 @@
 """
-Changes to a module's script by an observation: the AI proposes one (a job), the admin reviews its diff and applies it
-(and, if they want, produces the video again) or discards it. Any applied change — proposed, saved by hand or
-rewritten by the AI — can be undone.
+Changes to a module's content by an observation (its script, its quiz or one of its activities): the AI proposes one
+(a job), the admin reviews its diff and applies it (a script's, producing the video again if they want) or discards
+it. Any applied change — proposed, saved by hand or rewritten by the AI — can be undone.
 """
 
 import logging
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -22,18 +23,20 @@ from app.api.routes.studio import (
     _require_no_active,
     _require_voice,
 )
-from app.db.models import Job, Module, ModuleRevision, User
+from app.db.models import Activity, Job, Module, ModuleRevision, User
 from app.schemas.revisions import (
     Revision,
     RevisionApplied,
     RevisionApply,
     RevisionCreate,
+    RevisionLearners,
     RevisionProposal,
     RevisionScope,
     RevisionSummary,
     RevisionTarget,
 )
-from app.services import revisions, studio
+from app.services import activity_revisions, quiz, quiz_revisions, revisions, studio
+from app.services.activity_spec import SpecError
 from app.services.course_views import ACTIVE_GENERATION
 from app.services.media_views import job_out
 from app.worker import queue
@@ -41,7 +44,11 @@ from app.worker import queue
 router = APIRouter(tags=["revisions"], dependencies=[Depends(require_admin)])
 logger = logging.getLogger(__name__)
 
-BUSY_WITH_OTHER_CHANGE = "Ya se está preparando otro cambio de este guion; espera a que termine para pedir otro."
+BUSY_WITH_OTHER_CHANGE = {
+    "script": "Ya se está preparando otro cambio de este guion; espera a que termine para pedir otro.",
+    "quiz": "Ya se está preparando otro cambio de esta evaluación; espera a que termine para pedir otro.",
+    "activity": "Ya se está preparando otro cambio de esta actividad; espera a que termine para pedir otro.",
+}
 MAX_SUMMARY_CHARS = 300
 
 
@@ -61,12 +68,33 @@ def _summary_fields(revision: ModuleRevision, author: str | None) -> dict:
     }
 
 
+def _learners(db: Session, revision: ModuleRevision) -> RevisionLearners | None:
+    """Who a pending change to a quiz or an activity would reach as soon as it is applied (a script's waits for its
+    video)."""
+    if revision.target == "script" or revision.status not in revisions.PENDING:
+        return None
+    module = db.get(Module, revision.module_id)
+    if module is None:
+        return None
+    published = module.course.status == "published"
+    if revision.target == "quiz":
+        # An explanation fixed leaves every answer valid; while being proposed, it isn't known yet.
+        changes_answers = revision.after is None or quiz_revisions.changes_answers(revision.before, revision.after)
+        mid_quiz = quiz_revisions.learners_mid_quiz(db, module) if changes_answers else 0
+        return RevisionLearners(published=published, mid_quiz=mid_quiz)
+    activity = db.get(Activity, revision.activity_id) if revision.activity_id else None
+    if activity is None:
+        return None
+    return RevisionLearners(published=published and activity.status == "ready",
+                            mid_play=activity_revisions.learners_mid_play(db, activity))
+
+
 def _revision_out(db: Session, revision: ModuleRevision) -> Revision:
     author = db.get(User, revision.created_by) if revision.created_by else None
     return Revision(
         **_summary_fields(revision, author.name if author else None),
         scope=RevisionScope.model_validate(revision.scope or {}), unresolved=revision.unresolved or "",
-        changes=revision.changes, error=revision.error, job_id=revision.job_id,
+        changes=revision.changes, error=revision.error, job_id=revision.job_id, learners=_learners(db, revision),
     )
 
 
@@ -78,42 +106,92 @@ def _require_editable(db: Session, module: Module, action: str) -> None:
         raise HTTPException(status.HTTP_409_CONFLICT, f"El guion se está generando; {action} cuando termine")
 
 
-def _scenes_label(scene_ids: list[str], *scripts: dict) -> str:
-    """Scenes by their number, as the admin knows them ("la escena 2", "las escenas 2 y 5"), looked up in the
-    first script that has each."""
+def _require_kept(db: Session, activity: Activity, action: str) -> None:
+    """An AI draft nobody touched is replaced when the module's activities are drafted again: not while that runs."""
+    drafting = queue.active_with_key(db, f"activities:{activity.module_id}") is not None
+    if activity.source == "ai" and activity.status == "draft" and drafting:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"Se están creando las actividades del módulo; {action} cuando termine"
+        )
+
+
+def _numbered(item_ids: list[str], lists: list[list[dict]], noun: str) -> str:
+    """Scenes or questions by their number, as the admin knows them ("la escena 2", "las preguntas 2 y 5"), looked
+    up in the first list that has each."""
     numbers = []
-    for scene_id in scene_ids:
-        for script in scripts:
-            ids = [scene.get("id") for scene in script["scenes"]]
-            if scene_id in ids:
-                numbers.append(ids.index(scene_id) + 1)
+    for item_id in item_ids:
+        for items in lists:
+            ids = [item.get("id") for item in items]
+            if item_id in ids:
+                numbers.append(ids.index(item_id) + 1)
                 break
     numbers = sorted(set(numbers))
     if not numbers:
         return ""
     if len(numbers) == 1:
-        return f"la escena {numbers[0]}"
-    return f"las escenas {', '.join(map(str, numbers[:-1]))} y {numbers[-1]}"
+        return f"la {noun} {numbers[0]}"
+    return f"las {noun}s {', '.join(map(str, numbers[:-1]))} y {numbers[-1]}"
 
 
-def _conflict_places(conflict: revisions.Conflict, *scripts: dict) -> str:
+def _script_places(conflict: revisions.Conflict, *scripts: dict) -> str:
     """Where the script changed since, for the admin: "la escena 2", "las escenas 2 y 5 y la lectura"..."""
-    places = [_scenes_label(conflict.scene_ids, *scripts), "la lectura" if conflict.reading else ""]
+    places = [_numbered(conflict.ids, [script["scenes"] for script in scripts], "escena"),
+              "la lectura" if conflict.reading else ""]
     return " y ".join(place for place in places if place) or "el guion"
 
 
-def _three_way_or_409(current: dict, base: dict, target: dict, *, known: dict, code: str, message: str) -> dict:
-    """`revisions.three_way` with its refusals as 409s. `message` says where it conflicts with "{places}": the
-    scenes by their number in `current`, or else in `known`."""
+def _quiz_places(conflict: revisions.Conflict, *quizzes: dict) -> str:
+    return _numbered(conflict.ids, [each["questions"] for each in quizzes], "pregunta") or "la evaluación"
+
+
+def _merged_or_409(
+    merge: Callable[[], dict], *, code: str, message: str, places: Callable[[revisions.Conflict], str],
+    detail: Callable[[revisions.Conflict], dict],
+) -> dict:
+    """A three-way merge (`merge`) with its refusals as 409s: where it conflicts goes into `message` ("{places}") and,
+    by id, into the detail."""
     try:
-        return revisions.three_way(current, base, target)
+        return merge()
     except revisions.Conflict as conflict:
         raise HTTPException(status.HTTP_409_CONFLICT, {
-            "code": code, "message": message.format(places=_conflict_places(conflict, current, known)),
-            "scene_ids": conflict.scene_ids, "reading": conflict.reading,
+            "code": code, "message": message.format(places=places(conflict)), **detail(conflict),
         }) from conflict
     except revisions.RevisionError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+
+def _script_detail(conflict: revisions.Conflict) -> dict:
+    return {"scene_ids": conflict.ids, "reading": conflict.reading}
+
+
+def _quiz_detail(conflict: revisions.Conflict) -> dict:
+    return {"question_ids": conflict.ids}
+
+
+def _activity_detail(conflict: revisions.Conflict) -> dict:
+    return {"paths": conflict.ids}
+
+
+def _write_quiz(db: Session, module: Module, wanted: dict) -> None:
+    try:
+        questions = quiz.validate_questions(wanted["questions"])
+    except quiz.InvalidQuestions as exc:  # each question was valid; together (merged) they are not
+        raise HTTPException(status.HTTP_409_CONFLICT, f"La evaluación quedaría con un error: {exc}") from exc
+    quiz_revisions.write(db, module, questions)
+
+
+def _valid_activity(activity: Activity, wanted: dict) -> dict:
+    try:
+        return activity_revisions.validated(activity.type, wanted)
+    except SpecError as exc:  # each version was valid; their parts together (merged) are not
+        raise HTTPException(status.HTTP_409_CONFLICT, f"La actividad quedaría con un error: {exc}") from exc
+
+
+def _activity_of(db: Session, revision: ModuleRevision) -> Activity:
+    activity = db.get(Activity, revision.activity_id) if revision.activity_id else None
+    if activity is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "La actividad de este cambio ya no existe")
+    return activity
 
 
 def _applied_out(db: Session, revision: ModuleRevision, render_job: Job | None) -> RevisionApplied:
@@ -123,15 +201,50 @@ def _applied_out(db: Session, revision: ModuleRevision, render_job: Job | None) 
 # ── Proposals ─────────────────────────────────────────────────────────
 
 
-@router.post("/modules/{module_id}/revisions", response_model=RevisionProposal,
-             status_code=status.HTTP_202_ACCEPTED)
-def propose_revision(
-    module_id: int, payload: RevisionCreate, db: Session = Depends(get_db), admin: User = Depends(require_admin)
-):
-    """Ask the AI to change the module's script as the observation says (only the chosen scenes, when given). Nothing
-    changes until the proposal is applied."""
-    _require_ai()
-    module = module_or_404(db, module_id)
+def _check_scope(payload: RevisionCreate) -> None:
+    """What is chosen belongs to the target: scenes to a script, questions to a quiz, an activity to itself."""
+    if payload.target != "script" and payload.scene_ids:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Las escenas se eligen solo para cambiar el guion")
+    if payload.target != "quiz" and payload.question_ids:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, "Las preguntas se eligen solo para cambiar la evaluación"
+        )
+    if payload.target != "activity" and payload.activity_id is not None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, "La actividad se elige solo para cambiar una actividad"
+        )
+
+
+def _queue_proposal(
+    db: Session, module: Module, admin: User, payload: RevisionCreate, content: dict, scope: dict, *, key: str,
+    activity_id: int | None = None,
+) -> RevisionProposal:
+    """The proposal being prepared by the AI: a new one, or the same one when the same is asked again meanwhile."""
+    active = queue.active_with_key(db, key)
+    if active is not None:  # a double click gets the same proposal; another observation waits for it
+        waiting = db.get(ModuleRevision, (active.payload or {}).get("revision_id"))
+        if waiting is None or waiting.observation != payload.observation or waiting.scope != scope:
+            raise HTTPException(status.HTTP_409_CONFLICT, BUSY_WITH_OTHER_CHANGE[payload.target])
+        return RevisionProposal(revision=_revision_out(db, waiting), job=job_out(active))
+    # "Pedir otro ajuste": the newest observation wins over the earlier proposals for the same (script, quiz, activity).
+    revisions.supersede(db, module.id, target=payload.target, activity_id=activity_id)
+    revision = ModuleRevision(
+        module_id=module.id, target=payload.target, activity_id=activity_id,
+        source="qa" if payload.qa_issue_id else "observation", status="proposing", observation=payload.observation,
+        scope=scope, base_hash=revisions.content_hash(content), before=content, created_by=admin.id,
+    )
+    db.add(revision)
+    db.flush()
+    job = queue.enqueue(
+        db, "ai.revise", {"revision_id": revision.id}, course_id=module.course_id, module_id=module.id,
+        created_by=admin.id, dedupe_key=key, max_attempts=AI_JOB_ATTEMPTS, commit=False,
+    )
+    revision.job_id = job.id
+    db.commit()
+    return RevisionProposal(revision=_revision_out(db, revision), job=job_out(job))
+
+
+def _propose_script(db: Session, module: Module, payload: RevisionCreate, admin: User) -> RevisionProposal:
     _require_ai_module(module, "pedir cambios al guion con IA")
     db.refresh(module, with_for_update=True)  # two asks at once: one waits and sees the other
     content = revisions.script_content(module)
@@ -145,34 +258,59 @@ def propose_revision(
             status.HTTP_422_UNPROCESSABLE_CONTENT, "Alguna escena elegida ya no está en el guion; vuelve a cargarlo"
         )
     scope = {**revisions.empty_scope(), "scene_ids": scene_ids, "qa_issue_id": payload.qa_issue_id}
-    dedupe_key = f"revise:script:{module.id}"
-    active = queue.active_with_key(db, dedupe_key)
-    if active is not None:  # a double click gets the same proposal; another observation waits for it
-        waiting = db.get(ModuleRevision, (active.payload or {}).get("revision_id"))
-        if waiting is None or waiting.observation != payload.observation or waiting.scope != scope:
-            raise HTTPException(status.HTTP_409_CONFLICT, BUSY_WITH_OTHER_CHANGE)
-        return RevisionProposal(revision=_revision_out(db, waiting), job=job_out(active))
-    revisions.supersede(db, module.id)  # "Pedir otro ajuste": the newest observation wins
-    revision = ModuleRevision(
-        module_id=module.id, target="script", source="qa" if payload.qa_issue_id else "observation",
-        status="proposing", observation=payload.observation, scope=scope, base_hash=revisions.content_hash(content),
-        before=content, created_by=admin.id,
-    )
-    db.add(revision)
-    db.flush()
-    job = queue.enqueue(
-        db, "ai.revise", {"revision_id": revision.id}, course_id=module.course_id, module_id=module.id,
-        created_by=admin.id, dedupe_key=dedupe_key, max_attempts=AI_JOB_ATTEMPTS, commit=False,
-    )
-    revision.job_id = job.id
-    db.commit()
-    return RevisionProposal(revision=_revision_out(db, revision), job=job_out(job))
+    return _queue_proposal(db, module, admin, payload, content, scope, key=f"revise:script:{module.id}")
+
+
+def _propose_quiz(db: Session, module: Module, payload: RevisionCreate, admin: User) -> RevisionProposal:
+    db.refresh(module, with_for_update={"key_share": True})  # as a save of the quiz: two asks at once, one waits
+    content = quiz_revisions.content(module)
+    if not content["questions"]:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"«{module.title}» no tiene evaluación todavía")
+    question_ids = list(dict.fromkeys(payload.question_ids or []))
+    present = {question["id"] for question in content["questions"]}
+    if any(question_id not in present for question_id in question_ids):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "Alguna pregunta elegida ya no está en la evaluación; vuelve a cargarla",
+        )
+    scope = {**revisions.empty_scope(), "question_ids": question_ids, "qa_issue_id": payload.qa_issue_id}
+    return _queue_proposal(db, module, admin, payload, content, scope, key=f"revise:quiz:{module.id}")
+
+
+def _propose_activity(db: Session, module: Module, payload: RevisionCreate, admin: User) -> RevisionProposal:
+    if payload.activity_id is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Elige la actividad que quieres cambiar")
+    activity = db.get(Activity, payload.activity_id)
+    if activity is None or activity.module_id != module.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Actividad no encontrada")
+    db.refresh(activity, with_for_update={"key_share": True})  # as a save of the activity: one waits for the other
+    _require_kept(db, activity, "pide el cambio")
+    scope = {**revisions.empty_scope(), "qa_issue_id": payload.qa_issue_id}
+    return _queue_proposal(db, module, admin, payload, activity_revisions.content(activity), scope,
+                           key=f"revise:activity:{activity.id}", activity_id=activity.id)
+
+
+@router.post("/modules/{module_id}/revisions", response_model=RevisionProposal,
+             status_code=status.HTTP_202_ACCEPTED)
+def propose_revision(
+    module_id: int, payload: RevisionCreate, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+):
+    """Ask the AI to change the module's script, its quiz or one of its activities as the observation says (only the
+    chosen scenes or questions, when given). Nothing changes until the proposal is applied."""
+    _require_ai()
+    module = module_or_404(db, module_id)
+    _check_scope(payload)
+    if payload.target == "quiz":
+        return _propose_quiz(db, module, payload, admin)
+    if payload.target == "activity":
+        return _propose_activity(db, module, payload, admin)
+    return _propose_script(db, module, payload, admin)
 
 
 @router.get("/modules/{module_id}/revisions", response_model=list[RevisionSummary])
 def list_revisions(
-    module_id: int, target: RevisionTarget | None = None, limit: int = Query(50, ge=1, le=200),
-    db: Session = Depends(get_db),
+    module_id: int, target: RevisionTarget | None = None, activity_id: int | None = None,
+    limit: int = Query(50, ge=1, le=200), db: Session = Depends(get_db),
 ):
     """The module's changes, newest first: proposals and every change applied to it (and undone)."""
     module_or_404(db, module_id)
@@ -185,6 +323,8 @@ def list_revisions(
     )
     if target is not None:
         query = query.filter(ModuleRevision.target == target)
+    if activity_id is not None:
+        query = query.filter(ModuleRevision.activity_id == activity_id)
     rows = query.order_by(ModuleRevision.created_at.desc(), ModuleRevision.id.desc()).limit(limit).all()
     return [RevisionSummary(**_summary_fields(revision, author)) for revision, author in rows]
 
@@ -197,17 +337,28 @@ def get_revision(revision_id: int, db: Session = Depends(get_db)):
 # ── Applying, discarding and undoing ──────────────────────────────────
 
 
-@router.post("/revisions/{revision_id}/apply", response_model=RevisionApplied)
-def apply_revision(
-    revision_id: int, payload: RevisionApply, db: Session = Depends(get_db), admin: User = Depends(require_admin)
-):
-    """Make the proposal the module's script: over edits made since, as long as they are in other scenes. With
-    `render`, the module's video is produced again too."""
-    revision = _revision_or_404(db, revision_id)
-    module = module_or_404(db, revision.module_id)
+def _appliable(revision: ModuleRevision) -> bool:
+    """Whether the proposal is to be applied now: not when it already was (a double click gets what the first one
+    did); 409 when it can't be."""
+    if revision.status == "applied":
+        return False
+    if revision.status == "proposing":
+        raise HTTPException(status.HTTP_409_CONFLICT, "La propuesta aún se está preparando; espera a que termine")
+    if revision.status != "proposed":
+        raise HTTPException(status.HTTP_409_CONFLICT, "Esta propuesta ya no está vigente; pide el cambio de nuevo")
+    return True
+
+
+def _mark_applied(revision: ModuleRevision, before: dict, after: dict, changes: dict, admin: User) -> None:
+    """The proposal, as it was applied: over the content then (`before`), with what changed then."""
+    revision.before, revision.after, revision.changes = before, after, changes
+    revision.status, revision.applied_at, revision.applied_by = "applied", datetime.now(timezone.utc), admin.id
+
+
+def _apply_script(db: Session, revision: ModuleRevision, module: Module, render: bool, admin: User) -> RevisionApplied:
     # Only a video the module has is produced again (its first one is made from the studio), and what it takes is
     # checked before changing anything: the change and its video go together.
-    render = payload.render and bool(module.video_asset_id or module.video_url)
+    render = render and bool(module.video_asset_id or module.video_url)
     choices = None
     if render:
         _require_voice()
@@ -215,19 +366,16 @@ def apply_revision(
         _check_presenters(choices)
     db.refresh(module, with_for_update=True)  # as a manual save, and before the revision (the job's own lock)
     db.refresh(revision, with_for_update=True)
-    if revision.status == "applied":  # a double click: what the first one did
+    if not _appliable(revision):
         render_job = queue.active_with_key(db, f"render:{module.id}") if render else None
         return _applied_out(db, revision, render_job)
-    if revision.status == "proposing":
-        raise HTTPException(status.HTTP_409_CONFLICT, "La propuesta aún se está preparando; espera a que termine")
-    if revision.status != "proposed":
-        raise HTTPException(status.HTTP_409_CONFLICT, "Esta propuesta ya no está vigente; pide el cambio de nuevo")
     _require_ai_module(module, "aplicar cambios al guion con IA")
     _require_editable(db, module, "aplica el cambio")
     current = revisions.script_content(module)
-    result = _three_way_or_409(
-        current, revision.before, revision.after, known=revision.after, code="revision_stale",
+    result = _merged_or_409(
+        lambda: revisions.three_way(current, revision.before, revision.after), code="revision_stale",
         message="El guion cambió en {places} desde la propuesta; pide el cambio de nuevo.",
+        places=lambda conflict: _script_places(conflict, current, revision.after), detail=_script_detail,
     )
     revisions.write_script(module, result)
     proposed = revision.changes or {}
@@ -235,8 +383,7 @@ def apply_revision(
     changes = revisions.describe(current, result, revisions.Production.of(module), reasons)
     changes.update(ignored=proposed.get("ignored", []), affected_question_ids=proposed.get("affected_question_ids", []),
                    rebased=revisions.content_hash(current) != revision.base_hash)
-    revision.before, revision.after, revision.changes = current, result, changes
-    revision.status, revision.applied_at, revision.applied_by = "applied", datetime.now(timezone.utc), admin.id
+    _mark_applied(revision, current, result, changes, admin)
     revisions.supersede(db, module.id, ("proposed",), besides=revision.id)
     studio.queue_visuals(db, module)  # a new infographic is made now, for the preview
     render_job = None
@@ -244,10 +391,84 @@ def apply_revision(
         db.flush()  # the render's lock reads the module again: with the change
         render_job = _enqueue_render(db, module, admin, choices)
     db.commit()
-    logger.info("revision_applied", extra={"revision_id": revision.id, "module_id": module.id,
+    logger.info("revision_applied", extra={"revision_id": revision.id, "module_id": module.id, "target": "script",
                                            "scenes": len(changes["scenes"]), "rebased": changes["rebased"],
                                            "render": render_job is not None})
     return _applied_out(db, revision, render_job)
+
+
+def _apply_quiz(db: Session, revision: ModuleRevision, module: Module, admin: User) -> RevisionApplied:
+    db.refresh(module, with_for_update={"key_share": True})  # as a save of the quiz, and before the revision
+    db.refresh(revision, with_for_update=True)
+    if not _appliable(revision):
+        return _applied_out(db, revision, None)
+    if module.evaluation is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"«{module.title}» ya no tiene evaluación; pide el cambio de nuevo"
+        )
+    current = quiz_revisions.content(module)
+    proposed = revision.changes or {}
+    renamed = quiz_revisions.renames_of(proposed)
+    result = _merged_or_409(
+        lambda: quiz_revisions.three_way(current, revision.before, revision.after, renamed), code="revision_stale",
+        message="La evaluación cambió en {places} desde la propuesta; pide el cambio de nuevo.",
+        places=lambda conflict: _quiz_places(conflict, current, revision.before, revision.after),
+        detail=_quiz_detail,
+    )
+    _write_quiz(db, module, result)
+    changes = quiz_revisions.describe(current, result, quiz_revisions.reasons_of(proposed), renamed)
+    changes.update(ignored=proposed.get("ignored", []), rebased=revisions.content_hash(current) != revision.base_hash)
+    _mark_applied(revision, current, result, changes, admin)
+    revisions.supersede(db, module.id, ("proposed",), besides=revision.id, target="quiz")
+    db.commit()
+    logger.info("revision_applied", extra={"revision_id": revision.id, "module_id": module.id, "target": "quiz",
+                                           "questions": len(changes["questions"]), "rebased": changes["rebased"]})
+    return _applied_out(db, revision, None)
+
+
+def _apply_activity(db: Session, revision: ModuleRevision, admin: User) -> RevisionApplied:
+    activity = _activity_of(db, revision)
+    db.refresh(activity, with_for_update={"key_share": True})  # as a save of the activity, and before the revision
+    db.refresh(revision, with_for_update=True)
+    if not _appliable(revision):
+        return _applied_out(db, revision, None)
+    _require_kept(db, activity, "aplica el cambio")
+    current = activity_revisions.content(activity)
+    result = _valid_activity(activity, _merged_or_409(
+        lambda: activity_revisions.three_way(current, revision.before, revision.after), code="revision_stale",
+        message="La actividad cambió en {places} desde la propuesta; pide el cambio de nuevo.",
+        places=lambda conflict: activity_revisions.places(conflict.ids, current, revision.before),
+        detail=_activity_detail,
+    ))
+    activity_revisions.write(activity, result)  # a new version: open plays start again
+    changes = activity_revisions.describe(activity.type, current, result)
+    changes["rebased"] = revisions.content_hash(current) != revision.base_hash
+    _mark_applied(revision, current, result, changes, admin)
+    revisions.supersede(db, revision.module_id, ("proposed",), besides=revision.id, target="activity",
+                        activity_id=activity.id)
+    if activity.status == "ready":  # its new lines, voiced (the others keep their clips)
+        studio.queue_activity_voice(db, activity)
+    db.commit()
+    logger.info("revision_applied", extra={"revision_id": revision.id, "module_id": revision.module_id,
+                                           "target": "activity", "activity_id": activity.id,
+                                           "parts": len(changes["activity"]["entities"]),
+                                           "rebased": changes["rebased"]})
+    return _applied_out(db, revision, None)
+
+
+@router.post("/revisions/{revision_id}/apply", response_model=RevisionApplied)
+def apply_revision(
+    revision_id: int, payload: RevisionApply, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+):
+    """Make the proposal the module's script, quiz or activity: over edits made since, as long as they are elsewhere.
+    With `render`, a script's change produces the module's video again too."""
+    revision = _revision_or_404(db, revision_id)
+    module = module_or_404(db, revision.module_id)
+    if revision.target == "quiz":
+        return _apply_quiz(db, revision, module, admin)
+    if revision.target == "activity":
+        return _apply_activity(db, revision, admin)
+    return _apply_script(db, revision, module, payload.render, admin)
 
 
 @router.post("/revisions/{revision_id}/discard", response_model=Revision)
@@ -270,30 +491,32 @@ def discard_revision(revision_id: int, db: Session = Depends(get_db)):
     return _revision_out(db, revision)
 
 
-@router.post("/revisions/{revision_id}/revert", response_model=Revision)
-def revert_revision(revision_id: int, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
-    """Undo an applied change: the scenes (and reading) it changed go back to what they were, and edits made since in
-    other places stay. The undo is a change of its own (and can be undone)."""
-    revision = _revision_or_404(db, revision_id)
-    module = module_or_404(db, revision.module_id)
-    db.refresh(module, with_for_update=True)
-    db.refresh(revision, with_for_update=True)
+def _check_revertible(revision: ModuleRevision) -> None:
     if revision.status == "reverted":
         raise HTTPException(status.HTTP_409_CONFLICT, "Este cambio ya se deshizo")
     if revision.status != "applied":
         raise HTTPException(status.HTTP_409_CONFLICT, "Solo se puede deshacer un cambio aplicado")
+
+
+def _undo_summary(revision: ModuleRevision) -> str:
+    title = (revision.summary or revision.observation or "un cambio").strip()
+    return f"Deshace: {title}"[:MAX_SUMMARY_CHARS]
+
+
+def _revert_script(db: Session, revision: ModuleRevision, module: Module, admin: User) -> Revision:
+    db.refresh(module, with_for_update=True)
+    db.refresh(revision, with_for_update=True)
+    _check_revertible(revision)
     _require_ai_module(module, "deshacer cambios del guion")
     _require_editable(db, module, "deshaz el cambio")
     current = revisions.script_content(module)
-    restored = _three_way_or_409(
-        current, revision.after, revision.before, known=revision.after, code="revision_conflict",
+    restored = _merged_or_409(
+        lambda: revisions.three_way(current, revision.after, revision.before), code="revision_conflict",
         message="No se puede deshacer: el guion cambió después en {places}. Edítalo a mano o pide otro cambio.",
+        places=lambda conflict: _script_places(conflict, current, revision.after), detail=_script_detail,
     )
-    title = (revision.summary or revision.observation or "un cambio").strip()
-    undo = revisions.record(
-        db, module, source="revert", before=current, after=restored, user_id=admin.id,
-        summary=f"Deshace: {title}"[:MAX_SUMMARY_CHARS],
-    )
+    undo = revisions.record(db, module, source="revert", before=current, after=restored, user_id=admin.id,
+                            summary=_undo_summary(revision))
     if undo is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "No hay nada que deshacer: el guion ya está como antes del cambio")
     undo.scope = {**revisions.empty_scope(), "scene_ids": [change["scene_id"] for change in undo.changes["scenes"]],
@@ -302,5 +525,80 @@ def revert_revision(revision_id: int, db: Session = Depends(get_db), admin: User
     revision.status = "reverted"
     studio.queue_visuals(db, module)
     db.commit()
-    logger.info("revision_reverted", extra={"revision_id": revision.id, "undo_id": undo.id, "module_id": module.id})
+    logger.info("revision_reverted", extra={"revision_id": revision.id, "undo_id": undo.id, "module_id": module.id,
+                                            "target": "script"})
     return _revision_out(db, undo)
+
+
+def _revert_quiz(db: Session, revision: ModuleRevision, module: Module, admin: User) -> Revision:
+    db.refresh(module, with_for_update={"key_share": True})
+    db.refresh(revision, with_for_update=True)
+    _check_revertible(revision)
+    if module.evaluation is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"«{module.title}» ya no tiene evaluación")
+    current = quiz_revisions.content(module)
+    # The questions it gave a new id get their old one back (an update of each, as the change was).
+    renamed = {new_id: old_id for old_id, new_id in quiz_revisions.renames_of(revision.changes).items()}
+    restored = _merged_or_409(
+        lambda: quiz_revisions.three_way(current, revision.after, revision.before, renamed),
+        code="revision_conflict",
+        message="No se puede deshacer: la evaluación cambió después en {places}. Edítala a mano o pide otro cambio.",
+        places=lambda conflict: _quiz_places(conflict, current, revision.after), detail=_quiz_detail,
+    )
+    _write_quiz(db, module, restored)
+    undo = quiz_revisions.record(db, module, source="revert", before=current, after=restored, user_id=admin.id,
+                                 summary=_undo_summary(revision), renamed=renamed)
+    if undo is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "No hay nada que deshacer: la evaluación ya está como antes del cambio"
+        )
+    restored_ids = [(change["after"] or change["before"])["id"] for change in undo.changes["questions"]]
+    undo.scope = {**revisions.empty_scope(), "question_ids": restored_ids, "reverted_id": revision.id}
+    revision.status = "reverted"
+    db.commit()
+    logger.info("revision_reverted", extra={"revision_id": revision.id, "undo_id": undo.id, "module_id": module.id,
+                                            "target": "quiz"})
+    return _revision_out(db, undo)
+
+
+def _revert_activity(db: Session, revision: ModuleRevision, admin: User) -> Revision:
+    activity = _activity_of(db, revision)
+    db.refresh(activity, with_for_update={"key_share": True})
+    db.refresh(revision, with_for_update=True)
+    _check_revertible(revision)
+    current = activity_revisions.content(activity)
+    restored = _valid_activity(activity, _merged_or_409(
+        lambda: activity_revisions.three_way(current, revision.after, revision.before), code="revision_conflict",
+        message="No se puede deshacer: la actividad cambió después en {places}. Edítala a mano o pide otro cambio.",
+        places=lambda conflict: activity_revisions.places(conflict.ids, current, revision.after),
+        detail=_activity_detail,
+    ))
+    undo = activity_revisions.record(db, activity, source="revert", before=current, after=restored,
+                                     user_id=admin.id, summary=_undo_summary(revision))
+    if undo is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "No hay nada que deshacer: la actividad ya está como antes del cambio"
+        )
+    undo.scope = {**revisions.empty_scope(), "reverted_id": revision.id}
+    activity_revisions.write(activity, restored)  # a new version: open plays start again
+    revision.status = "reverted"
+    if activity.status == "ready":
+        studio.queue_activity_voice(db, activity)
+    db.commit()
+    logger.info("revision_reverted", extra={"revision_id": revision.id, "undo_id": undo.id,
+                                            "module_id": revision.module_id, "target": "activity",
+                                            "activity_id": activity.id})
+    return _revision_out(db, undo)
+
+
+@router.post("/revisions/{revision_id}/revert", response_model=Revision)
+def revert_revision(revision_id: int, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    """Undo an applied change: what it changed (scenes and reading, questions, parts of an activity) goes back to what
+    it was, and edits made since elsewhere stay. The undo is a change of its own (and can be undone)."""
+    revision = _revision_or_404(db, revision_id)
+    module = module_or_404(db, revision.module_id)
+    if revision.target == "quiz":
+        return _revert_quiz(db, revision, module, admin)
+    if revision.target == "activity":
+        return _revert_activity(db, revision, admin)
+    return _revert_script(db, revision, module, admin)

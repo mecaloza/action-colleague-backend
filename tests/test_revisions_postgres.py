@@ -1,15 +1,19 @@
-"""Revisions on a real PostgreSQL: applies at the same time (row locks) and what deleting a module or course takes."""
+"""Revisions on a real PostgreSQL: applies and saves at the same time (row locks), what a save leaves free for learners
+and what deleting a module or course takes."""
 
 import copy
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from app.db.models import Course, Job, MediaAsset, Module, ModuleRevision
-from app.services import revisions
+from app.db.models import Activity, Course, Enrollment, Evaluation, Job, MediaAsset, Module, ModuleRevision
+from app.services import activity_revisions, quiz_revisions, revisions
 from tests.conftest import auth_headers
+from tests.test_activity_spec import DECISION
+from tests.test_learning_api import QUESTIONS
 from tests.test_revisions import OUTLINE, READING, RENDER, SCENES
 
 
@@ -118,3 +122,104 @@ def test_deleting_a_module_or_its_course_takes_its_revisions(client, db, admin, 
     assert {module_id for (module_id,) in db.query(ModuleRevision.module_id)} == {second.id}
     assert client.delete(f"/api/v1/courses/{first.course_id}", headers=headers).status_code == 204
     assert db.query(ModuleRevision).count() == 0
+
+
+# ── The quiz and the activities ───────────────────────────────────────
+
+
+def _content_module(db, admin) -> tuple[Module, Activity]:
+    """A published course's module with a quiz and a published conversation (no script)."""
+    course = Course(title="Seguridad", status="published", source="manual", settings={}, created_by=admin.id)
+    db.add(course)
+    db.flush()
+    module = Module(course_id=course.id, title="EPP", order=1, source="text", content_text="Usa el casco.")
+    db.add(module)
+    db.flush()
+    activity = Activity(module_id=module.id, order=1, type="decision", title="Cliente", intro="Escucha.",
+                        spec=copy.deepcopy(DECISION), status="ready")
+    db.add_all([Evaluation(module_id=module.id, spec=copy.deepcopy(QUESTIONS), max_attempts=3, passing_score=80),
+                activity])
+    db.commit()
+    return module, activity
+
+
+def test_a_quiz_or_activity_change_applied_twice_at_once_is_applied_once(client, db, admin, worker, monkeypatch,
+                                                                        caplog):
+    headers = auth_headers(client, admin.email)
+    module, activity = _content_module(db, admin)
+    for owner in (quiz_revisions, activity_revisions):  # widen the window between reading and committing
+        merge = owner.three_way
+        monkeypatch.setattr(owner, "three_way", lambda *args, merge=merge: (time.sleep(0.3), merge(*args))[1])
+    proposals = []
+    for body in ({"target": "quiz", "question_ids": ["q2"]}, {"target": "activity", "activity_id": activity.id}):
+        response = client.post(f"/api/v1/modules/{module.id}/revisions", headers=headers,
+                               json={"observation": "Más claro", **body})
+        assert response.status_code == 202, response.text
+        worker()
+        proposals.append(response.json()["revision"]["id"])
+
+    with caplog.at_level(logging.INFO, logger="app.api.routes.revisions"):
+        responses = [_apply_at_once(client, headers, [revision_id, revision_id]) for revision_id in proposals]
+
+    assert [[response.status_code for response in pair] for pair in responses] == [[200, 200], [200, 200]]
+    assert [record.getMessage() for record in caplog.records].count("revision_applied") == 2  # the others waited
+    db.expire_all()
+    prompts = [question["prompt"] for question in quiz_revisions.content(db.get(Module, module.id))["questions"]]
+    assert prompts.count("Revisado: El EPP es opcional") == 1 and len(prompts) == len(QUESTIONS)
+    assert db.get(Activity, activity.id).version == 2
+    assert db.query(Job).filter(Job.type == "activities.voice").count() == 1
+
+
+def test_two_saves_of_an_activity_at_once_are_both_kept(client, db, admin, monkeypatch):
+    headers = auth_headers(client, admin.email)
+    _, activity = _content_module(db, admin)
+    write = activity_revisions.write
+    monkeypatch.setattr(activity_revisions, "write", lambda *args: (write(*args), time.sleep(0.3))[0])
+
+    with ThreadPoolExecutor(2) as pool:
+        responses = list(pool.map(
+            lambda body: client.put(f"/api/v1/activities/{activity.id}", headers=headers, json=body),
+            [{"title": "Uno"}, {"intro": "Dos."}],
+        ))
+
+    assert [response.status_code for response in responses] == [200, 200]
+    db.expire_all()
+    stored = db.get(Activity, activity.id)
+    assert (stored.title, stored.intro, stored.version) == ("Uno", "Dos.", 3)  # a version each (2, without the lock)
+    first, second = db.query(ModuleRevision).filter(ModuleRevision.activity_id == activity.id).order_by(
+        ModuleRevision.id).all()
+    assert second.before == first.after  # one after the other: each undoes exactly its own
+
+
+def test_saving_the_quiz_never_waits_for_a_learner_answering_it(client, db, admin, collaborator, monkeypatch):
+    """The save holds the module (NO KEY UPDATE) while it writes the quiz: a learner's attempt, which only references
+    the module, goes on meanwhile (FOR UPDATE would make it wait for the save)."""
+    headers = auth_headers(client, admin.email)
+    module, _ = _content_module(db, admin)
+    db.add(Enrollment(user_id=collaborator.id, course_id=module.course_id, status="assigned", progress_pct=0))
+    db.commit()
+    learner = auth_headers(client, collaborator.email)
+    version = client.get(f"/api/v1/learn/modules/{module.id}/quiz", headers=learner).json()["version"]
+    paused, release, saved = threading.Event(), threading.Event(), []
+    write = quiz_revisions.write
+
+    def slow_write(*args):
+        paused.set()  # the save holds the module
+        release.wait(5)
+        return write(*args)
+
+    monkeypatch.setattr(quiz_revisions, "write", slow_write)
+    edited = [{**question, "explanation": "Editada."} for question in QUESTIONS]
+    saving = threading.Thread(target=lambda: saved.append(client.put(
+        f"/api/v1/modules/{module.id}/evaluation", headers=headers, json={"questions": edited})))
+    saving.start()
+    assert paused.wait(5)
+    started = time.monotonic()
+    answered = client.post(f"/api/v1/learn/modules/{module.id}/quiz/attempts", headers=learner,
+                           json={"answers": [], "version": version})
+    waited = time.monotonic() - started
+    release.set()
+    saving.join(15)
+
+    assert answered.status_code == 200 and waited < 2
+    assert saved[0].status_code == 200

@@ -29,7 +29,7 @@ from app.services.metrics import percentage
 logger = logging.getLogger(__name__)
 
 
-def _new_id() -> str:
+def new_id() -> str:
     return uuid.uuid4().hex[:10]
 
 
@@ -45,7 +45,7 @@ def _repeats(values: list[str]) -> bool:
 
 
 class _QuestionBase(BaseModel):
-    id: str = Field(default_factory=_new_id, min_length=1, max_length=40)
+    id: str = Field(default_factory=new_id, min_length=1, max_length=40)
     prompt: Prompt
     explanation: LongText = ""
 

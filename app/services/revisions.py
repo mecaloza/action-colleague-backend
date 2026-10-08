@@ -1,7 +1,8 @@
 """
-Revisions of a module's script: the changes the AI proposes from an admin's observation, previewed as a diff and
+Revisions of a module's content: the changes the AI proposes from an admin's observation, previewed as a diff and
 applied (or undone) on purpose, and the changes made otherwise (saved by hand, rewritten by the AI, undone), kept the
-same way so any of them can be undone.
+same way so any of them can be undone. This module holds what every target shares and the script's own rules; the
+quiz's and the activities' are in `quiz_revisions` and `activity_revisions`.
 
 The model proposes, the server decides. The model names the scenes and the fields it changes; only those are taken
 from its answer, through the same conversions as a first draft (`designer.to_slide` / `to_visual`), and every other
@@ -18,12 +19,13 @@ import logging
 import re
 import uuid
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import update
+from sqlalchemy import delete, update
 from sqlalchemy.orm import Session
 
 from app.db.models import Job, Module, ModuleRevision
@@ -82,11 +84,12 @@ class RevisionError(Exception):
 
 
 class Conflict(Exception):
-    """What changed since in the places a change touches: those scenes (ids) and whether the reading."""
+    """What changed since in the places a change touches: those items (a script's scenes, a quiz's questions, an
+    activity's parts) and, in a script, whether the reading."""
 
-    def __init__(self, scene_ids: list[str], reading: bool):
-        super().__init__(", ".join(scene_ids) or "reading")
-        self.scene_ids, self.reading = scene_ids, reading
+    def __init__(self, ids: list[str], reading: bool = False):
+        super().__init__(", ".join(ids) or "reading")
+        self.ids, self.reading = ids, reading
 
 
 # ── Content ───────────────────────────────────────────────────────────
@@ -142,8 +145,9 @@ def scene_hash(scene: dict) -> str:
     return hashlib.sha256(_canonical(_essential(scene))).hexdigest()[:16]
 
 
-def _moved(before: list, after: list) -> set:
-    """The scenes in both lists whose place among the others changed: those out of the longest runs kept in order."""
+def moved_items(before: list, after: list) -> set:
+    """The items in both lists (ids) whose place among the others changed: those out of the longest runs kept in
+    order."""
     common = set(before) & set(after)
     old, new = [item for item in before if item in common], [item for item in after if item in common]
     kept = set()
@@ -169,7 +173,7 @@ def stale_scene_ids(storyboard: dict | None) -> list[str]:
         return []
     then = {entry["id"]: entry["hash"] for entry in shown}
     now = [(str(scene.get("id", "")), scene_hash(scene)) for scene in storyboard.get("scenes") or []]
-    moved = _moved([entry["id"] for entry in shown], [scene_id for scene_id, _ in now])
+    moved = moved_items([entry["id"] for entry in shown], [scene_id for scene_id, _ in now])
     stale = [scene_id for scene_id, digest in now if then.get(scene_id) != digest or scene_id in moved]
     present = {scene_id for scene_id, _ in now}
     return stale + [entry["id"] for entry in shown if entry["id"] not in present]
@@ -290,29 +294,48 @@ def _scene_change(
     }
 
 
+def _equal(item: dict, other: dict) -> bool:
+    return item == other
+
+
+def item_changes(
+    before: list[dict], after: list[dict], change: Callable[..., dict], same: Callable[[dict, dict], bool] = _equal,
+    renamed: dict[str, str] | None = None,
+) -> list[dict]:
+    """Every item (a script's scenes, a quiz's questions: each with its "id") that changed from `before` to `after`,
+    in their order: updated (and maybe moved), only moved, added or removed, each as `change(item_id, action,
+    (position before, position after), before, after)` describes it. An item `renamed` ({old id: new id}: a question
+    given a new id) is an update of the old one, under its old id."""
+    renamed = renamed or {}
+    old = {item.get("id"): (position, item) for position, item in enumerate(before, start=1)}
+    new = {item.get("id"): (position, item) for position, item in enumerate(after, start=1)}
+    previous = {new_id: old_id for old_id, new_id in renamed.items()
+                if old_id in old and old_id not in new and new_id in new and new_id not in old}
+    successors = {old_id: new_id for new_id, old_id in previous.items()}
+    moved = moved_items([successors.get(item_id, item_id) for item_id in old], list(new))
+    changes = []
+    for item_id, (position, item) in new.items():
+        was_id = previous.get(item_id, item_id)
+        if was_id not in old:
+            changes.append(change(item_id, "insert", (None, position), None, item))
+            continue
+        was_at, was = old[was_id]
+        unchanged = same(was, item)
+        if not unchanged or item_id in moved:
+            changes.append(change(was_id, "move" if unchanged else "update", (was_at, position), was, item))
+    for item_id, (position, item) in old.items():
+        if item_id not in new and item_id not in successors:
+            changes.append(change(item_id, "delete", (position, None), item, None))
+    return sorted(changes, key=lambda each: (
+        each["position"]["after"] or each["position"]["before"], each["action"] != "delete"
+    ))
+
+
 def scene_changes(before: list[dict], after: list[dict], reasons: dict[str, str] | None = None) -> list[dict]:
     """Every scene that changed from `before` to `after`, in the script's order: updated (and maybe moved), only
     moved, added or removed, each with its fields before and after and its narration word by word."""
     reasons = reasons or {}
-    old = {scene.get("id"): (position, scene) for position, scene in enumerate(before, start=1)}
-    new = {scene.get("id"): (position, scene) for position, scene in enumerate(after, start=1)}
-    moved = _moved(list(old), list(new))
-    changes = []
-    for scene_id, (position, scene) in new.items():
-        if scene_id not in old:
-            changes.append(_scene_change(scene_id, "insert", (None, position), None, scene, reasons))
-            continue
-        was_at, was = old[scene_id]
-        same = _same(was, scene)
-        if not same or scene_id in moved:
-            action = "move" if same else "update"
-            changes.append(_scene_change(scene_id, action, (was_at, position), was, scene, reasons))
-    for scene_id, (position, scene) in old.items():
-        if scene_id not in new:
-            changes.append(_scene_change(scene_id, "delete", (position, None), scene, None, reasons))
-    return sorted(changes, key=lambda change: (
-        change["position"]["after"] or change["position"]["before"], change["action"] != "delete"
-    ))
+    return item_changes(before, after, lambda *change: _scene_change(*change, reasons), _same)
 
 
 @dataclass(frozen=True)
@@ -412,76 +435,158 @@ def _clip(text: str, limit: int) -> str:
     return text.strip()[:limit].strip()
 
 
-class _Merge:
-    """The model's changes, taken one by one over the script as stored (see `propose`)."""
+@dataclass(frozen=True)
+class MergeTexts:
+    """What a merge tells the admin about the changes it leaves out, in the words of its items."""
 
-    def __init__(self, scenes: list[dict], scope: list[str] | None, max_clips: int):
-        self.scenes = scenes
-        self.by_id = {scene.get("id"): scene for scene in scenes}
+    missing: str  # the item doesn't exist
+    out_of_scope: str  # it isn't among the chosen ones
+    repeated: str  # a second change to the same item
+    unchanged: str  # the change changes nothing in it (no reason to tell when nothing is left to apply)
+    insert_missing: str  # the item a new one was to follow doesn't exist
+    insert_out_of_scope: str  # the new one goes among items that weren't chosen
+    full: str  # past the limit of items
+    emptied: str  # every item removed (the proposal fails)
+
+
+class LeftOut(Exception):
+    """A change the merge can't make, and why (for the admin)."""
+
+
+class ItemMerge:
+    """
+    A patch's changes, taken one by one over the items as stored (a script's scenes, a quiz's questions: each with
+    its "id"). A change names an item by its id (update, delete) or the one a new item follows (insert_after; "" =
+    first); one about an item that doesn't exist, isn't among the chosen ones or already had a change is left out and
+    listed in `ignored`, as is one the subclass can't make (`_changed` / `_added` raise LeftOut). Untouched items stay
+    as stored.
+    """
+
+    id_field: str  # the change's field naming its item
+    limit: int  # items at most: the last new ones past it are left out
+    texts: MergeTexts
+
+    def __init__(self, items: list[dict], scope: list[str] | None):
+        self.items = items
+        self.by_id = {item.get("id"): item for item in items}
         self.scope = set(scope) if scope else None
-        self.max_clips = max_clips
         self.updated: dict[str, dict] = {}
         self.deleted: set[str] = set()
-        self.inserted: dict[str, list[dict]] = defaultdict(list)  # the scene they follow ("" = first) -> new scenes
-        self.seen: set[str] = set()  # scenes a change was already taken for
+        self.inserted: dict[str, list[dict]] = defaultdict(list)  # the item they follow ("" = first) -> new items
+        self.seen: set[str] = set()  # items a change was already taken for
         self.reasons: dict[str, str] = {}
         self.ignored: list[dict] = []
 
-    def _ignore(self, change: SceneChangeDraft, reason: str) -> None:
-        self.ignored.append({"scene_id": change.scene_id, "action": change.action, "reason": reason})
+    def _changed(self, old: dict, change) -> dict | None:
+        """The item with the change made, or None when that changes nothing. Raises LeftOut when it can't be made."""
+        raise NotImplementedError
 
-    def _in_scope(self, scene_id: str) -> bool:
-        return self.scope is None or scene_id in self.scope
+    def _added(self, change) -> dict:
+        """The new item the change adds (with its own new id). Raises LeftOut when it can't be made."""
+        raise NotImplementedError
 
-    def take(self, change: SceneChangeDraft) -> None:
-        scene_id = change.scene_id.strip()
+    def _ignore(self, change, reason: str) -> None:
+        self.ignored.append({self.id_field: getattr(change, self.id_field), "action": change.action, "reason": reason})
+
+    def _in_scope(self, item_id: str) -> bool:
+        return self.scope is None or item_id in self.scope
+
+    def take(self, change) -> None:
+        item_id = getattr(change, self.id_field).strip()
         if change.action == "insert_after":
-            self._insert(change, scene_id)
+            self._insert(change, item_id)
             return
-        if scene_id not in self.by_id:
-            self._ignore(change, "Esa escena no existe en el guion.")
-        elif not self._in_scope(scene_id):
-            self._ignore(change, "La escena no está entre las que elegiste.")
-        elif scene_id in self.seen:
-            self._ignore(change, "Ya había otro cambio para esta escena.")
+        if item_id not in self.by_id:
+            self._ignore(change, self.texts.missing)
+        elif not self._in_scope(item_id):
+            self._ignore(change, self.texts.out_of_scope)
+        elif item_id in self.seen:
+            self._ignore(change, self.texts.repeated)
         elif change.action == "delete":
-            self.seen.add(scene_id)
-            self.deleted.add(scene_id)
-            self.reasons[scene_id] = change.reason.strip()
+            self.seen.add(item_id)
+            self.deleted.add(item_id)
+            self.reasons[item_id] = change.reason.strip()
         else:
-            self.seen.add(scene_id)
-            scene = self._updated(self.by_id[scene_id], change)
-            if scene is None:
-                self._ignore(change, UNCHANGED)
+            self.seen.add(item_id)
+            try:
+                item = self._changed(self.by_id[item_id], change)
+            except LeftOut as exc:
+                self._ignore(change, str(exc))
+                return
+            if item is None:
+                self._ignore(change, self.texts.unchanged)
             else:
-                self.updated[scene_id] = scene
-                self.reasons[scene_id] = change.reason.strip()
+                self.updated[item_id] = item
+                self.reasons[item_id] = change.reason.strip()
+
+    def _insert(self, change, after_id: str) -> None:
+        if after_id and after_id not in self.by_id:
+            self._ignore(change, self.texts.insert_missing)
+        elif not self._in_scope(after_id or self.items[0].get("id")):
+            self._ignore(change, self.texts.insert_out_of_scope)
+        else:
+            try:
+                item = self._added(change)
+            except LeftOut as exc:
+                self._ignore(change, str(exc))
+                return
+            self.inserted[after_id].append(item)
+            self.reasons[item["id"]] = change.reason.strip()
+
+    def result(self) -> list[dict]:
+        items = list(self.inserted.get("", []))
+        for item in self.items:
+            if item.get("id") not in self.deleted:
+                items.append(self.updated.get(item.get("id"), item))
+            items.extend(self.inserted.get(item.get("id"), []))
+        added = [item["id"] for group in self.inserted.values() for item in group]
+        while len(items) > self.limit and added:  # the last new items past the limit
+            dropped = added.pop()
+            items = [item for item in items if item.get("id") != dropped]
+            self.reasons.pop(dropped, None)
+            self.ignored.append({self.id_field: "", "action": "insert_after", "reason": self.texts.full})
+        if not items:
+            raise ProposalError(self.texts.emptied)
+        return items
+
+
+class _Merge(ItemMerge):
+    """The model's changes, taken one by one over the script as stored (see `propose`)."""
+
+    id_field, limit = "scene_id", MAX_STORYBOARD_SCENES  # the editor's limit
+    texts = MergeTexts(
+        missing="Esa escena no existe en el guion.",
+        out_of_scope="La escena no está entre las que elegiste.",
+        repeated="Ya había otro cambio para esta escena.",
+        unchanged=UNCHANGED,
+        insert_missing="La escena después de la que iba la nueva no existe.",
+        insert_out_of_scope="La escena nueva iba fuera de las escenas que elegiste.",
+        full=f"El guion ya tiene el máximo de {MAX_STORYBOARD_SCENES} escenas.",
+        emptied="La propuesta quitaba todas las escenas del guion. Pide el cambio de otra forma.",
+    )
+
+    def __init__(self, scenes: list[dict], scope: list[str] | None, max_clips: int):
+        super().__init__(scenes, scope)
+        self.max_clips = max_clips
 
     def _clips_left(self, besides: str | None = None) -> int:
         """Animated clips the module may still have: its limit minus those of its other scenes."""
-        scenes = [self.updated.get(scene.get("id"), scene) for scene in self.scenes
+        scenes = [self.updated.get(scene.get("id"), scene) for scene in self.items
                   if scene.get("id") not in self.deleted and scene.get("id") != besides]
         scenes += [scene for added in self.inserted.values() for scene in added]
         return self.max_clips - sum((scene.get("visual") or {}).get("kind") == "clip" for scene in scenes)
 
-    def _insert(self, change: SceneChangeDraft, after_id: str) -> None:
-        if after_id and after_id not in self.by_id:
-            self._ignore(change, "La escena después de la que iba la nueva no existe.")
-        elif not self._in_scope(after_id or self.scenes[0].get("id")):
-            self._ignore(change, "La escena nueva iba fuera de las escenas que elegiste.")
-        elif not change.scene.narration.strip():
-            self._ignore(change, "La escena nueva no tenía narración.")
-        else:
-            draft = change.scene
-            scene = {
-                "id": f"s{uuid.uuid4().hex[:8]}", "slide": designer.to_slide(draft).model_dump(),
-                "narration": _clip(draft.narration, MAX_NARRATION_CHARS),
-                "visual": designer.to_visual(draft, self._clips_left()).model_dump(),
-            }
-            self.inserted[after_id].append(scene)
-            self.reasons[scene["id"]] = change.reason.strip()
+    def _added(self, change: SceneChangeDraft) -> dict:
+        draft = change.scene
+        if not draft.narration.strip():
+            raise LeftOut("La escena nueva no tenía narración.")
+        return {
+            "id": f"s{uuid.uuid4().hex[:8]}", "slide": designer.to_slide(draft).model_dump(),
+            "narration": _clip(draft.narration, MAX_NARRATION_CHARS),
+            "visual": designer.to_visual(draft, self._clips_left()).model_dump(),
+        }
 
-    def _updated(self, old: dict, change: SceneChangeDraft) -> dict | None:
+    def _changed(self, old: dict, change: SceneChangeDraft) -> dict | None:
         """The scene with the fields the change names, or None when that changes nothing."""
         fields = set(change.fields)
         try:
@@ -536,20 +641,7 @@ class _Merge:
         return visual
 
     def result(self) -> list[dict]:
-        scenes = list(self.inserted.get("", []))
-        for scene in self.scenes:
-            if scene.get("id") not in self.deleted:
-                scenes.append(self.updated.get(scene.get("id"), scene))
-            scenes.extend(self.inserted.get(scene.get("id"), []))
-        added = [scene["id"] for group in self.inserted.values() for scene in group]
-        while len(scenes) > MAX_STORYBOARD_SCENES and added:  # the last new scenes past the editor's limit
-            dropped = added.pop()
-            scenes = [scene for scene in scenes if scene.get("id") != dropped]
-            self.reasons.pop(dropped, None)
-            self.ignored.append({"scene_id": "", "action": "insert_after",
-                                 "reason": f"El guion ya tiene el máximo de {MAX_STORYBOARD_SCENES} escenas."})
-        if not scenes:
-            raise ProposalError("La propuesta quitaba todas las escenas del guion. Pide el cambio de otra forma.")
+        scenes = super().result()
         try:
             Storyboard.model_validate({"scenes": scenes})
         except ValidationError as exc:  # the conversions keep every field within its limits: not expected
@@ -558,11 +650,12 @@ class _Merge:
         return scenes
 
 
-def _nothing_to_apply(patch: StoryboardPatchDraft, ignored: list[dict]) -> str:
+def nothing_to_apply(unresolved: str, reasons: list[str]) -> str:
     """Why a proposal is left with nothing to apply, for the admin: why its changes were left out (e.g. scenes other
-    than the chosen ones: the scope to widen), then what the model says it could not do."""
-    unresolved = patch.unresolved.strip()
-    reasons = list(dict.fromkeys(item["reason"] for item in ignored if item["reason"] != UNCHANGED))
+    than the chosen ones: the scope to widen; changes that changed nothing are no reason), then what the model says
+    it could not do."""
+    unresolved = unresolved.strip()
+    reasons = list(dict.fromkeys(reasons))
     if reasons:
         return " ".join([NOTHING_APPLICABLE, *reasons, *([unresolved] if unresolved else [])])
     return f"La IA no propuso cambios: {unresolved}" if unresolved else NOTHING_PROPOSED
@@ -586,7 +679,8 @@ def propose(
     after = {"scenes": scenes, "reading": reading}
     changes = describe(before, after, production, merge.reasons)
     if is_empty(changes):
-        raise ProposalError(_nothing_to_apply(patch, merge.ignored))
+        reasons = [item["reason"] for item in merge.ignored if item["reason"] != UNCHANGED]
+        raise ProposalError(nothing_to_apply(patch.unresolved, reasons))
     known = set(question_ids)
     changes["ignored"] = merge.ignored
     changes["affected_question_ids"] = [qid for qid in dict.fromkeys(patch.affected_question_ids) if qid in known]
@@ -594,6 +688,48 @@ def propose(
 
 
 # ── Applying and undoing ──────────────────────────────────────────────
+
+
+def merge_items(current: list[dict], base: list[dict], target: list[dict], same=_equal) -> list[dict]:
+    """
+    The change from `base` to `target` made over `current`, item by item (a script's scenes, a quiz's questions: each
+    with its "id"). The items it changes, adds, removes or moves; every other item stays as `current` has it, and
+    where. `same` says whether two versions of an item are the same.
+
+    Raises Conflict with the items it changes that are neither as it found them nor as it leaves them.
+    """
+    now = {item.get("id"): item for item in current}
+    old = {item.get("id"): item for item in base}
+    new = {item.get("id"): item for item in target}
+    changed = {item_id for item_id in old.keys() & new.keys() if not same(old[item_id], new[item_id])}
+    removed, added = old.keys() - new.keys(), new.keys() - old.keys()
+    moved = moved_items(list(old), list(new))
+    conflicts = {item_id for item_id in changed if item_id not in now
+                 or not same(now[item_id], old[item_id]) and not same(now[item_id], new[item_id])}
+    conflicts |= {item_id for item_id in removed if item_id in now and not same(now[item_id], old[item_id])}
+    conflicts |= {item_id for item_id in added if item_id in now and not same(now[item_id], new[item_id])}
+    if conflicts:
+        order = [item.get("id") for item in (*target, *base)]
+        raise Conflict(sorted(conflicts, key=order.index))
+
+    placed = moved | added  # put where the target has them, after the item they follow there
+    items = []
+    for item in current:
+        item_id = item.get("id")
+        if item_id not in removed and item_id not in placed:
+            items.append(new[item_id] if item_id in changed else item)
+    ids = [item.get("id") for item in items]
+    order = [item.get("id") for item in target]
+    for index, item_id in enumerate(order):
+        if item_id not in placed:
+            continue
+        item = new[item_id] if item_id in added or item_id in changed else now.get(item_id)
+        if item is None:
+            continue  # moved by the change, but removed since
+        at = next((ids.index(previous) + 1 for previous in reversed(order[:index]) if previous in ids), 0)
+        items.insert(at, item)
+        ids.insert(at, item_id)
+    return items
 
 
 def three_way(current: dict, base: dict, target: dict) -> dict:
@@ -607,40 +743,14 @@ def three_way(current: dict, base: dict, target: dict) -> dict:
     """
     if content_hash(current) == content_hash(base):
         return target
-    now = {scene.get("id"): scene for scene in current["scenes"]}
-    old = {scene.get("id"): scene for scene in base["scenes"]}
-    new = {scene.get("id"): scene for scene in target["scenes"]}
-    changed = {scene_id for scene_id in old.keys() & new.keys() if not _same(old[scene_id], new[scene_id])}
-    removed, added = old.keys() - new.keys(), new.keys() - old.keys()
-    moved = _moved(list(old), list(new))
-    # A scene is in the way when it is neither as the change found it nor as the change leaves it.
-    conflicts = {scene_id for scene_id in changed if scene_id not in now
-                 or not _same(now[scene_id], old[scene_id]) and not _same(now[scene_id], new[scene_id])}
-    conflicts |= {scene_id for scene_id in removed if scene_id in now and not _same(now[scene_id], old[scene_id])}
-    conflicts |= {scene_id for scene_id in added if scene_id in now and not _same(now[scene_id], new[scene_id])}
     reading_changes = base["reading"] != target["reading"]
     reading_conflict = reading_changes and current["reading"] not in (base["reading"], target["reading"])
-    if conflicts or reading_conflict:
-        order = [scene.get("id") for scene in (*target["scenes"], *base["scenes"])]
-        raise Conflict(sorted(conflicts, key=order.index), reading_conflict)
-
-    placed = moved | added  # put where the target has them, after the scene they follow there
-    scenes = []
-    for scene in current["scenes"]:
-        scene_id = scene.get("id")
-        if scene_id not in removed and scene_id not in placed:
-            scenes.append(new[scene_id] if scene_id in changed else scene)
-    ids = [scene.get("id") for scene in scenes]
-    order = [scene.get("id") for scene in target["scenes"]]
-    for index, scene_id in enumerate(order):
-        if scene_id not in placed:
-            continue
-        scene = new[scene_id] if scene_id in added or scene_id in changed else now.get(scene_id)
-        if scene is None:
-            continue  # moved by the change, but removed since
-        at = next((ids.index(previous) + 1 for previous in reversed(order[:index]) if previous in ids), 0)
-        scenes.insert(at, scene)
-        ids.insert(at, scene_id)
+    try:
+        scenes = merge_items(current["scenes"], base["scenes"], target["scenes"], _same)
+    except Conflict as conflict:
+        raise Conflict(conflict.ids, reading_conflict) from None
+    if reading_conflict:
+        raise Conflict([], True)
     if not scenes:
         raise RevisionError("El guion quedaría sin escenas.")
     if len(scenes) > MAX_STORYBOARD_SCENES:
@@ -656,6 +766,21 @@ def _what(changes: dict) -> str:
     return f"{scenes} y la lectura" if count else "la lectura"
 
 
+def applied(
+    db: Session, module_id: int, *, target: str, source: str, before: dict, after: dict, changes: dict,
+    user_id: int | None, summary: str, observation: str = "", activity_id: int | None = None,
+) -> ModuleRevision:
+    """A change already made to the module's content (a target's), kept as an applied revision so it can be undone;
+    the caller commits."""
+    revision = ModuleRevision(
+        module_id=module_id, target=target, activity_id=activity_id, source=source, status="applied",
+        observation=observation, scope=empty_scope(), summary=summary, base_hash=content_hash(before), before=before,
+        after=after, changes=changes, created_by=user_id, applied_by=user_id, applied_at=datetime.now(timezone.utc),
+    )
+    db.add(revision)
+    return revision
+
+
 def record(
     db: Session, module: Module, *, source: str, before: dict, after: dict, user_id: int | None,
     observation: str = "", summary: str = "",
@@ -668,24 +793,33 @@ def record(
     if not summary:
         what = _what(changes)
         summary = f"Guion reescrito con IA ({what})." if source == "regenerate" else f"Cambios a mano en {what}."
-    revision = ModuleRevision(
-        module_id=module.id, target="script", source=source, status="applied", observation=observation,
-        scope=empty_scope(), summary=summary, base_hash=content_hash(before), before=before, after=after,
-        changes=changes, created_by=user_id, applied_by=user_id, applied_at=datetime.now(timezone.utc),
-    )
-    db.add(revision)
-    return revision
+    return applied(db, module.id, target="script", source=source, before=before, after=after, changes=changes,
+                   user_id=user_id, summary=summary, observation=observation)
 
 
-def supersede(db: Session, module_id: int, statuses: tuple[str, ...] = PENDING, besides: int | None = None) -> None:
-    """The module's script proposals in `statuses` (by default, those not applied nor discarded yet), all but
-    `besides`, give way to a newer change. A job still proposing one of them then leaves it as it is."""
-    conditions = [ModuleRevision.module_id == module_id, ModuleRevision.target == "script",
+def supersede(
+    db: Session, module_id: int, statuses: tuple[str, ...] = PENDING, besides: int | None = None, *,
+    target: str = "script", activity_id: int | None = None,
+) -> None:
+    """The module's proposals for `target` (an activity's: for that one) in `statuses` (by default, those not applied
+    nor discarded yet), all but `besides`, give way to a newer change. A job still proposing one of them then leaves
+    it as it is. The other targets' proposals stay."""
+    conditions = [ModuleRevision.module_id == module_id, ModuleRevision.target == target,
                   ModuleRevision.status.in_(statuses)]
+    if activity_id is not None:
+        conditions.append(ModuleRevision.activity_id == activity_id)
     if besides is not None:
         conditions.append(ModuleRevision.id != besides)
     db.execute(update(ModuleRevision).where(*conditions).values(status="superseded"),
                execution_options={"synchronize_session": False})
+
+
+def forget_activities(db: Session, activity_ids: list[int]) -> None:
+    """The changes of activities about to be deleted go with them (the foreign key's cascade does it too; SQLite
+    doesn't enforce it)."""
+    if activity_ids:
+        db.execute(delete(ModuleRevision).where(ModuleRevision.activity_id.in_(activity_ids)),
+                   execution_options={"synchronize_session": False})
 
 
 def pending_modules(db: Session, module_ids: list[int]) -> set[int]:

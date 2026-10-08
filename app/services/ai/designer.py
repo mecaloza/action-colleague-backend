@@ -146,11 +146,45 @@ class StoryboardPatchDraft(BaseModel):
     unresolved: str  # what the observation asks that could not be done, and why
 
 
+# A change to a quiz names the fields it changes in each question, as a change to a script does (see
+# app.services.quiz_revisions, which maps each one to the question's keys).
+QuestionField = Literal["type", "prompt", "scenario", "options", "correct", "items", "pairs", "answers", "hint",
+                        "explanation"]
+
+
+class QuestionChangeDraft(BaseModel):
+    action: Literal["update", "insert_after", "delete"]
+    question_id: str  # update / delete: that question; insert_after: the question the new one follows ("" = first)
+    fields: list[QuestionField]  # update: the fields taken from `question` (the others keep what it has)
+    question: QuestionDraft  # the new values of those fields; a new question in full
+    reason: str  # one sentence for the admin
+
+
+class QuizPatchDraft(BaseModel):
+    """A change to a module's quiz by an admin's observation: only the questions it touches."""
+
+    summary: str
+    changes: list[QuestionChangeDraft]
+    unresolved: str
+
+
+class ActivityPatchDraft(BaseModel):
+    """A change to an activity by an admin's observation: the whole activity as it should be after it. The server
+    validates it as a save in the editor would and compares it with the stored one, part by part."""
+
+    summary: str
+    title: str
+    intro: str
+    spec_json: str  # the activity's whole spec, as JSON (its ids and untouched parts as they were)
+    unresolved: str
+
+
 # ── Prompts ───────────────────────────────────────────────────────────
 
 # The offline FakeLLM reads a few markers back from these prompts ("BRIEF DEL ADMINISTRADOR:", "AUDIENCIA:",
 # "Exactamente N módulos", "MÓDULO N:", "lista vacía"; a revision's "GUION ACTUAL", "LECTURA ACTUAL",
-# "ESCENAS EN ALCANCE:" and "OBSERVACIÓN DEL ADMINISTRADOR:"): keep them when rewording.
+# "ESCENAS EN ALCANCE:", "PREGUNTAS ACTUALES", "PREGUNTAS EN ALCANCE:", "ACTIVIDAD ACTUAL" and
+# "OBSERVACIÓN DEL ADMINISTRADOR:"): keep them when rewording.
 
 _SYSTEM = (
     "Eres un diseñador instruccional senior que crea cursos corporativos breves, prácticos y memorables. "
@@ -246,6 +280,15 @@ def scene_rules(max_clips: int) -> str:
     return _SCENE_RULES.format(icons=", ".join(ICONS), max_clips=max_clips)
 
 
+# How every question is written, by type: a module's quiz and a change to it share them.
+_QUESTION_RULES = """- single_choice: prompt + scenario opcional (caso laboral breve) + 3-4 options + correct_index (desde 0).
+- true_false: prompt es una afirmación; correct_bool.
+- ordering: items en el ORDEN CORRECTO (3-5); se barajan al mostrarlos.
+- matching: 3-4 pairs (left concepto → right definición), sin repetir textos.
+- fill_blank: prompt con "_____" y answers (1-3 variantes aceptadas); hint breve.
+Cada pregunta con explanation (1-2 frases). Deja vacíos los campos que el tipo no usa."""
+
+
 def outline_prompt(
     brief: str, audience: str, tone: str, target_modules: int | None, minutes: int, materials: str, feedback: str = "",
     previous: CourseOutline | None = None,
@@ -312,12 +355,7 @@ reading_summary: resumen en Markdown para leer (5-10 líneas, con viñetas).
 {feedback_block}
 EVALUACIÓN: {"4 a 6 preguntas" if module.include_quiz else "lista vacía (este módulo no lleva evaluación)"} que midan los objetivos,
 mezclando tipos:
-- single_choice: prompt + scenario opcional (caso laboral breve) + 3-4 options + correct_index (desde 0).
-- true_false: prompt es una afirmación; correct_bool.
-- ordering: items en el ORDEN CORRECTO (3-5); se barajan al mostrarlos.
-- matching: 3-4 pairs (left concepto → right definición), sin repetir textos.
-- fill_blank: prompt con "_____" y answers (1-3 variantes aceptadas); hint breve.
-Cada pregunta con explanation (1-2 frases). Deja vacíos los campos que el tipo no usa.
+{_QUESTION_RULES}
 
 {_materials_block(materials, 40_000)}"""
 
@@ -393,6 +431,121 @@ LECTURA ACTUAL (Markdown; vacía si no hay):
 {_fenced(reading)}
 {questions_block}
 ESCENAS EN ALCANCE: {", ".join(scene_ids) if scene_ids else "todas"}
+
+OBSERVACIÓN DEL ADMINISTRADOR:
+{observation.strip()}"""
+
+
+def quiz_revision_prompt(
+    course_title: str, module_title: str, content: str, questions: list[dict], question_ids: list[str] | None,
+    observation: str,
+) -> str:
+    """A change to a module's quiz by an observation: the rules first (the same for every quiz), then the module and
+    what it teaches, its questions and, last, the observation."""
+    return f"""Ajusta la evaluación de un módulo de un curso según la observación del administrador.
+No la reescribas: propón solo los cambios que la observación necesita; el resto de las preguntas queda exactamente
+igual.
+
+REGLAS DE LAS PREGUNTAS (con ellas se escribió la evaluación; lo que cambies también las cumple):
+{_QUESTION_RULES}
+Cada pregunta se responde con lo que enseña el módulo: no preguntes por datos que no estén en su contenido.
+
+CÓMO RESPONDER:
+- changes: un cambio por cada pregunta que tocas.
+  · "update": cambia campos de la pregunta question_id. fields dice cuáles; solo esos se toman de question (los
+    demás pueden ir vacíos). Campos: "prompt", "scenario", "options", "correct" (correct_index o correct_bool),
+    "items", "pairs", "answers", "hint", "explanation" y "type" (otro tipo de pregunta: la pregunta completa sale
+    de question).
+  · "insert_after": agrega una pregunta completa después de question_id ("" para ponerla primera).
+  · "delete": quita la pregunta question_id.
+  No agregues ni quites preguntas salvo que la observación lo pida.
+- Si cambias las opciones, revisa cuál es la correcta (e incluye "correct").
+- Si PREGUNTAS EN ALCANCE no dice "todas", cambia solo esas preguntas: los cambios a otras se descartan.
+- reason: una frase para el administrador con qué cambiaste en esa pregunta y por qué.
+- summary: 1-3 frases para el administrador con lo que cambiaste.
+- unresolved: lo que la observación pide y no pudiste hacer, y por qué ("" si hiciste todo).
+
+CURSO: {course_title}
+MÓDULO: {module_title}
+CONTENIDO DEL MÓDULO (lo que estudia quien responde):
+{_fenced(content[:30_000])}
+
+PREGUNTAS ACTUALES (JSON: cada pregunta con su número, su id y los campos que usa):
+{_fenced(questions_json(questions))}
+
+PREGUNTAS EN ALCANCE: {", ".join(question_ids) if question_ids else "todas"}
+
+OBSERVACIÓN DEL ADMINISTRADOR:
+{observation.strip()}"""
+
+
+ACTIVITY_NAMES = {"decision": "Decisión con cliente", "inspection": "Inspección", "simulator": "Simulador con reto",
+                  "quick": "Reto rápido con tiempo"}
+# What each kind of activity holds, as it is stored (app.services.activity_spec): a change writes it back that way.
+_ACTIVITY_SPEC_RULES = {
+    "decision": """spec = {"nodes": [...]}: una conversación realista con un cliente o compañero; la primera
+situación la abre. Cada situación: id, speaker (quién habla, máx. 80 caracteres), situation (lo que dice o pasa, 1-2
+frases) y choices (2-3 opciones). Cada opción: id, text (lo que haría el colaborador, máx. 200 caracteres), points
+(0-10: la mejor práctica 6-10, las malas 0-3), feedback (la consecuencia y por qué, 1-2 frases que enseñan) y next (el
+id de la situación a la que lleva, o "" si ahí termina). La conversación siempre avanza (nunca vuelve a una situación
+anterior), tiene hasta 4 pasos de profundidad y hasta 8 situaciones, y a cada situación lleva alguna opción.""",
+    "inspection": """spec = {"prompt", "scene", "verdicts", "items", "lives"}: el colaborador revisa varios
+elementos, lee sus datos y decide qué hacer con cada uno. prompt: la misión (máx. 200 caracteres). scene: "truck" (las
+llantas de un camión: 4, 6, 8 o 10, por pares izquierda y derecha de cada eje, empezando por el delantero) o "cards"
+(casos en tarjetas, 3-10). verdicts: 2-4 decisiones {id, label (máx. 40 caracteres)}. items: cada uno con id, label
+(máx. 80 caracteres), facts (1-5 datos observables {label, value (máx. 60 caracteres)}, nunca la respuesta), look (cómo
+se ve la llanta: "even", "center", "shoulders", "one_side", "cupping", "cuts" o "bulge"; "none" si no es una llanta),
+answer (el id de la decisión correcta) y explanation (por qué, 1-2 frases que enseñan). Al menos 2 decisiones
+distintas como respuesta, y que los datos permitan deducirla. lives: las vidas (1-5).""",
+    "simulator": """spec = {"prompt", "variables", "formula", "output", "target", "success_text", "fail_text",
+"hint"}: el colaborador mueve controles hasta que el resultado de la fórmula cumple el reto (prompt, máx. 200
+caracteres). variables: 1-4 controles {key (minúsculas sin acentos ni espacios), label, unit, min, max, step,
+default}; max y default caen en un paso (min + k × step). formula: solo +, -, *, /, paréntesis, min(a,b), max(a,b) y
+las keys. output: {label, unit, decimals (0-4)}. target: {op ("lte", "gte" o "between"), value, value2 (solo con
+"between", mayor que value)}: el reto se cumple con algún valor de los controles y NO con los valores iniciales.
+success_text, fail_text y hint enseñan el porqué. Solo cifras de los materiales.""",
+    "quick": """spec = {"mode", "prompt", "items", "pairs", "seconds"}: un reto contra reloj. mode "order": items son
+4-8 pasos en el orden correcto (máx. 80 caracteres cada uno; se barajan al mostrarlos). mode "match": pairs son 4-8
+parejas {left (máx. 80 caracteres), right (máx. 200)}, sin textos repetidos. prompt: la instrucción (máx. 200
+caracteres). seconds: 20-120.""",
+}
+
+
+def activity_revision_prompt(
+    course_title: str, module_title: str, script: str, materials: str, activity: dict, observation: str,
+) -> str:
+    """A change to an activity by an observation (`activity`: its type, title, intro and spec). What every activity
+    of the course shares comes first (materials, course, how to answer), then its module, the rules of its kind, the
+    activity and, last, the observation."""
+    kind = activity["type"]
+    return f"""Ajusta una actividad interactiva de un curso según la observación del administrador.
+No la rehagas: cambia solo lo que la observación necesita; todo lo demás queda exactamente igual.
+
+{_materials_block(materials, 20_000)}
+
+CURSO: {course_title}
+
+CÓMO RESPONDER:
+- Devuelve la actividad completa como debe quedar: title (máx. 60 caracteres), intro (1 frase que invita a jugar)
+  y spec_json (el JSON completo de su spec, en el mismo formato que tiene ahora).
+- Copia sin cambios todo lo que la observación no pide cambiar: los mismos textos, los mismos ids y el mismo orden.
+  Un elemento nuevo lleva un id nuevo que no se repita (letras minúsculas, números y _; máx. 24 caracteres); nunca
+  cambies el id de uno que ya existe.
+- Cada explicación la dice una voz en off: frases cortas para ser escuchadas (máximo 2 por texto), en segunda
+  persona y sin emojis.
+- summary: 1-3 frases para el administrador con lo que cambiaste.
+- unresolved: lo que la observación pide y no pudiste hacer, y por qué ("" si hiciste todo). Nunca inventes datos
+  que no estén en el guion ni en los materiales para cumplirla.
+
+MÓDULO: {module_title}
+GUION DEL MÓDULO (lo que el colaborador acaba de ver):
+{_fenced(script[:12_000])}
+
+CÓMO ES UNA ACTIVIDAD «{ACTIVITY_NAMES.get(kind, kind)}» (type "{kind}"):
+{_ACTIVITY_SPEC_RULES.get(kind, "")}
+
+ACTIVIDAD ACTUAL (JSON: type, title, intro y spec):
+{_fenced(json.dumps(activity, ensure_ascii=False))}
 
 OBSERVACIÓN DEL ADMINISTRADOR:
 {observation.strip()}"""
@@ -540,8 +693,8 @@ def plain_markdown(text: str) -> str:
     return text.strip()
 
 
-def to_question(draft: QuestionDraft) -> dict | None:
-    """The draft in the canonical question format, or None when it does not validate."""
+def question_dict(draft: QuestionDraft) -> dict:
+    """The draft in the canonical question format, not validated yet (`to_question` does)."""
     base = {"type": draft.type, "prompt": draft.prompt.strip(), "explanation": draft.explanation.strip()}
     if draft.type == "single_choice":
         base |= {"scenario": draft.scenario.strip(), "options": draft.options, "correct_index": draft.correct_index}
@@ -553,10 +706,48 @@ def to_question(draft: QuestionDraft) -> dict | None:
         base |= {"pairs": [pair.model_dump() for pair in draft.pairs]}
     else:
         base |= {"answers": draft.answers, "hint": draft.hint.strip()}
+    return base
+
+
+def to_question(draft: QuestionDraft) -> dict | None:
+    """The draft in the canonical question format, or None when it does not validate."""
     try:
-        return validate_questions([base])[0].model_dump(mode="json")
+        return validate_questions([question_dict(draft)])[0].model_dump(mode="json")
     except ValueError:  # InvalidQuestions, or whatever else the question schema rejects
         return None
+
+
+def question_draft(question: dict) -> QuestionDraft:
+    """A stored question (canonical) in the model's own words, what `question_dict` reads: where a change starts."""
+    return QuestionDraft(
+        type=question["type"], prompt=question.get("prompt", ""), scenario=question.get("scenario", ""),
+        options=question.get("options", []), correct_index=question.get("correct_index", 0),
+        correct_bool=question.get("correct", False), items=question.get("items", []),
+        pairs=[PairDraft(**pair) for pair in question.get("pairs", [])], answers=question.get("answers", []),
+        hint=question.get("hint", ""), explanation=question.get("explanation", ""),
+    )
+
+
+# The fields of the model's question each type uses (besides type, prompt and explanation).
+_QUESTION_TYPE_FIELDS = {
+    "single_choice": ("scenario", "options", "correct_index"),
+    "true_false": ("correct_bool",),
+    "ordering": ("items",),
+    "matching": ("pairs",),
+    "fill_blank": ("answers", "hint"),
+}
+
+
+def questions_json(questions: list[dict]) -> str:
+    """A stored quiz as the model reads it to change it: every question with its number, its id and the fields its
+    type uses, named as the model writes them back (empty texts left out)."""
+    entries = []
+    for number, question in enumerate(questions, start=1):
+        fields = question_draft(question).model_dump()
+        used = ("type", "prompt", *_QUESTION_TYPE_FIELDS.get(question["type"], ()), "explanation")
+        entries.append({"number": number, "id": question["id"],
+                        **{key: fields[key] for key in used if fields[key] != ""}})
+    return json.dumps(entries, ensure_ascii=False)
 
 
 def to_questions(drafts: list[QuestionDraft], limit: int | None = None) -> list[dict]:
@@ -799,5 +990,31 @@ def generate_storyboard_patch(
         revision_prompt(outline, module, number, tone, materials, scenes, reading, questions, scene_ids, observation),
         StoryboardPatchDraft,
         max_tokens=24000,  # a short answer, but the model reasons over the whole script before it
+        usage=usage,
+    )
+
+
+def generate_quiz_patch(
+    llm: LLM, *, language: str, course_title: str, module_title: str, content: str, questions: list[dict],
+    question_ids: list[str] | None, observation: str, usage: dict | None = None,
+) -> QuizPatchDraft:
+    return llm.structured(
+        _system(language),
+        quiz_revision_prompt(course_title, module_title, content, questions, question_ids, observation),
+        QuizPatchDraft,
+        max_tokens=16000,
+        usage=usage,
+    )
+
+
+def generate_activity_patch(
+    llm: LLM, *, language: str, course_title: str, module_title: str, script: str, materials: str, activity: dict,
+    observation: str, usage: dict | None = None,
+) -> ActivityPatchDraft:
+    return llm.structured(
+        _system(language),
+        activity_revision_prompt(course_title, module_title, script, materials, activity, observation),
+        ActivityPatchDraft,
+        max_tokens=24000,  # the whole activity back, after reasoning over it
         usage=usage,
     )

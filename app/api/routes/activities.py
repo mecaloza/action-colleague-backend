@@ -11,7 +11,7 @@ from app.schemas.activities import ActivityAdmin, ActivityCreate, ActivityImage,
 from app.schemas.learn import ActivityMoveIn, ActivityMoveOut, ActivityPlay
 from app.schemas.media import JobOut
 from app.services import activities as engine
-from app.services import progress
+from app.services import activity_revisions, progress, revisions
 from app.services import studio
 from app.services.activity_spec import SpecError, parse_spec
 from app.services.media import MediaResolver, discard_assets
@@ -106,21 +106,24 @@ def generate_activities(module_id: int, db: Session = Depends(get_db)):
 
 
 @router.put("/activities/{activity_id}", response_model=ActivityAdmin)
-def update_activity(activity_id: int, payload: ActivityUpdate, db: Session = Depends(get_db)):
-    """A change to what is played (title, intro, spec) is a new version: open plays must start again."""
+def update_activity(
+    activity_id: int, payload: ActivityUpdate, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+):
+    """A change to what is played (title, intro, spec) is a new version: open plays must start again. It is kept as a
+    change of its own, so it can be undone."""
     activity = _activity_or_404(db, activity_id)
-    changed = False
-    if payload.title is not None and payload.title.strip() != activity.title:
-        activity.title, changed = payload.title.strip(), True
-    if payload.intro is not None and payload.intro.strip() != activity.intro:
-        activity.intro, changed = payload.intro.strip(), True
-    if payload.spec is not None:
-        spec = _validated_spec(activity.type, payload.spec)
-        if spec != activity.spec:
-            activity.spec, changed = spec, True
+    # One change at a time (each kept with what it changed). NO KEY UPDATE: plays starting meanwhile go on.
+    db.refresh(activity, with_for_update={"key_share": True})
+    before = activity_revisions.content(activity)
+    wanted = {
+        "title": payload.title.strip() if payload.title is not None else before["title"],
+        "intro": payload.intro.strip() if payload.intro is not None else before["intro"],
+        "spec": _validated_spec(activity.type, payload.spec) if payload.spec is not None else before["spec"],
+    }
+    # The admin's now, when it changed: a new AI proposal never replaces it.
+    changed = activity_revisions.write(activity, wanted)
     if changed:
-        activity.version += 1
-        activity.source = "admin"  # the admin's now: a new AI proposal never replaces it
+        activity_revisions.record(db, activity, source="manual", before=before, after=wanted, user_id=admin.id)
     published = payload.status == "ready" and activity.status != "ready"
     unpublished = payload.status == "draft" and activity.status == "ready"
     if payload.status is not None:
@@ -148,6 +151,7 @@ def delete_activity(activity_id: int, db: Session = Depends(get_db)):
     """Its plays and voice clips go with it; learners who only waited for it complete the module."""
     activity = _activity_or_404(db, activity_id)
     module, clips = activity.module, [clip.get("asset_id") for clip in (activity.narration or {}).values()]
+    revisions.forget_activities(db, [activity.id])
     db.delete(activity)
     progress.recheck_module(db, module)
     db.commit()

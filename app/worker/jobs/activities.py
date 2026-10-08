@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from app.db.models import Activity, MediaAsset, Module
 from app.core.config import get_settings
 from app.services import activities as engine
-from app.services import studio
+from app.services import revisions, studio
 from app.services.ai import designer
 from app.services.ai.llm import get_llm
 from app.services.media import discard_assets
@@ -63,6 +63,7 @@ def draft_activities(ctx: JobContext) -> dict:
             return {"skipped": "module deleted"}
         replaced = [a for a in module.activities if a.source == "ai" and a.status == "draft"]  # untouched proposals
         clips = [clip.get("asset_id") for activity in replaced for clip in (activity.narration or {}).values()]
+        revisions.forget_activities(db, [activity.id for activity in replaced])
         for activity in replaced:
             db.delete(activity)
         db.flush()
