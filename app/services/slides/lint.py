@@ -142,21 +142,21 @@ class Recorder:
             self._note("shape", _bounds([start, end], half))
         return self._draw.line(xy, **options)
 
-    def polygon(self, xy, **options):
+    def _shape(self, method: str, xy, options: dict):
         self._note("shape", _bounds(_points(xy)))
-        return self._draw.polygon(xy, **options)
+        return getattr(self._draw, method)(xy, **options)
+
+    def polygon(self, xy, **options):
+        return self._shape("polygon", xy, options)
 
     def rectangle(self, xy, **options):
-        self._note("shape", _bounds(_points(xy)))
-        return self._draw.rectangle(xy, **options)
+        return self._shape("rectangle", xy, options)
 
     def rounded_rectangle(self, xy, **options):
-        self._note("shape", _bounds(_points(xy)))
-        return self._draw.rounded_rectangle(xy, **options)
+        return self._shape("rounded_rectangle", xy, options)
 
     def ellipse(self, xy, **options):
-        self._note("shape", _bounds(_points(xy)))
-        return self._draw.ellipse(xy, **options)
+        return self._shape("ellipse", xy, options)
 
 
 # ── Checks ────────────────────────────────────────────────────────────

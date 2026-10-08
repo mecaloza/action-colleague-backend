@@ -442,13 +442,11 @@ def _numbered_list(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDra
     per_item = (bottom - top - gap * (len(points) - 1)) // len(points)
     prefix_font = font(DISPLAY_FONT, 44, 600)
     prefix_w = int(text_width(draw, f"{MAX_POINTS}.", prefix_font)) + 18  # room for the last number
-    text_left = left + 44 + prefix_w
+    with_icons = any(icon in ICONS for icon in icons)
+    # With icons the badge takes the marker's place.
+    text_left = left + (ICON_BADGE + 36 if with_icons else 44 + prefix_w)
     # The presenter bubble narrows the lowest items; size every item for the narrowest width.
     width = _text_right_limit(ctx, bottom, right) - text_left
-    with_icons = any(icon in ICONS for icon in icons)
-    if with_icons:  # the icon badge takes the marker's place
-        text_left = left + ICON_BADGE + 36
-        width = _text_right_limit(ctx, bottom, right) - text_left
     fitted_items = fit_all(draw, points, BODY_FONT, 500, width, per_item, 52, 30, max_lines=3)
     y = top
     for number, (field, fitted) in enumerate(zip(fields, fitted_items), start=1):
