@@ -8,7 +8,6 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import update
 from sqlalchemy.orm import Session, defer
 
 from app.api.deps import get_db, require_admin
@@ -121,16 +120,6 @@ def _applied_out(db: Session, revision: ModuleRevision, render_job: Job | None) 
     return RevisionApplied(revision=_revision_out(db, revision), render_job=render_job and job_out(render_job))
 
 
-def _supersede(db: Session, module_id: int, statuses: tuple[str, ...], besides: int | None = None) -> None:
-    """Older proposals for the module's script give way to the newer change."""
-    conditions = [ModuleRevision.module_id == module_id, ModuleRevision.target == "script",
-                  ModuleRevision.status.in_(statuses)]
-    if besides is not None:
-        conditions.append(ModuleRevision.id != besides)
-    db.execute(update(ModuleRevision).where(*conditions).values(status="superseded"),
-               execution_options={"synchronize_session": False})
-
-
 # ── Proposals ─────────────────────────────────────────────────────────
 
 
@@ -163,7 +152,7 @@ def propose_revision(
         if waiting is None or waiting.observation != payload.observation or waiting.scope != scope:
             raise HTTPException(status.HTTP_409_CONFLICT, BUSY_WITH_OTHER_CHANGE)
         return RevisionProposal(revision=_revision_out(db, waiting), job=job_out(active))
-    _supersede(db, module.id, revisions.PENDING)  # "Pedir otro ajuste": the newest observation wins
+    revisions.supersede(db, module.id)  # "Pedir otro ajuste": the newest observation wins
     revision = ModuleRevision(
         module_id=module.id, target="script", source="qa" if payload.qa_issue_id else "observation",
         status="proposing", observation=payload.observation, scope=scope, base_hash=revisions.content_hash(content),
@@ -216,15 +205,18 @@ def apply_revision(
     `render`, the module's video is produced again too."""
     revision = _revision_or_404(db, revision_id)
     module = module_or_404(db, revision.module_id)
+    # Only a video the module has is produced again (its first one is made from the studio), and what it takes is
+    # checked before changing anything: the change and its video go together.
+    render = payload.render and bool(module.video_asset_id or module.video_url)
     choices = None
-    if payload.render:  # checked before changing anything: the change and its video go together
+    if render:
         _require_voice()
         choices = _render_choices(module.course)
         _check_presenters(choices)
     db.refresh(module, with_for_update=True)  # as a manual save, and before the revision (the job's own lock)
     db.refresh(revision, with_for_update=True)
     if revision.status == "applied":  # a double click: what the first one did
-        render_job = queue.active_with_key(db, f"render:{module.id}") if payload.render else None
+        render_job = queue.active_with_key(db, f"render:{module.id}") if render else None
         return _applied_out(db, revision, render_job)
     if revision.status == "proposing":
         raise HTTPException(status.HTTP_409_CONFLICT, "La propuesta aún se está preparando; espera a que termine")
@@ -245,10 +237,10 @@ def apply_revision(
                    rebased=revisions.content_hash(current) != revision.base_hash)
     revision.before, revision.after, revision.changes = current, result, changes
     revision.status, revision.applied_at, revision.applied_by = "applied", datetime.now(timezone.utc), admin.id
-    _supersede(db, module.id, ("proposed",), besides=revision.id)
+    revisions.supersede(db, module.id, ("proposed",), besides=revision.id)
     studio.queue_visuals(db, module)  # a new infographic is made now, for the preview
     render_job = None
-    if payload.render and (module.video_asset_id or module.video_url):
+    if render and (module.video_asset_id or module.video_url):  # its video, read again under the lock
         db.flush()  # the render's lock reads the module again: with the change
         render_job = _enqueue_render(db, module, admin, choices)
     db.commit()
@@ -295,7 +287,7 @@ def revert_revision(revision_id: int, db: Session = Depends(get_db), admin: User
     current = revisions.script_content(module)
     restored = _three_way_or_409(
         current, revision.after, revision.before, known=revision.after, code="revision_conflict",
-        message="No se puede deshacer: después cambió {places}. Edítalo a mano o pide otro cambio.",
+        message="No se puede deshacer: el guion cambió después en {places}. Edítalo a mano o pide otro cambio.",
     )
     title = (revision.summary or revision.observation or "un cambio").strip()
     undo = revisions.record(

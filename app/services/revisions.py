@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import ValidationError
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.db.models import Job, Module, ModuleRevision
@@ -39,6 +40,8 @@ PENDING = ("proposing", "proposed")  # a proposal not applied nor discarded yet
 MAX_READING_CHARS = 100_000  # the module's reading (as the editor's limit)
 GENERATED_VISUALS = ("image", "infographic", "clip")  # made (and paid for) from their description
 NOTHING_PROPOSED = "La IA no propuso ningún cambio. Describe lo que quieres cambiar con más detalle."
+NOTHING_APPLICABLE = "La IA solo propuso cambios que no se pueden aplicar."
+UNCHANGED = "El cambio propuesto no cambiaba nada en esta escena."  # left out, but nothing to apply in the first place
 
 # The fields of a scene a change names (designer.SceneField), with the slide's keys each one replaces...
 SLIDE_FIELDS = {
@@ -114,20 +117,29 @@ def content_hash(content: dict) -> str:
 
 
 def _normalized(scene: dict) -> dict:
-    """A scene as the editor saves it, every default written down: two scenes that only differ in defaults one of
-    them leaves out (stored before the field existed) are the same scene."""
+    """A scene as the editor saves it, every default written down: what the admin sees in each of its fields."""
     try:
         return StoryboardScene.model_validate(scene).model_dump(mode="json")
     except ValidationError:
         return scene
 
 
+def _essential(scene: dict) -> dict:
+    """A scene without the defaults it holds: what two versions of it are compared by, and its hash taken on. Scenes
+    that only differ in defaults one of them leaves out (stored before the field existed) are the same scene, and a
+    field added to the slides later, with its default, changes none of the hashes the videos keep."""
+    try:
+        return StoryboardScene.model_validate(scene).model_dump(mode="json", exclude_defaults=True)
+    except ValidationError:
+        return scene
+
+
 def _same(scene: dict, other: dict) -> bool:
-    return scene == other or _normalized(scene) == _normalized(other)
+    return scene == other or _essential(scene) == _essential(other)
 
 
 def scene_hash(scene: dict) -> str:
-    return hashlib.sha256(_canonical(_normalized(scene))).hexdigest()[:16]
+    return hashlib.sha256(_canonical(_essential(scene))).hexdigest()[:16]
 
 
 def _moved(before: list, after: list) -> set:
@@ -440,7 +452,7 @@ class _Merge:
             self.seen.add(scene_id)
             scene = self._updated(self.by_id[scene_id], change)
             if scene is None:
-                self._ignore(change, "El cambio propuesto no cambiaba nada en esta escena.")
+                self._ignore(change, UNCHANGED)
             else:
                 self.updated[scene_id] = scene
                 self.reasons[scene_id] = change.reason.strip()
@@ -546,13 +558,24 @@ class _Merge:
         return scenes
 
 
+def _nothing_to_apply(patch: StoryboardPatchDraft, ignored: list[dict]) -> str:
+    """Why a proposal is left with nothing to apply, for the admin: why its changes were left out (e.g. scenes other
+    than the chosen ones: the scope to widen), then what the model says it could not do."""
+    unresolved = patch.unresolved.strip()
+    reasons = list(dict.fromkeys(item["reason"] for item in ignored if item["reason"] != UNCHANGED))
+    if reasons:
+        return " ".join([NOTHING_APPLICABLE, *reasons, *([unresolved] if unresolved else [])])
+    return f"La IA no propuso cambios: {unresolved}" if unresolved else NOTHING_PROPOSED
+
+
 def propose(
     before: dict, patch: StoryboardPatchDraft, *, scene_ids: list[str] | None, production: Production,
     question_ids: list[str], max_clips: int,
 ) -> Proposal:
     """The script with the model's patch: the scenes (in scope) and fields it names changed, every other scene as
     stored. What it asked that can't be taken (another scene, one that doesn't exist, a second change to the same
-    scene...) is left out and listed in `changes.ignored`. Raises ProposalError when nothing is left to apply."""
+    scene...) is left out and listed in `changes.ignored`. Raises ProposalError, saying why, when nothing is left to
+    apply."""
     merge = _Merge(before["scenes"], scene_ids, max_clips)
     for change in patch.changes:
         merge.take(change)
@@ -563,8 +586,7 @@ def propose(
     after = {"scenes": scenes, "reading": reading}
     changes = describe(before, after, production, merge.reasons)
     if is_empty(changes):
-        unresolved = patch.unresolved.strip()
-        raise ProposalError(f"La IA no propuso cambios: {unresolved}" if unresolved else NOTHING_PROPOSED)
+        raise ProposalError(_nothing_to_apply(patch, merge.ignored))
     known = set(question_ids)
     changes["ignored"] = merge.ignored
     changes["affected_question_ids"] = [qid for qid in dict.fromkeys(patch.affected_question_ids) if qid in known]
@@ -653,6 +675,17 @@ def record(
     )
     db.add(revision)
     return revision
+
+
+def supersede(db: Session, module_id: int, statuses: tuple[str, ...] = PENDING, besides: int | None = None) -> None:
+    """The module's script proposals in `statuses` (by default, those not applied nor discarded yet), all but
+    `besides`, give way to a newer change. A job still proposing one of them then leaves it as it is."""
+    conditions = [ModuleRevision.module_id == module_id, ModuleRevision.target == "script",
+                  ModuleRevision.status.in_(statuses)]
+    if besides is not None:
+        conditions.append(ModuleRevision.id != besides)
+    db.execute(update(ModuleRevision).where(*conditions).values(status="superseded"),
+               execution_options={"synchronize_session": False})
 
 
 def pending_modules(db: Session, module_ids: list[int]) -> set[int]:

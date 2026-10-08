@@ -338,12 +338,13 @@ def revision_prompt(
     reading: str, questions: list[tuple[str, str]], scene_ids: list[str] | None, observation: str,
 ) -> str:
     """A change to a module's script by an observation. What stays the same from one change to the next comes first
-    (the provider reuses a prompt's beginning it already read), the script after it and the observation last."""
+    (the provider reuses a prompt's beginning it already read): what every module of the course shares (materials,
+    course, rules), then the module, its script and, last, the observation."""
     questions_block = ""
     if questions:
         listed = "\n".join(f"{question_id}: {prompt}" for question_id, prompt in questions)
         questions_block = f"\nPREGUNTAS DE LA EVALUACIÓN (id: enunciado):\n{_fenced(listed)}\n"
-    return f"""Ajusta el guion en escenas del módulo {number} de un curso según la observación del administrador.
+    return f"""Ajusta el guion en escenas de un módulo de un curso según la observación del administrador.
 No lo reescribas: propón solo los cambios que la observación necesita; el resto del guion queda exactamente igual.
 
 {_materials_block(materials, 40_000)}
@@ -351,10 +352,6 @@ No lo reescribas: propón solo los cambios que la observación necesita; el rest
 CURSO: {outline.title} — {outline.description}
 AUDIENCIA: {outline.audience}
 TONO: {tone or "profesional y cercano"}
-MÓDULO {number}: {module.title}
-Resumen: {module.summary}
-Objetivos: {"; ".join(module.objectives)}
-Puntos clave: {"; ".join(module.key_points)}
 
 REGLAS DE LAS ESCENAS (con ellas se escribió el guion; lo que cambies también las cumple):
 {scene_rules(get_settings().max_clips_per_module)}
@@ -383,6 +380,11 @@ CÓMO RESPONDER:
 - summary: 1-3 frases para el administrador con lo que cambiaste.
 - unresolved: lo que la observación pide y no pudiste hacer, y por qué ("" si hiciste todo). Nunca inventes datos
   que no estén en los materiales para cumplirla.
+
+MÓDULO {number}: {module.title}
+Resumen: {module.summary}
+Objetivos: {"; ".join(module.objectives)}
+Puntos clave: {"; ".join(module.key_points)}
 
 GUION ACTUAL (JSON: cada escena con su número, su id y los campos que usa; los vacíos no aparecen):
 {_fenced(storyboard_json(scenes))}

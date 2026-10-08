@@ -3,16 +3,22 @@
 
 import copy
 import logging
+import os
 import re
+from datetime import timedelta
 
 import pytest
+from pydantic import Field
 
+from app.api.routes import studio as studio_routes
 from app.db.models import Course, Evaluation, Job, MediaAsset, Module, ModuleRevision
+from app.schemas.studio import StoryboardScene
 from app.services import revisions
 from app.services.ai import designer
 from app.services.ai.fake import FakeLLM
 from app.services.ai.llm import LLMError, OpenAILLM
 from app.services.revisions import Production
+from app.services.slides.spec import SceneVisual, Slide
 from app.worker import queue
 from tests.conftest import auth_headers
 
@@ -88,6 +94,23 @@ def _save(client, headers, module_id, edit) -> None:
     edit(storyboard["scenes"])
     saved = client.put(f"/api/v1/modules/{module_id}/storyboard", headers=headers, json={"scenes": storyboard["scenes"]})
     assert saved.status_code == 200, saved.text
+
+
+def _regenerate(client, headers, module_id, feedback="") -> None:
+    """The admin asks for the whole script again ("Reescribir con IA")."""
+    asked = client.post(f"/api/v1/modules/{module_id}/storyboard/regenerate", headers=headers,
+                        json={"feedback": feedback})
+    assert asked.status_code == 202, asked.text
+
+
+def _revert(client, headers, revision_id):
+    return client.post(f"/api/v1/revisions/{revision_id}/revert", headers=headers)
+
+
+def _module_entry(client, headers, module) -> dict:
+    """The module as the course's detail shows it to the admin."""
+    entries = client.get(f"/api/v1/courses/{module.course_id}", headers=headers).json()["modules"]
+    return next(entry for entry in entries if entry["id"] == module.id)
 
 
 # ── The flow ──────────────────────────────────────────────────────────
@@ -256,6 +279,30 @@ def test_applying_and_producing_the_video_again(client, db, admin_headers, modul
     assert db.query(Job).filter(Job.type == "video.render").count() == 1
 
 
+def test_only_a_video_the_module_has_is_produced_again(client, db, admin_headers, module, worker, monkeypatch):
+    monkeypatch.setattr(studio_routes, "voice_available", lambda: False)  # no narration on this server
+    video = MediaAsset(kind="video", status="ready", bucket="b", path="v.mp4", course_id=module.course_id)
+    db.add(video)
+    db.flush()
+    module.video_asset_id = video.id
+    db.commit()
+    revision = _proposed(client, admin_headers, worker, module.id)
+
+    refused = _apply(client, admin_headers, revision["id"], render=True)  # its video couldn't be narrated
+
+    assert refused.status_code == 503 and _revision(client, admin_headers, revision["id"])["status"] == "proposed"
+    stored = _stored(db, module)
+    assert stored.storyboard["scenes"] == SCENES  # the change waits with its video
+    stored.video_asset_id = None  # no video yet: its first one is made from the studio
+    db.commit()
+
+    applied = _apply(client, admin_headers, revision["id"], render=True)
+
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["revision"]["status"] == "applied" and applied.json()["render_job"] is None
+    assert db.query(Job).filter(Job.type == "video.render").count() == 0
+
+
 def test_undo_restores_what_the_change_touched_and_keeps_later_edits(client, db, admin_headers, module, worker):
     revision = _proposed(client, admin_headers, worker, module.id, "Cambia la narración", scene_ids=["s2"])
     assert _apply(client, admin_headers, revision["id"]).status_code == 200
@@ -292,8 +339,56 @@ def test_undo_is_refused_when_the_same_scene_changed_since(client, db, admin_hea
 
     assert refused.status_code == 409
     detail = refused.json()["detail"]
-    assert detail["code"] == "revision_conflict" and detail["scene_ids"] == ["s2"] and "la escena 2" in detail["message"]
+    assert detail["code"] == "revision_conflict" and detail["scene_ids"] == ["s2"]
+    assert detail["message"] == (
+        "No se puede deshacer: el guion cambió después en la escena 2. Edítalo a mano o pide otro cambio."
+    )
     assert _stored(db, module).storyboard["scenes"][1]["slide"]["title"] == "Editado a mano"
+
+
+def test_undoing_waits_for_the_video_and_the_script_and_is_only_for_applied_changes(
+    client, db, admin_headers, module, worker
+):
+    asked = _ask(client, admin_headers, module.id, scene_ids=["s2"])
+    revision_id = asked["revision"]["id"]
+    early = _apply(client, admin_headers, revision_id)  # the AI hasn't answered yet
+    assert early.status_code == 409 and "aún se está preparando" in early.json()["detail"]
+    worker()
+    not_applied = _revert(client, admin_headers, revision_id)
+    assert not_applied.status_code == 409
+    assert not_applied.json()["detail"] == "Solo se puede deshacer un cambio aplicado"
+    assert _apply(client, admin_headers, revision_id).status_code == 200
+    applied = _stored(db, module).storyboard["scenes"]
+
+    # The render reads the script when it starts: undoing meanwhile would publish a video of the other one.
+    render = queue.enqueue(db, "video.render", {}, course_id=module.course_id, module_id=module.id,
+                           dedupe_key=f"render:{module.id}")
+    for status in ("queued", "running"):
+        render.status = status
+        db.commit()
+        refused = _revert(client, admin_headers, revision_id)
+        assert refused.status_code == 409 and "se está produciendo" in refused.json()["detail"]
+    render.status = "succeeded"
+    db.commit()
+    stored = _stored(db, module)
+    stored.generation_status = "generating"  # its script being rewritten
+    db.commit()
+    refused = _revert(client, admin_headers, revision_id)
+    assert refused.status_code == 409 and "se está generando" in refused.json()["detail"]
+    stored.generation_status, stored.source = "completed", "text"  # it got content of its own meanwhile
+    db.commit()
+    refused = _revert(client, admin_headers, revision_id)
+    assert refused.status_code == 409 and "tiene su propio contenido" in refused.json()["detail"]
+
+    assert _stored(db, module).storyboard["scenes"] == applied  # nothing was undone
+    assert _revision(client, admin_headers, revision_id)["status"] == "applied"
+    stored = _stored(db, module)
+    stored.source = "ai"
+    db.commit()
+    assert _revert(client, admin_headers, revision_id).status_code == 200
+    discarded = _proposed(client, admin_headers, worker, module.id, "Otro título", scene_ids=["s2"])
+    assert client.post(f"/api/v1/revisions/{discarded['id']}/discard", headers=admin_headers).status_code == 200
+    assert _revert(client, admin_headers, discarded["id"]).status_code == 409
 
 
 def test_a_double_click_gets_the_same_proposal_and_another_observation_waits(client, db, admin_headers, module, worker):
@@ -409,6 +504,67 @@ def test_saving_by_hand_and_rewriting_with_ai_are_kept_and_can_be_undone(
     assert _stored(db, module).storyboard["scenes"][1]["narration"] == SCENES[1]["narration"]
 
 
+def test_a_rewrite_retires_the_changes_proposed_to_the_script_it_replaces(
+    client, db, admin_headers, module, worker, storage
+):
+    # The rewrite's scenes take the old ids (s1, s2…): a scene the proposal adds after s2 would land in it.
+    proposed = _proposed(client, admin_headers, worker, module.id, scene_ids=["s2"])
+    _regenerate(client, admin_headers, module.id)
+    worker()
+
+    assert _revision(client, admin_headers, proposed["id"])["status"] == "superseded"
+    assert _apply(client, admin_headers, proposed["id"]).status_code == 409
+    assert _module_entry(client, admin_headers, module)["revision_pending"] is False
+    history = client.get(f"/api/v1/modules/{module.id}/revisions", headers=admin_headers).json()
+    assert [(item["source"], item["status"]) for item in history] == [
+        ("regenerate", "applied"), ("observation", "superseded"),
+    ]
+
+    # Asked before a rewrite and answered after it: an answer about a script that no longer exists.
+    asked = _ask(client, admin_headers, module.id, "Otro ajuste")
+    _regenerate(client, admin_headers, module.id, "Más corto")
+    revise = db.get(Job, asked["job"]["id"])
+    revise.run_after = queue.utcnow() + timedelta(hours=1)  # the rewrite finishes first
+    db.commit()
+    worker()
+    assert _revision(client, admin_headers, asked["revision"]["id"])["status"] == "superseded"
+    revise = db.get(Job, asked["job"]["id"])
+    revise.run_after = queue.utcnow()
+    db.commit()
+    worker()
+
+    db.expire_all()
+    assert db.get(Job, asked["job"]["id"]).result == {"skipped": "revision no longer waiting"}
+    revision = _revision(client, admin_headers, asked["revision"]["id"])
+    assert revision["status"] == "superseded" and revision["changes"] is None  # the AI's answer is left out
+    assert _module_entry(client, admin_headers, module)["revision_pending"] is False
+
+
+def test_editing_the_reading_in_the_module_sheet_is_kept_and_can_be_undone(client, db, admin_headers, module):
+    url = f"/api/v1/modules/{module.id}"
+    assert client.patch(url, headers=admin_headers, json={"content_text": "Otra lectura"}).status_code == 200
+    assert client.patch(url, headers=admin_headers, json={"title": "Presión de inflado"}).status_code == 200
+    assert client.patch(url, headers=admin_headers, json={"content_text": "Otra lectura"}).status_code == 200
+
+    history = client.get(f"/api/v1/modules/{module.id}/revisions", headers=admin_headers).json()
+    assert [(item["source"], item["status"], item["summary"]) for item in history] == [
+        ("manual", "applied", "Cambios a mano en la lectura."),  # the title isn't the script; the same text, nothing
+    ]
+    manual = _revision(client, admin_headers, history[0]["id"])
+    assert manual["changes"]["reading"] == {"before": READING, "after": "Otra lectura"}
+    assert manual["changes"]["scenes"] == [] and manual["created_by_name"] == "admin"
+
+    assert _revert(client, admin_headers, manual["id"]).status_code == 200
+    assert _stored(db, module).content_text == READING
+
+    own = Module(course_id=module.course_id, title="Propio", order=2, source="text", content_text="Texto")
+    db.add(own)
+    db.commit()
+    assert client.patch(f"/api/v1/modules/{own.id}", headers=admin_headers,
+                        json={"content_text": "Otro texto"}).status_code == 200
+    assert db.query(ModuleRevision).filter(ModuleRevision.module_id == own.id).count() == 0  # no script to undo
+
+
 # ── The video and the script ──────────────────────────────────────────
 
 
@@ -481,10 +637,10 @@ def _patch(*changes, **fields):
     })
 
 
-def _propose(*changes, scenes=SCENES, scope=None, production=Production(0, False), max_clips=2):
+def _propose(*changes, scenes=SCENES, scope=None, production=Production(0, False), max_clips=2, **fields):
     before = {"scenes": copy.deepcopy(scenes), "reading": READING}
-    return revisions.propose(before, _patch(*changes), scene_ids=scope, production=production, question_ids=[],
-                             max_clips=max_clips)
+    return revisions.propose(before, _patch(*changes, **fields), scene_ids=scope, production=production,
+                             question_ids=[], max_clips=max_clips)
 
 
 def test_points_bring_their_icons_and_icons_alone_follow_the_points():
@@ -567,6 +723,22 @@ def test_a_proposal_that_changes_nothing_fails():
         _propose(*(_change(action="delete", scene_id=scene["id"], fields=[]) for scene in SCENES))
 
 
+def test_when_every_change_is_left_out_the_failure_says_why():
+    with pytest.raises(revisions.ProposalError) as failed:  # the admin chose scene 2; the AI changed scene 3
+        _propose(_change(scene_id="s3", title="Otro"), scope=["s2"])
+    assert str(failed.value) == (
+        "La IA solo propuso cambios que no se pueden aplicar. La escena no está entre las que elegiste."
+    )
+
+    with pytest.raises(revisions.ProposalError) as failed:  # and one that changes nothing: not a reason
+        _propose(_change(scene_id="s9", title="Otro"), _change(scene_id="s3", title="Otro"),
+                 _change(title="Cómo medir"), scope=["s2"], unresolved="No encontré la escena del caso.")
+    assert str(failed.value) == (
+        "La IA solo propuso cambios que no se pueden aplicar. Esa escena no existe en el guion. "
+        "La escena no está entre las que elegiste. No encontré la escena del caso."
+    )
+
+
 def test_narration_diff_goes_word_by_word():
     before, after = "Mide la presión en frío, cada semana.", "Mide la presión  en caliente, cada semana."
     parts = revisions.narration_diff(before, after)
@@ -619,22 +791,52 @@ def test_scenes_that_only_differ_in_defaults_left_out_are_the_same():
     assert revisions.stale_scene_ids({"scenes": SCENES, "render": {"job_id": "x"}}) == []  # unknown: none
 
 
+class _GrownSlide(Slide):
+    caption: str = ""  # e.g. a field a later version adds to every slide, with its default
+
+
+class _GrownVisual(SceneVisual):
+    style: str = ""
+
+
+class _GrownScene(StoryboardScene):
+    slide: _GrownSlide
+    visual: _GrownVisual = Field(default_factory=_GrownVisual)
+
+
+def test_a_field_added_to_the_slides_later_leaves_the_videos_up_to_date(monkeypatch):
+    shown = revisions.video_scenes(SCENES)  # kept with each video when it is published
+    monkeypatch.setattr(revisions, "StoryboardScene", _GrownScene)  # the next deploy
+
+    assert revisions.video_scenes(SCENES) == shown
+    resaved = [{**scene, "slide": {**scene["slide"], "caption": ""}} for scene in SCENES]  # by the editor, then
+    assert revisions.stale_scene_ids({"scenes": resaved, "render": {"scene_hashes": shown}}) == []
+    captioned = [resaved[0], {**resaved[1], "slide": {**resaved[1]["slide"], "caption": "Nuevo"}}, *resaved[2:]]
+    assert revisions.stale_scene_ids({"scenes": captioned, "render": {"scene_hashes": shown}}) == ["s2"]
+
+
 # ── The prompt and the model's usage ──────────────────────────────────
 
 
 def test_the_revision_prompt_puts_what_repeats_first_and_the_observation_last():
     outline = designer.CourseOutline(title="Llantas", description="D", audience="Asesores", objectives=[],
-                                     modules=[designer.OutlineModule(**OUTLINE)])
+                                     modules=[designer.OutlineModule(**OUTLINE),
+                                              designer.OutlineModule(**{**OUTLINE, "title": "Rotación"})])
     chart = {"id": "s5", "slide": {"layout": "chart", "title": "Costo", "chart_labels": ["A", "B"],
                                    "chart_values": [1.5, 0.0], "chart_unit": "MXN"}, "narration": "Compara."}
     prompt = designer.revision_prompt(outline, outline.modules[0], 1, "cercano", "Material de llantas",
                                       [*SCENES, chart], READING, [("q1", "¿Se mide en frío?")], ["s2"],
                                       "Haz el título más claro")
 
-    order = ["Material de llantas", "MÓDULO 1: Presión", "REGLAS DE LAS ESCENAS", "GUION ACTUAL", "LECTURA ACTUAL",
-             "q1: ¿Se mide en frío?", "ESCENAS EN ALCANCE: s2", "OBSERVACIÓN DEL ADMINISTRADOR:"]
+    order = ["Material de llantas", "CURSO: Llantas", "REGLAS DE LAS ESCENAS", "CÓMO RESPONDER", "MÓDULO 1: Presión",
+             "GUION ACTUAL", "LECTURA ACTUAL", "q1: ¿Se mide en frío?", "ESCENAS EN ALCANCE: s2",
+             "OBSERVACIÓN DEL ADMINISTRADOR:"]
     assert [prompt.index(part) for part in order] == sorted(prompt.index(part) for part in order)
     assert prompt.endswith("OBSERVACIÓN DEL ADMINISTRADOR:\nHaz el título más claro")
+    # A change to another module of the course starts the same, up to its own module (what the provider reuses).
+    other = designer.revision_prompt(outline, outline.modules[1], 2, "cercano", "Material de llantas", SCENES[:2],
+                                     "", [], None, "Otra cosa")
+    assert len(os.path.commonprefix([prompt, other])) >= prompt.index("MÓDULO 1: Presión")
     script = designer.storyboard_json([*SCENES, chart])
     assert script in prompt
     assert '"id": "s2"' in script and '"subtitle": "Lo esencial"' in script and '"icons": ["clock", "check"]' in script

@@ -143,6 +143,9 @@ def draft_module(ctx: JobContext) -> dict:
         if replaced is not None:  # a script rewritten: kept, so the rewrite can be undone
             revisions.record(db, module, source="regenerate", before=replaced, after=revisions.script_content(module),
                              user_id=ctx.created_by, observation=feedback)
+            # The changes proposed to the script it replaces (those still being proposed too) no longer apply: its
+            # scenes are new, even where they keep an id (s1, s2…), and a scene such a change adds would land in it.
+            revisions.supersede(db, module.id)
         # Ready to produce the video; the storyboard can be reviewed and edited first.
         module.generation_status, module.generation_error = "pending", None
         if questions and module.evaluation is None:  # a quiz the admin already has is never overwritten
