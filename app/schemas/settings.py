@@ -72,6 +72,13 @@ class RankingSettings(_Section):
     points_path: Points = 200
 
 
+class QaSettings(_Section):
+    """The automatic review of the AI videos ("Revisión de calidad")."""
+
+    auto_review: bool = True  # every video is reviewed as soon as it is produced
+    block_publish: bool = False  # a course can't be published while a video has open critical findings
+
+
 class PlatformSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -79,6 +86,7 @@ class PlatformSettings(BaseModel):
     evaluations: EvaluationDefaults = Field(default_factory=EvaluationDefaults)
     certificates: CertificateSettings = Field(default_factory=CertificateSettings)
     ranking: RankingSettings = Field(default_factory=RankingSettings)
+    qa: QaSettings = Field(default_factory=QaSettings)
 
 
 class LearnerSettings(BaseModel):

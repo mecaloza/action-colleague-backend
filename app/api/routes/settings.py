@@ -1,4 +1,5 @@
-"""Admin: the platform's parameters ("parámetros"): general, evaluation defaults, certificates and ranking."""
+"""Admin: the platform's parameters ("parámetros"): general, evaluation defaults, certificates, ranking and the
+automatic review of the videos."""
 
 import logging
 from typing import Any

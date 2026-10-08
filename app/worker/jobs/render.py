@@ -16,6 +16,10 @@ what it says and in which voice, and a presenter's take by the speech it lip-syn
 the slides or the visuals only recomposes, and a scene narrated anew records only its presenter's
 take again. Both stay after publishing; only this job's own intermediate files are deleted.
 
+Right after composing, while the video is still here, its review's frames are taken and checked (when the
+parameters ask for a review: see `services.video_reviews`); they are published with it, and its review is queued
+in the same transaction. Only advice: nothing about the review ever costs the video.
+
 The first run freezes what it renders (scenes, voice, presenter and look) in the state, so a retry
 or a wait never mixes two voices or pairs slides with another script's audio. Only the worker that
 still holds the job publishes, into a folder of its own, and only while the module is still an AI
@@ -39,9 +43,11 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.db.models import Job, MediaAsset, Module
-from app.services import revisions, studio
+from app.services import revisions, studio, video_reviews
+from app.services import settings as platform
+from app.services.ai import llm
 from app.services.course_views import ACTIVE_GENERATION
-from app.services.media import SIGNED_URL_SECONDS, discard_assets
+from app.services.media import REVIEW_FRAMES, SIGNED_URL_SECONDS, discard_assets
 from app.services.slides import lint
 from app.services.slides.render import beat_count, is_hero
 from app.services.slides.render import render as render_slide
@@ -49,6 +55,7 @@ from app.services.slides.spec import Slide, SlideContext
 from app.services.storage import StorageError, get_storage
 from app.services.video import cache as video_cache
 from app.services.video import captions, compose, motion
+from app.services.video import review as video_review
 from app.services.video.avatar import (
     MAX_ASSET_BYTES,
     PRESENTER_BACKGROUND,
@@ -772,6 +779,16 @@ class _Upload:
 
 
 @dataclass
+class _Review:
+    """What the video's review takes from it while it is here: its frames (none when they couldn't be taken: the
+    review takes them from the published video) and what FFmpeg tells about it."""
+
+    frames: list[dict] = field(default_factory=list)  # as the review keeps them (see video_reviews.frame_entries)
+    files: list[Path] = field(default_factory=list)  # each one's JPEG
+    checks: dict | None = None
+
+
+@dataclass
 class _Composition:
     """The files the composition leaves in the work folder."""
 
@@ -782,6 +799,7 @@ class _Composition:
     duration: float
     presenter: bool  # whether the video carries the presenter bubble
     damaged: dict[str, str] = field(default_factory=dict)  # kept takes it left out, damaged ({key: path})
+    review: _Review | None = None  # None: the video isn't reviewed
 
 
 def _hero_scenes(render: RenderInput, presenter: bool) -> list[bool]:
@@ -906,7 +924,11 @@ def _publish(ctx: JobContext, render: RenderInput, made: _Composition) -> dict:
     video = _Upload(f"{folder}/video.mp4", "video/mp4", made.video)
     poster = _Upload(f"{folder}/poster.jpg", "image/jpeg", made.poster)
     vtt = _Upload(f"{folder}/captions.vtt", "text/vtt", made.vtt)
-    uploads = (video, poster, vtt)
+    frames = [
+        _Upload(f"{folder}/review/{video_review.frame_name(frame['index'])}", "image/jpeg", file)
+        for frame, file in zip(made.review.frames, made.review.files)
+    ] if made.review else []
+    uploads = (video, poster, vtt, *frames)
     published = [upload.path for upload in uploads]
     # Saved before uploading: if this process dies meanwhile, whoever comes next deletes the copy.
     abandoned = ctx.state.get("uploading") or []  # an earlier run's copy: that run never published it
@@ -930,7 +952,8 @@ def _publish(ctx: JobContext, render: RenderInput, made: _Composition) -> dict:
             return {"skipped": "module deleted" if module is None else "module has its own video"}
         replaced = [module.video_asset_id, module.poster_asset_id, module.captions_asset_id]
         video_asset = _new_asset(
-            db, render, "video", video, duration_seconds=seconds, width=compose.WIDTH, height=compose.HEIGHT
+            db, render, "video", video, duration_seconds=seconds, width=compose.WIDTH, height=compose.HEIGHT,
+            meta={REVIEW_FRAMES: [frame.path for frame in frames]} if frames else None,  # they go with the video
         )
         poster_asset = _new_asset(db, render, "image", poster, width=made.poster_size[0], height=made.poster_size[1])
         captions_asset = _new_asset(db, render, "captions", vtt, meta={"language": render.language})
@@ -956,6 +979,10 @@ def _publish(ctx: JobContext, render: RenderInput, made: _Composition) -> dict:
                 "cache": video_cache.record(earlier.get("cache"), _kept_speech(ctx), list(takes), dropped=made.damaged),
             },
         }
+        if made.review is not None:  # reviewed as it is published: its review never waits for another video
+            entries = [{**frame, "path": upload.path} for frame, upload in zip(made.review.frames, frames)]
+            video_reviews.request(db, module, created_by=ctx.created_by, frames=entries, checks=made.review.checks,
+                                  render_job_id=ctx.job_id)
         db.commit()
         ctx.state.pop("uploading", None)  # the module's video now
         try:
@@ -1023,6 +1050,7 @@ def render_module(ctx: JobContext) -> dict | Reschedule:
         except compose.ComposeError as exc:
             logger.error("compose_failed", extra={"module_id": ctx.module_id, "error": str(exc)[:MAX_LOG_ERROR_CHARS]})
             raise JobError(MEDIA_ERROR) from exc
+        made.review = _review(ctx, work, made)
         return _publish(ctx, render, made)
 
 
@@ -1052,8 +1080,32 @@ def _compose_video(ctx: JobContext, render: RenderInput, work: Path) -> _Composi
             continue
         if not made.presenter and ctx.state.get("avatar_path"):  # it came out without the presenter's clip
             made.damaged = _damaged_takes(ctx, render, work)
+        ctx.state["composed"] = {"presenter": made.presenter, "visuals": visuals}  # what its review looks for
         return made
     raise AssertionError("unreachable")
+
+
+def _review(ctx: JobContext, work: Path, made: _Composition) -> _Review | None:
+    """The video's frames and FFmpeg's checks for its review, taken while the video is here: when the parameters ask
+    for a review and an AI can look at it (None otherwise). Only advice: when they can't be taken, the review takes
+    them itself from the published video."""
+    with open_session() as db:
+        if not platform.get_settings(db).qa.auto_review or not llm.available():
+            return None
+    try:
+        video = video_reviews.video_from_render(ctx.state, presenter=made.presenter, duration=made.duration)
+        frames = video_review.sample(video.timeline, made.duration, seed=ctx.job_id)
+        files = video_review.extract_frames(made.video, frames, work / "review")
+        presenter = work / "presenter.mp4"  # the presenter's clip (its length against the narration's)
+        checks = {
+            "lint": ctx.state.get("lint"), **video_review.video_checks(made.video, made.duration, video.bubble()),
+            "presenter_seconds": round(compose.clip_seconds(presenter), 2) if made.presenter and presenter.exists()
+            else None,
+        }
+    except Exception:  # FFmpeg, a full disk...: the review takes them from the published video instead
+        logger.exception("review_frames_failed", extra={"module_id": ctx.module_id})
+        return _Review()
+    return _Review(video_reviews.frame_entries(video, frames), files, checks)
 
 
 def _damaged_takes(ctx: JobContext, render: RenderInput, work: Path) -> dict[str, str]:

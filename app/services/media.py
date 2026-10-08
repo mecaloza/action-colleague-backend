@@ -24,6 +24,7 @@ from app.services.storage import StorageError, get_storage
 logger = logging.getLogger(__name__)
 
 SIGNED_URL_SECONDS = 6 * 3600
+REVIEW_FRAMES = "review_frames"  # a video's `meta`: the frames its reviews took (they go with it)
 _LEGACY_CACHE_SECONDS = 20 * 60
 _legacy_cache: dict[str, tuple[float, str | None]] = {}
 
@@ -100,6 +101,12 @@ def _referenced(db: Session, asset_ids: set[str]) -> set[str]:
     return used
 
 
+def _files(asset: MediaAsset) -> list[str]:
+    """What an asset is in storage: its file, and those that go with it (a deck's pages, a video's review frames)."""
+    meta = asset.meta or {}
+    return [asset.path, *meta.get("pages", []), *meta.get(REVIEW_FRAMES, [])]
+
+
 def discard_assets(db: Session, asset_ids: Iterable[str | None]) -> None:
     """
     Delete assets nothing points at any more: rows now (committing the caller's changes too), files
@@ -120,7 +127,7 @@ def discard_assets(db: Session, asset_ids: Iterable[str | None]) -> None:
     for asset in assets:
         db.delete(asset)
     db.flush()
-    paths = {path for asset in assets for path in (asset.path, *(asset.meta or {}).get("pages", []))}
+    paths = {path for asset in assets for path in _files(asset)}
     if paths:  # two rows can share a file (a retried or handed-back job): it goes with the last one
         paths -= {path for (path,) in db.query(MediaAsset.path).filter(MediaAsset.path.in_(paths))}
     db.commit()

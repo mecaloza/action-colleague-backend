@@ -34,6 +34,8 @@ _MESSAGES = {
     ("ranking", "points_module"): "Los puntos por módulo completado deben ser un número entero entre 0 y 1000.",
     ("ranking", "points_course"): "Los puntos por curso completado deben ser un número entero entre 0 y 1000.",
     ("ranking", "points_path"): "Los puntos por ruta completada deben ser un número entero entre 0 y 1000.",
+    ("qa", "auto_review"): "Indica si cada video se revisa automáticamente al producirse (sí o no).",
+    ("qa", "block_publish"): "Indica si los problemas críticos de un video impiden publicar el curso (sí o no).",
 }
 _INVALID = "Revisa los parámetros: hay un valor que no es válido."
 
