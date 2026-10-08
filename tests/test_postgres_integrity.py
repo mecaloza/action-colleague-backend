@@ -554,3 +554,99 @@ def test_assigning_many_people_is_one_insert(client, db, engine, admin, collabor
     with ThreadPoolExecutor(4) as pool:
         assert list(pool.map(assign, range(4))) == [200] * 4
     assert db.query(Enrollment).filter(Enrollment.user_id == collaborator.id).count() == 1
+
+
+# ── Learning paths ────────────────────────────────────────────────────
+
+
+def _audience_with_profile(db, learners: int) -> tuple[int, list[int]]:
+    """A profile and `learners` active collaborators who have it."""
+    profile_id = db.execute(text("INSERT INTO job_profiles (name) VALUES ('Asesor') RETURNING id")).scalar()
+    db.execute(
+        text(
+            "INSERT INTO users (name, email, role, password_hash, is_active, profile_id) "
+            "SELECT 'p' || g, 'p' || g || '@x.test', 'collaborator', 'x', true, :p FROM generate_series(1, :n) g"
+        ),
+        {"p": profile_id, "n": learners},
+    )
+    db.commit()
+    return profile_id, [user_id for (user_id,) in db.execute(text("SELECT id FROM users WHERE email LIKE 'p%@x.test'"))]
+
+
+def _path_with(client, admin_headers, course_ids: list[int], **changes) -> dict:
+    path = client.post("/api/v1/paths", headers=admin_headers, json={"title": "Ruta"}).json()
+    client.put(f"/api/v1/paths/{path['id']}/courses", headers=admin_headers, json={"course_ids": course_ids})
+    if changes:
+        client.patch(f"/api/v1/paths/{path['id']}", headers=admin_headers, json=changes)
+    return path
+
+
+def test_a_path_reaches_many_people_in_a_few_statements(client, db, engine, admin, collaborator):
+    admin_headers = auth_headers(client, admin.email)
+    course_ids = [_course(client, admin_headers, collaborator, quiz=False)[0]["id"] for _ in range(3)]
+    profile_id, user_ids = _audience_with_profile(db, learners=300)
+    by_profile = _path_with(client, admin_headers, course_ids, profile_ids=[profile_id], settings={"due_days": 30})
+    by_hand = _path_with(client, admin_headers, course_ids, status="published")
+    counter = QueryCounter(engine)
+
+    with counter:
+        published = client.patch(f"/api/v1/paths/{by_profile['id']}", headers=admin_headers,
+                                 json={"status": "published"})
+    assert published.status_code == 200, published.text
+    publish_statements = counter.count
+    with counter:
+        assigned = client.post(f"/api/v1/paths/{by_hand['id']}/people", headers=admin_headers,
+                               json={"user_ids": user_ids})
+    assert assigned.status_code == 200 and len(assigned.json()) == 300
+    assign_statements = counter.count  # the response's progress of 300 people included
+
+    assert publish_statements <= 20 and assign_statements <= 20, (publish_statements, assign_statements)
+    assert _count(db, "SELECT count(*) FROM path_assignments WHERE source = 'profile' AND due_at IS NOT NULL") == 300
+    assert _count(db, "SELECT count(*) FROM path_assignments WHERE source = 'manual'") == 300
+    assert _count(db, "SELECT count(*) FROM enrollments e JOIN users u ON u.id = e.user_id "
+                      "WHERE u.email LIKE 'p%@x.test'") == 900
+
+
+def test_bulk_completion_completes_and_reopens_paths_in_a_few_statements(client, db, engine, admin, collaborator):
+    """An admin's module change completes (or reopens) a course for everyone at once: their paths follow, set-based."""
+    admin_headers = auth_headers(client, admin.email)
+    course, module_ids = _course(client, admin_headers, collaborator, modules=3)
+    _seed_audience(db, course["id"], module_ids, learners=300)  # the first two modules completed by everyone
+    learners = [user_id for (user_id,) in db.execute(text("SELECT id FROM users WHERE email LIKE 'u%@x.test'"))]
+    path = _path_with(client, admin_headers, [course["id"]], status="published")
+    client.post(f"/api/v1/paths/{path['id']}/people", headers=admin_headers, json={"user_ids": learners})
+    counter = QueryCounter(engine)
+
+    with counter:
+        assert client.delete(f"/api/v1/modules/{module_ids[-1]}", headers=admin_headers).status_code == 204
+    completing = counter.count
+    completed = _count(db, "SELECT count(*) FROM path_assignments WHERE completed_at IS NOT NULL")
+    with counter:
+        client.post(f"/api/v1/courses/{course['id']}/modules", headers=admin_headers, json={"title": "Nuevo"})
+    reopening = counter.count
+
+    assert completing <= 30 and reopening <= 30, (completing, reopening)
+    assert completed == 300
+    assert _count(db, "SELECT count(*) FROM path_assignments WHERE completed_at IS NOT NULL") == 0
+
+
+def test_path_deletes_respect_foreign_keys(client, db, admin, collaborator):
+    admin_headers = auth_headers(client, admin.email)
+    (course, _), (kept, _) = (_course(client, admin_headers, collaborator, quiz=False) for _ in range(2))
+    profile = client.post("/api/v1/profiles", headers=admin_headers, json={"name": "Asesor"}).json()
+    client.patch(f"/api/v1/users/{collaborator.id}", headers=admin_headers, json={"profile_id": profile["id"]})
+    path = _path_with(client, admin_headers, [course["id"], kept["id"]], status="published",
+                      profile_ids=[profile["id"]])
+    assert _count(db, "SELECT count(*) FROM path_assignments") == 1
+
+    assert client.delete(f"/api/v1/courses/{course['id']}", headers=admin_headers).status_code == 204
+    assert _count(db, "SELECT count(*) FROM learning_path_courses") == 1
+    assert client.delete(f"/api/v1/profiles/{profile['id']}", headers=admin_headers).status_code == 204
+    assert _count(db, "SELECT count(*) FROM users WHERE profile_id IS NOT NULL") == 0
+    assert _count(db, "SELECT count(*) FROM learning_path_profiles") == 0
+    assert _count(db, "SELECT count(*) FROM path_assignments") == 0  # given by the profile, not completed
+    client.post(f"/api/v1/paths/{path['id']}/people", headers=admin_headers, json={"user_ids": [collaborator.id]})
+    assert client.delete(f"/api/v1/paths/{path['id']}", headers=admin_headers).status_code == 204
+    for table in ("learning_paths", "learning_path_courses", "path_assignments"):
+        assert _count(db, f"SELECT count(*) FROM {table}") == 0
+    assert _count(db, f"SELECT count(*) FROM enrollments WHERE course_id = {kept['id']}") == 1  # kept

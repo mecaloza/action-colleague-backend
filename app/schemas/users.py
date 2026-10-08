@@ -4,6 +4,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.common import UtcDatetime, required_text
+from app.schemas.profiles import ProfileRef
 
 Role = Literal["admin", "collaborator"]
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -23,6 +24,7 @@ class UserCreate(BaseModel):
     role: Role = "collaborator"
     position: str = Field(default="", max_length=200)
     department: str = Field(default="", max_length=200)
+    profile_id: int | None = None
 
     _email = field_validator("email")(classmethod(lambda cls, v: normalize_email(v)))
     _name = field_validator("name")(classmethod(lambda cls, v: required_text(v)))
@@ -36,6 +38,7 @@ class UserUpdate(BaseModel):
     position: str | None = Field(default=None, max_length=200)
     department: str | None = Field(default=None, max_length=200)
     is_active: bool | None = None
+    profile_id: int | None = None  # null removes the person's profile
 
     _email = field_validator("email")(classmethod(lambda cls, v: normalize_email(v) if v is not None else v))
     _name = field_validator("name")(classmethod(lambda cls, v: required_text(v) if v is not None else v))
@@ -48,6 +51,7 @@ class UserRow(BaseModel):
     role: str
     position: str
     department: str
+    profile: ProfileRef | None = None
     is_active: bool
     created_at: UtcDatetime | None = None
     enrolled_count: int = 0

@@ -66,6 +66,9 @@ def _schema_diff(url: str) -> list:
         return compare_metadata(context, Base.metadata)
 
 
+_PATH_TABLES = ("job_profiles", "learning_paths", "learning_path_profiles", "learning_path_courses", "path_assignments")
+
+
 def _legacy_database(url: str) -> None:
     """A database like production: baseline schema, data, and no alembic_version table."""
     command.upgrade(alembic_config(url), BASELINE_REVISION)
@@ -93,7 +96,7 @@ def test_fresh_database_matches_the_models(database_url):
     run_migrations(database_url)
 
     assert _schema_diff(database_url) == []
-    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0003_activities",)]
+    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0004_learning_paths",)]
 
 
 def test_production_like_database_is_stamped_then_upgraded(database_url):
@@ -110,7 +113,7 @@ def test_production_like_database_is_stamped_then_upgraded(database_url):
         5: "ai",
     }
     assert [bool(revoked) for (revoked,) in _fetch(database_url, "SELECT revoked FROM refresh_tokens")] == [True]
-    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0003_activities",)]
+    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0004_learning_paths",)]
     assert _schema_diff(database_url) == []
 
 
@@ -135,21 +138,24 @@ def test_new_tables_have_row_level_security_on_postgres(database_url):
         pytest.skip("RLS only exists on Postgres")
     run_migrations(database_url)
 
+    tables = ("media_assets", "jobs", "activities", "activity_attempts", *_PATH_TABLES, VERSION_TABLE)
     rows = _fetch(
         database_url,
         "SELECT relname, relrowsecurity FROM pg_class WHERE relname IN "
-        f"('media_assets', 'jobs', 'activities', 'activity_attempts', '{VERSION_TABLE}') ORDER BY relname",
+        f"({', '.join(repr(table) for table in tables)}) ORDER BY relname",
     )
-    assert rows == [(VERSION_TABLE, True), ("activities", True), ("activity_attempts", True), ("jobs", True),
-                    ("media_assets", True)]
+    assert sorted(rows) == [(table, True) for table in sorted(tables)]  # sorted here: collations differ
 
 
 def test_downgrade_returns_to_the_baseline(database_url):
     run_migrations(database_url)
     command.downgrade(alembic_config(database_url), BASELINE_REVISION)
 
-    assert {"media_assets", "jobs", "activities", "activity_attempts"}.isdisjoint(_table_names(database_url))
+    assert {"media_assets", "jobs", "activities", "activity_attempts", *_PATH_TABLES}.isdisjoint(
+        _table_names(database_url)
+    )
     assert "source" not in _column_names(database_url, "courses")
+    assert "profile_id" not in _column_names(database_url, "users")
 
 
 # --- added in review -------------------------------------------------------------------------
@@ -243,8 +249,10 @@ def test_the_previous_release_can_still_insert_rows(database_url):
         "INSERT INTO evaluations (module_id) VALUES (10)",
         "INSERT INTO enrollments (id, user_id, course_id, status) VALUES (10, 1, 10, 'assigned')",
         "INSERT INTO module_progress (enrollment_id, module_id) VALUES (10, 10)",
+        "INSERT INTO users (id, name, email, password_hash, role) VALUES (10, 'Bea', 'b@x.test', 'h', 'collaborator')",
     )
     assert _fetch(database_url, "SELECT source FROM courses WHERE id = 10") == [("manual",)]
+    assert _fetch(database_url, "SELECT profile_id FROM users WHERE id = 10") == [(None,)]
 
 
 def test_an_empty_version_table_is_stamped_too(database_url):

@@ -1,4 +1,4 @@
-"""Learner endpoints: my courses, the course player, quizzes, interactive activities and module completion."""
+"""Learner endpoints: my courses and paths, the course player, quizzes, interactive activities and completion."""
 
 import json
 
@@ -24,10 +24,12 @@ from app.schemas.learn import (
     PositionUpdate,
     QuestionResult,
 )
+from app.schemas.paths import CourseRef, LearnerPath, PathRef
 from app.services import activities as engine
-from app.services import progress, quiz
+from app.services import paths, progress, quiz
 from app.services.learner_views import course_player_detail, learner_course
 from app.services.media import MediaResolver
+from app.services.path_views import learner_paths
 
 router = APIRouter(prefix="/learn", tags=["learn"])
 
@@ -54,14 +56,18 @@ def _enrollment_for_course(db: Session, user: User, course_id: int) -> Enrollmen
 def _unlocked_module(
     db: Session, user: User, module_id: int
 ) -> tuple[Enrollment, progress.ModuleState, list[progress.ModuleState]]:
-    """The learner's enrollment, the module's state and all the course's states; 403 while it is locked."""
+    """The learner's enrollment, the module's state and all the course's states; 403 while it is locked (by the
+    previous module, or by the course's learning path)."""
     module = db.get(Module, module_id)
     if module is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, NO_ACCESS)
     enrollment = _enrollment_for_course(db, user, module.course_id)
-    states = progress.module_states(db, enrollment)
+    locked_by = paths.journey(db, user.id).locked_by.get(module.course_id)
+    states = progress.module_states(db, enrollment, course_unlocked=locked_by is None)
     state = next(s for s in states if s.module.id == module_id)
     if not state.unlocked:
+        if locked_by:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, f"Completa el curso «{locked_by.title}» para continuar.")
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Completa el módulo anterior para continuar")
     return enrollment, state, states
 
@@ -78,6 +84,19 @@ def _next_module_id(states: list[progress.ModuleState], module_id: int) -> int |
     ids = [state.module.id for state in states]
     index = ids.index(module_id)
     return ids[index + 1] if index + 1 < len(ids) else None
+
+
+def _path_outcome(db: Session, enrollment: Enrollment) -> dict:
+    """Once the course is completed: the next course its path opened, or the path it completed."""
+    if enrollment.status != "completed":
+        return {}
+    db.flush()  # the completion is read back below
+    journey = paths.journey(db, enrollment.user_id)
+    step, path = journey.next_course(enrollment.course_id), journey.completed_path(enrollment.course_id)
+    return {
+        "next_course": CourseRef(course_id=step.course_id, title=step.title) if step else None,
+        "path_completed": PathRef(id=path.id, title=path.title) if path else None,
+    }
 
 
 def _learner_results(graded_results: list[dict], reveal: bool) -> list[QuestionResult]:
@@ -101,16 +120,31 @@ def my_courses(db: Session = Depends(get_db), user: User = Depends(get_current_u
     enrollments = progress.user_enrollments(db, user.id, published_only=True)
     media = MediaResolver(db).prepare(extra_asset_ids=[e.course.cover_asset_id for e in enrollments])
     evaluations = progress.evaluations_by_module(db, [m for e in enrollments for m in e.course.modules])
+    journey = paths.journey(db, user.id)
     return [
-        learner_course(e, progress.module_states(db, e, evaluations), media.url(e.course.cover_asset_id))
+        learner_course(
+            e,
+            progress.module_states(db, e, evaluations, course_unlocked=e.course_id not in journey.locked_by),
+            media.url(e.course.cover_asset_id),
+            journey,
+        )
         for e in enrollments
     ]
 
 
 @router.get("/courses/{course_id}", response_model=LearnerCourseDetail)
 def course_player(course_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """A course its path still keeps locked opens with every module locked, and says which course unlocks it."""
     enrollment = _enrollment_for_course(db, user, course_id)
-    return course_player_detail(db, enrollment.course, progress.module_states(db, enrollment), enrollment)
+    journey = paths.journey(db, user.id)
+    states = progress.module_states(db, enrollment, course_unlocked=course_id not in journey.locked_by)
+    return course_player_detail(db, enrollment.course, states, enrollment, journey)
+
+
+@router.get("/paths", response_model=list[LearnerPath])
+def my_paths(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """My published learning paths, oldest first: each course's state, the one to go on with and the deadline."""
+    return learner_paths(db, user.id)
 
 
 @router.get("/modules/{module_id}/quiz", response_model=LearnerQuiz)
@@ -184,6 +218,7 @@ def submit_quiz(
     # admin grants more attempts or reassigns the course.
     reveal = passed
     return AttemptResult(
+        **_path_outcome(db, enrollment),
         score=graded["score"],
         passed=passed,
         correct=graded["correct"],
@@ -210,6 +245,7 @@ def complete_module(module_id: int, db: Session = Depends(get_db), user: User = 
     progress.refresh_enrollment(db, enrollment)
     db.commit()
     return CompletionResult(
+        **_path_outcome(db, enrollment),
         module_completed=True,
         next_module_id=_next_module_id(states, module_id),
         course_completed=enrollment.status == "completed",
@@ -281,13 +317,14 @@ def _count_finished_play(db: Session, enrollment: Enrollment, state: progress.Mo
     return record
 
 
-def _completion(enrollment: Enrollment, states: list[progress.ModuleState], state: progress.ModuleState,
+def _completion(db: Session, enrollment: Enrollment, states: list[progress.ModuleState], state: progress.ModuleState,
                 module_completed: bool) -> dict:
-    """What a finished play left done: its module (and then the next one to go to) and the course."""
+    """What a finished play left done: its module (and then the next one to go to), the course and its path."""
     return {
         "module_completed": module_completed,
         "next_module_id": _next_module_id(states, state.module.id) if module_completed else None,
         "course_completed": enrollment.status == "completed",
+        **_path_outcome(db, enrollment),
     }
 
 
@@ -299,7 +336,7 @@ def _finish_play(db: Session, activity: Activity, attempt: ActivityAttempt, enro
     except engine.GameError as exc:
         raise HTTPException(exc.status, str(exc)) from exc
     record = _count_finished_play(db, enrollment, state)
-    return _completion(enrollment, states, state, bool(record.completed))
+    return _completion(db, enrollment, states, state, bool(record.completed))
 
 
 @router.post("/activities/{activity_id}/attempts", response_model=ActivityPlay)
@@ -393,7 +430,7 @@ def finish_activity(attempt_id: int, db: Session = Depends(get_db), user: User =
     attempt = _own_attempt(db, user, attempt_id)
     activity, enrollment, state, states = _playable_activity(db, user, attempt.activity_id)
     if attempt.finished_at is not None:
-        completion = _completion(enrollment, states, state, state.completed)
+        completion = _completion(db, enrollment, states, state, state.completed)
     else:
         completion = _finish_play(db, activity, attempt, enrollment, state, states)
         db.commit()

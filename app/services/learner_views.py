@@ -12,15 +12,31 @@ from app.schemas.learn import (
     LearnerModule,
     QuizSummary,
 )
+from app.schemas.paths import CoursePath, CourseRef
 from app.services import activities as activity_engine
 from app.services import quiz
 from app.services.media import MediaResolver
 from app.services.metrics import percentage
+from app.services.paths import Journey
 from app.services.progress import ModuleState
 
 
-def learner_course(enrollment: Enrollment, states: list[ModuleState], cover_url: str | None = None) -> LearnerCourse:
-    """A row of a person's course list: overall progress and the module that comes next."""
+def path_fields(course_id: int, journey: Journey | None) -> dict:
+    """The course's place in the learner's paths: locked (and by which course) and its step in the first path."""
+    lock = journey.locked_by.get(course_id) if journey else None
+    place = journey.place(course_id) if journey else None
+    return {
+        "locked": lock is not None,
+        "locked_by": CourseRef(course_id=lock.course_id, title=lock.title) if lock else None,
+        "path": CoursePath(id=place[0].id, title=place[0].title, step=place[1], steps=len(place[0].steps))
+        if place else None,
+    }
+
+
+def learner_course(
+    enrollment: Enrollment, states: list[ModuleState], cover_url: str | None = None, journey: Journey | None = None
+) -> LearnerCourse:
+    """A row of a person's course list: overall progress, the module that comes next and its place in a path."""
     course = enrollment.course
     completed = sum(1 for state in states if state.completed)
     next_state = next((state for state in states if not state.completed), None)
@@ -38,6 +54,7 @@ def learner_course(enrollment: Enrollment, states: list[ModuleState], cover_url:
         total_duration_seconds=sum(state.module.duration_seconds or 0 for state in states),
         enrolled_at=enrollment.enrolled_at,
         completed_at=enrollment.completed_at,
+        **path_fields(enrollment.course_id, journey),
     )
 
 
@@ -119,7 +136,8 @@ def _learner_enrollment(enrollment: Enrollment) -> LearnerEnrollment:
 
 
 def course_player_detail(
-    db: Session, course: Course, states: list[ModuleState], enrollment: Enrollment | None
+    db: Session, course: Course, states: list[ModuleState], enrollment: Enrollment | None,
+    journey: Journey | None = None,
 ) -> LearnerCourseDetail:
     media = MediaResolver(db).prepare(modules=[state.module for state in states])
     resumable = _resumable_activities(db, enrollment, states) if enrollment else set()
@@ -129,4 +147,5 @@ def course_player_detail(
         ),
         enrollment=_learner_enrollment(enrollment) if enrollment else None,
         modules=[_learner_module(state, media, resumable) for state in states],
+        **path_fields(course.id, journey),
     )
