@@ -37,9 +37,16 @@ from app.schemas.courses import (
 )
 from app.schemas.learn import LearnerCourseDetail
 from app.schemas.media import PURPOSES_NEEDING_MODULE
-from app.services import certificates, legacy_data, paths, progress, quiz
+from app.services import certificates, legacy_data, paths, progress, quiz, revisions
 from app.services import settings as platform
-from app.services.course_views import ACTIVE_GENERATION, course_counts, course_detail, course_summary, module_admin
+from app.services.course_views import (
+    ACTIVE_GENERATION,
+    course_counts,
+    course_detail,
+    course_summary,
+    module_admin,
+    module_out,
+)
 from app.services.learner_views import course_player_detail
 from app.services.media import MediaResolver, discard_assets
 from app.services.storage import StorageError, get_storage
@@ -303,12 +310,23 @@ def create_module(course_id: int, payload: ModuleCreate, db: Session = Depends(g
 
 
 @router.patch("/modules/{module_id}", response_model=ModuleAdmin)
-def update_module(module_id: int, payload: ModuleUpdate, db: Session = Depends(get_db)):
+def update_module(
+    module_id: int, payload: ModuleUpdate, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+):
     module = module_or_404(db, module_id)
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    fields = payload.model_dump(exclude_unset=True)
+    # An AI module's reading is part of its script: an edit to it is kept as a change, so it can be undone.
+    before = None
+    if module.source == "ai" and "content_text" in fields:
+        db.refresh(module, with_for_update={"key_share": True})  # one change to the script at a time
+        before = revisions.script_content(module)
+    for field, value in fields.items():
         setattr(module, field, value)
+    if before is not None:
+        revisions.record(db, module, source="manual", before=before, after=revisions.script_content(module),
+                         user_id=admin.id)
     db.commit()
-    return module_admin(module, MediaResolver(db).prepare(modules=[module]), module.evaluation)
+    return module_out(db, module)
 
 
 @router.delete("/modules/{module_id}", status_code=status.HTTP_204_NO_CONTENT)

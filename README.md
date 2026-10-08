@@ -47,7 +47,7 @@ Tests:
 | Verificación de certificados | `/public/certificates/{code}` (+ `/pdf`) | cualquiera, sin sesión |
 | Aprender | `/learn/courses`, `/learn/courses/{id}`, `/learn/paths`, `/learn/certificates`, `/learn/ranking`, `/learn/settings`, `/learn/modules/{id}/quiz`, `/quiz/attempts`, `/complete`, `/position` | colaborador inscrito |
 | Medios y trabajos | `/media/uploads`, `/media/{id}/complete`, `/media/{id}`, `/courses/{id}/cover`, `/courses/{id}/materials`, `/jobs` | admin |
-| Estudio IA y video | `/courses/{id}/outline` (+ `generate`), `/courses/{id}/draft`, `/modules/{id}/storyboard`, `/slides/preview`, `/studio/*`, `/courses/{id}/render`, `/modules/{id}/render`, `/modules/{id}/recording`, `/modules/{id}/transcribe` | admin |
+| Estudio IA y video | `/courses/{id}/outline` (+ `generate`), `/courses/{id}/draft`, `/modules/{id}/storyboard`, `/modules/{id}/revisions`, `/revisions/{id}` (+ `apply`, `discard`, `revert`), `/slides/preview`, `/studio/*`, `/courses/{id}/render`, `/modules/{id}/render`, `/modules/{id}/recording`, `/modules/{id}/transcribe` | admin |
 
 Reglas clave:
 - Los módulos se desbloquean en orden. Un módulo con evaluación se completa aprobándola y uno sin evaluación, al marcarlo como visto.
@@ -73,6 +73,7 @@ Reglas clave:
 2. `PUT /courses/{id}/outline`: el admin aprueba (y edita) la propuesta y se crean los módulos.
 3. `POST /courses/{id}/draft`: por módulo, la IA escribe el guion en escenas (diapositiva + narración), un resumen de lectura y la evaluación (`ai.module_draft`). El guion se puede editar o regenerar con indicaciones.
 4. `POST /modules/{id}/evaluation/generate`: sugiere preguntas desde el contenido de cualquier módulo (también manual); se revisan antes de guardar.
+5. **Pedir un cambio** (`POST /modules/{id}/revisions`, trabajo `ai.revise`): en vez de reescribir el guion, el admin escribe una observación, para todo el guion o para las escenas que elija. La IA propone solo lo que cambia (qué escenas y qué campos) y el servidor toma solo eso, con las mismas conversiones y límites del primer guion: las demás escenas quedan tal como estaban guardadas. La propuesta trae las diferencias por escena (cada campo antes y después, la narración palabra por palabra) y lo que costaría volver a producir el video (escenas a narrar y sus caracteres, tomas del presentador, si cambia quién presenta cada escena, imágenes por hacer). Nada cambia hasta `POST /revisions/{id}/apply` (con `render: true` también vuelve a producir el video, si el módulo ya tiene uno). Si el guion cambió después en otras escenas, se aplica encima; si cambió en las mismas, responde 409. `discard` la descarta y `revert` deshace un cambio aplicado: solo lo que ese cambio tocó, sin perder lo editado después en otras escenas. Guardar a mano (el guion, o la lectura desde la ficha del módulo) y reescribir con IA también quedan en el historial (`GET /modules/{id}/revisions`), así que también se deshacen. Reescribir con IA deja sin efecto las propuestas pendientes: se hicieron sobre el guion que reemplaza. Cada módulo dice qué escenas no refleja su video (`stale_scene_ids`) y si tiene un cambio por revisar (`revision_pending`).
 
 Las diapositivas se dibujan en el servidor a 1920×1080 (`app/services/slides`): siete layouts de marca, tipografías libres incluidas (OFL), texto que se ajusta solo y zona reservada para el presentador. `POST /slides/preview` devuelve exactamente la misma imagen que usará el video.
 
@@ -97,6 +98,7 @@ Cada arranque encola `legacy.migrate` (idempotente, una sola copia activa):
 - Pone fecha de finalización a los cursos completados antes de que existiera (la del último módulo completado).
 - Emite los certificados que faltan de cursos y rutas ya completados (con las mismas reglas; nunca repite ni vuelve a emitir uno revocado).
 - Deriva los puntos de lo hecho antes de que existieran, cada uno con su fecha. Una actividad o evaluación que ya ganó puntos desde el deploy no se repite: al ganarlos escribió su pasado.
+- Anota qué escenas muestra cada video IA hecho antes de que se guardara (las que su render congeló al empezar), para saber cuáles se editaron después.
 - Copia al bucket privado los videos que la app anterior dejó en buckets públicos del proyecto y los procesa como cualquier subida (portada, duración, subtítulos). El archivo original no se toca.
 - Los videos que siguen en HeyGen esperan a que el copiado de abajo los pase a Storage; el trabajo lo vuelve a revisar cada 6 h hasta el apagado de la API de HeyGen.
 

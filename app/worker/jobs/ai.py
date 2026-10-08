@@ -4,7 +4,7 @@ AI studio jobs.
 - ai.outline:       brief + course materials -> proposed outline (stored in the course settings).
 - ai.module_draft:  outline entry -> storyboard (slides + narration), reading summary and quiz.
 - ai.quiz:          a module's content -> suggested questions (returned for review, not saved).
-(Interactive activities: app/worker/jobs/activities.py.)
+(Interactive activities: app/worker/jobs/activities.py; a change to a script by an observation: revisions.py.)
 """
 
 import logging
@@ -17,8 +17,8 @@ from app.core.config import get_settings
 from app.db.models import Course, Evaluation, Job, Module
 from app.schemas.courses import MAX_AUDIENCE_CHARS
 from app.schemas.studio import OutlineGenerate, QuizGenerate
+from app.services import revisions, studio
 from app.services import settings as platform
-from app.services import studio
 from app.services.ai import designer
 from app.services.ai.llm import LLMError, get_llm
 from app.services.course_views import ACTIVE_GENERATION
@@ -136,9 +136,16 @@ def draft_module(ctx: JobContext) -> dict:
             return {"skipped": "module deleted"}
         if module.source != "ai":  # a video or document was attached while the model wrote
             return {"skipped": "not an AI module"}
+        replaced = revisions.script_content(module) if studio.scenes_of(module) else None
         render = (module.storyboard or {}).get("render")  # about the video still attached: it stays
         module.storyboard = {"outline": entry.model_dump(), "scenes": scenes, **({"render": render} if render else {})}
         module.content_text = designer.plain_markdown(draft.reading_summary)
+        if replaced is not None:  # a script rewritten: kept, so the rewrite can be undone
+            revisions.record(db, module, source="regenerate", before=replaced, after=revisions.script_content(module),
+                             user_id=ctx.created_by, observation=feedback)
+            # The changes proposed to the script it replaces (those still being proposed too) no longer apply: its
+            # scenes are new, even where they keep an id (s1, s2…), and a scene such a change adds would land in it.
+            revisions.supersede(db, module.id)
         # Ready to produce the video; the storyboard can be reviewed and edited first.
         module.generation_status, module.generation_error = "pending", None
         if questions and module.evaluation is None:  # a quiz the admin already has is never overwritten

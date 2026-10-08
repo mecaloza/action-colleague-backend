@@ -74,6 +74,7 @@ def _schema_diff(url: str) -> list:
 _PATH_TABLES = ("job_profiles", "learning_paths", "learning_path_profiles", "learning_path_courses", "path_assignments")
 _CERTIFICATE_TABLES = ("app_settings", "learner_certificates")
 _POINTS_TABLES = ("learner_points",)
+_REVISION_TABLES = ("module_revisions",)
 
 
 def _legacy_database(url: str) -> None:
@@ -103,7 +104,7 @@ def test_fresh_database_matches_the_models(database_url):
     run_migrations(database_url)
 
     assert _schema_diff(database_url) == []
-    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0006_points_ranking",)]
+    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0007_module_revisions",)]
 
 
 def test_production_like_database_is_stamped_then_upgraded(database_url):
@@ -120,7 +121,7 @@ def test_production_like_database_is_stamped_then_upgraded(database_url):
         5: "ai",
     }
     assert [bool(revoked) for (revoked,) in _fetch(database_url, "SELECT revoked FROM refresh_tokens")] == [True]
-    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0006_points_ranking",)]
+    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0007_module_revisions",)]
     assert _schema_diff(database_url) == []
 
 
@@ -146,7 +147,7 @@ def test_new_tables_have_row_level_security_on_postgres(database_url):
     run_migrations(database_url)
 
     tables = ("media_assets", "jobs", "activities", "activity_attempts", *_PATH_TABLES, *_CERTIFICATE_TABLES,
-              *_POINTS_TABLES, VERSION_TABLE)
+              *_POINTS_TABLES, *_REVISION_TABLES, VERSION_TABLE)
     rows = _fetch(
         database_url,
         "SELECT relname, relrowsecurity FROM pg_class WHERE relname IN "
@@ -160,7 +161,7 @@ def test_downgrade_returns_to_the_baseline(database_url):
     command.downgrade(alembic_config(database_url), BASELINE_REVISION)
 
     assert {"media_assets", "jobs", "activities", "activity_attempts", *_PATH_TABLES, *_CERTIFICATE_TABLES,
-            *_POINTS_TABLES}.isdisjoint(_table_names(database_url))
+            *_POINTS_TABLES, *_REVISION_TABLES}.isdisjoint(_table_names(database_url))
     assert "source" not in _column_names(database_url, "courses")
     assert "profile_id" not in _column_names(database_url, "users")
     assert _index_names(database_url, "evaluation_attempts") == {"ix_evaluation_attempts_id"}
@@ -180,6 +181,26 @@ def test_downgrading_the_points_keeps_the_attempts(database_url):
     assert "learner_points" not in _table_names(database_url)
     assert "ix_evaluation_attempts_enrollment_id" not in _index_names(database_url, "evaluation_attempts")
     assert "ix_activity_attempts_user_finished" not in _index_names(database_url, "activity_attempts")
+    run_migrations(database_url)  # and up again
+    assert _schema_diff(database_url) == []
+
+
+def test_downgrading_the_revisions_keeps_the_scripts(database_url):
+    """Back to the points: the revisions go; the modules (and the scripts they changed) stay."""
+    run_migrations(database_url)
+    _execute(
+        database_url,
+        "INSERT INTO courses (id, title, status) VALUES (1, 'C', 'draft')",
+        'INSERT INTO modules (id, course_id, title, "order", storyboard) VALUES '
+        """(1, 1, 'M', 1, '{"scenes": [{"id": "s1"}]}')""",
+        "INSERT INTO module_revisions (module_id, source, status, \"before\", \"after\") VALUES "
+        """(1, 'manual', 'applied', '{"scenes": []}', '{"scenes": [{"id": "s1"}]}')""",
+    )
+
+    command.downgrade(alembic_config(database_url), "0006_points_ranking")
+
+    assert "module_revisions" not in _table_names(database_url)
+    assert _fetch(database_url, "SELECT id FROM modules") == [(1,)]
     run_migrations(database_url)  # and up again
     assert _schema_diff(database_url) == []
 

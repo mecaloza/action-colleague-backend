@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.db.models import Job, MediaAsset, Module
-from app.services import studio
+from app.services import revisions, studio
 from app.services.course_views import ACTIVE_GENERATION
 from app.services.media import SIGNED_URL_SECONDS, discard_assets
 from app.services.slides import lint
@@ -43,7 +43,7 @@ from app.services.slides.spec import Slide, SlideContext
 from app.services.storage import StorageError, get_storage
 from app.services.video import captions, compose, motion
 from app.services.video.avatar import MAX_ASSET_BYTES, AvatarError, AvatarProvider, get_avatar_provider
-from app.services.video.visuals import VisualError, VisualRequest, cache_path, get_visuals
+from app.services.video.visuals import VisualError, VisualRequest, cache_path, get_visuals, scene_prompt
 from app.services.video.voice import VoiceError, get_voice_provider
 from app.worker import queue
 from app.worker.runner import JobCancelled, JobContext, JobError, Reschedule, handler, holds_job, open_session
@@ -297,17 +297,6 @@ FALLBACKS = {
     "infographic": ("infographic",),  # it explains the scene: nothing else stands in for it (the title does)
 }
 MAX_VISUAL_RETRIES = 6  # a busy provider (rate limit) is asked again this many times, then the next kind is tried
-
-
-def scene_prompt(scene: dict) -> str:
-    """What a generated visual shows: its description, or (keywords alone make a poor prompt) the slide's title
-    with its search keywords."""
-    visual = scene.get("visual") or {}
-    prompt, query = (visual.get("prompt") or "").strip(), (visual.get("query") or "").strip()
-    if prompt or not query:
-        return prompt
-    title = ((scene.get("slide") or {}).get("title") or "").strip()
-    return f"{title}. {query}" if title else query
 
 
 def _visual_options(render: RenderInput) -> dict[int, list[VisualRequest]]:
@@ -794,6 +783,8 @@ def _publish(ctx: JobContext, render: RenderInput, made: _Composition) -> dict:
                 "avatar_id": render.avatar_id if made.presenter else "",
                 "warning": ctx.state.get("warning"),
                 "duration_seconds": seconds,
+                # What the video shows: the script is compared with it (the scenes edited since it was made).
+                "scene_hashes": revisions.video_scenes(render.scenes),
             },
         }
         db.commit()
