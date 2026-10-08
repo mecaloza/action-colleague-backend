@@ -20,6 +20,7 @@ DEFAULTS = {
                      "signer_title": ""},
     "ranking": {"visible_to_learners": True, "show_full_names": True, "points_module": 20, "points_course": 100,
                 "points_path": 200},
+    "qa": {"auto_review": True, "block_publish": False},
 }
 
 
@@ -78,6 +79,8 @@ def test_changes_merge_section_by_section_and_unknown_keys_are_dropped(client, d
     ({"ranking": {"points_module": -1}}, "Los puntos por módulo completado deben ser un número entero entre 0 y"),
     ({"ranking": {"points_course": 1001}}, "Los puntos por curso completado deben ser un número entero entre 0 y"),
     ({"ranking": {"points_path": 2.5}}, "Los puntos por ruta completada deben ser un número entero entre 0 y 1000."),
+    ({"qa": {"auto_review": "a veces"}}, "Indica si cada video se revisa automáticamente al producirse (sí o no)."),
+    ({"qa": {"block_publish": None}}, "Indica si los problemas críticos de un video impiden publicar el curso"),
 ])
 def test_wrong_values_are_rejected_in_the_admins_words(client, admin_headers, changes, message):
     _patch(client, admin_headers, {"general": {"company_name": "Acme"}})

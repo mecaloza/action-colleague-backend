@@ -4,10 +4,13 @@ LLM access with structured outputs.
 `structured(system, user, schema)` returns a validated Pydantic object. The OpenAI provider uses
 Structured Outputs (`chat.completions.parse`), so responses always match the schema — no JSON
 repair and no placeholder fallbacks. The fake provider (tests, local dev without keys) builds
-deterministic, schema-valid content so every flow can run end to end offline.
+deterministic, schema-valid content so every flow can run end to end offline. A request can carry
+pictures too (`images`: JPEG files), e.g. the frames of a video to review.
 """
 
+import base64
 import logging
+from collections.abc import Sequence
 from functools import lru_cache
 from typing import Protocol, TypeVar
 
@@ -36,9 +39,23 @@ class LLMError(RuntimeError):
 
 class LLM(Protocol):
     def structured(
-        self, system: str, user: str, schema: type[T], max_tokens: int = 8000, usage: dict | None = None
+        self, system: str, user: str, schema: type[T], max_tokens: int = 8000, usage: dict | None = None,
+        images: Sequence[bytes] | None = None,
     ) -> T:
-        """`usage`, when given, gets the tokens the call used (`prompt_tokens`, `completion_tokens`)."""
+        """`usage`, when given, gets the tokens the call used (`prompt_tokens`, `completion_tokens`). `images`: JPEG
+        pictures the model looks at after reading `user`, each introduced as "Imagen N" (N from 0, in order)."""
+
+
+def _user_content(user: str, images: Sequence[bytes] | None) -> str | list[dict]:
+    """The user's message: the text, then each picture (sent whole: `detail` high) after its number."""
+    if not images:
+        return user
+    content: list[dict] = [{"type": "text", "text": user}]
+    for number, image in enumerate(images):
+        url = "data:image/jpeg;base64," + base64.b64encode(image).decode()
+        content += [{"type": "text", "text": f"Imagen {number}:"},
+                    {"type": "image_url", "image_url": {"url": url, "detail": "high"}}]
+    return content
 
 
 class OpenAILLM:
@@ -46,11 +63,13 @@ class OpenAILLM:
         self.client = openai.OpenAI(api_key=api_key, max_retries=2, timeout=180)
         self.model = model
 
-    def structured(self, system, user, schema, max_tokens=8000, usage=None):
+    def structured(self, system, user, schema, max_tokens=8000, usage=None, images=None):
         try:
             completion = self.client.chat.completions.parse(
                 model=self.model,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                messages=[
+                    {"role": "system", "content": system}, {"role": "user", "content": _user_content(user, images)},
+                ],
                 response_format=schema,
                 max_completion_tokens=max_tokens,
             )
@@ -70,7 +89,9 @@ class OpenAILLM:
             if getattr(exc, "code", None) == "context_length_exceeded":
                 raise LLMError("Los materiales son demasiado largos para la IA; quita alguno.", permanent=True) from exc
             if isinstance(exc, openai.APIStatusError) and 400 <= exc.status_code < 500 and exc.status_code not in TRANSIENT:
-                raise LLMError("El servicio de IA rechazó la solicitud.", permanent=True) from exc
+                # e.g. a model that doesn't take pictures: say so, the admin can't tell it from the generic message
+                rejected = "las imágenes" if images else "la solicitud"
+                raise LLMError(f"El servicio de IA rechazó {rejected}.", permanent=True) from exc
             raise LLMError("El servicio de IA no respondió. Intenta de nuevo en unos minutos.") from exc
         message = completion.choices[0].message
         if message.refusal or message.parsed is None:
@@ -83,6 +104,12 @@ class OpenAILLM:
         if usage is not None:
             usage.update(tokens)
         return message.parsed
+
+
+def available() -> bool:
+    """Whether this server can ask an LLM at all (a key, or the offline fake)."""
+    settings = get_settings()
+    return settings.use_fake_providers or bool(settings.openai_api_key)
 
 
 @lru_cache

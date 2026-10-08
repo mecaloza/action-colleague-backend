@@ -3,6 +3,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.common import UtcDatetime, required_text
+from app.schemas.reviews import ReviewBadge
 
 Language = Literal["es", "en", "pt"]
 CourseStatus = Literal["draft", "published", "archived"]
@@ -116,6 +117,7 @@ class ModuleAdmin(BaseModel):
     # last, those it shows that the script no longer has): it needs producing again.
     stale_scene_ids: list[str] = Field(default_factory=list)
     revision_pending: bool = False  # a change the AI proposed (or is proposing) waits for the admin's review
+    review: ReviewBadge | None = None  # the automatic review of its AI video (none yet, or no AI video: null)
     evaluation: EvaluationSummary | None = None
     updated_at: UtcDatetime | None = None
 

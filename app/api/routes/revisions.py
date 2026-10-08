@@ -35,7 +35,7 @@ from app.schemas.revisions import (
     RevisionSummary,
     RevisionTarget,
 )
-from app.services import activity_revisions, quiz, quiz_revisions, revisions, studio
+from app.services import activity_revisions, quiz, quiz_revisions, revisions, studio, video_reviews
 from app.services.activity_spec import SpecError
 from app.services.course_views import ACTIVE_GENERATION
 from app.services.media_views import job_out
@@ -380,6 +380,30 @@ def _mark_applied(revision: ModuleRevision, before: dict, after: dict, changes: 
     revision.status, revision.applied_at, revision.applied_by = "applied", datetime.now(timezone.utc), admin.id
 
 
+def _qa_issue(db: Session, revision: ModuleRevision) -> tuple[str | None, bool]:
+    """The video review's finding a change is about, and whether making the change fixes it: a change asked for the
+    finding fixes it, its undo undoes the fix, the undo of that undo fixes it again..."""
+    fixes, seen = True, set()
+    while revision is not None and revision.id not in seen:
+        seen.add(revision.id)
+        scope = revision.scope or {}
+        if scope.get("qa_issue_id"):
+            return scope["qa_issue_id"], fixes
+        if not scope.get("reverted_id"):
+            break
+        revision, fixes = db.get(ModuleRevision, scope["reverted_id"]), not fixes
+    return None, fixes
+
+
+def _follow_qa(db: Session, revision: ModuleRevision, *, undone: bool = False) -> None:
+    """The finding the change (applied now, or `undone` now) was made for: fixed while the change stands, open again
+    once it is undone. The caller commits."""
+    issue_id, fixes = _qa_issue(db, revision)
+    if issue_id:
+        fixed = not fixes if undone else fixes  # undoing a change undoes what it did for the finding
+        video_reviews.mark_issue(db, revision.module_id, issue_id, video_reviews.FIXED if fixed else video_reviews.OPEN)
+
+
 def _apply_script(db: Session, revision: ModuleRevision, module: Module, render: bool, admin: User) -> RevisionApplied:
     # Only a video the module has is produced again (its first one is made from the studio), and what it takes is
     # checked before changing anything: the change and its video go together.
@@ -409,6 +433,7 @@ def _apply_script(db: Session, revision: ModuleRevision, module: Module, render:
     changes.update(ignored=proposed.get("ignored", []), affected_question_ids=proposed.get("affected_question_ids", []),
                    rebased=revisions.content_hash(current) != revision.base_hash)
     _mark_applied(revision, current, result, changes, admin)
+    _follow_qa(db, revision)
     revisions.supersede(db, module.id, ("proposed",), besides=revision.id)
     studio.queue_visuals(db, module)  # a new infographic is made now, for the preview
     render_job = None
@@ -444,6 +469,7 @@ def _apply_quiz(db: Session, revision: ModuleRevision, module: Module, admin: Us
     changes = quiz_revisions.describe(current, result, quiz_revisions.reasons_of(proposed), renamed)
     changes.update(ignored=proposed.get("ignored", []), rebased=revisions.content_hash(current) != revision.base_hash)
     _mark_applied(revision, current, result, changes, admin)
+    _follow_qa(db, revision)
     revisions.supersede(db, module.id, ("proposed",), besides=revision.id, target="quiz")
     db.commit()
     logger.info("revision_applied", extra={"revision_id": revision.id, "module_id": module.id, "target": "quiz",
@@ -468,6 +494,7 @@ def _apply_activity(db: Session, revision: ModuleRevision, admin: User) -> Revis
     changes = activity_revisions.describe(activity.type, current, result)
     changes["rebased"] = revisions.content_hash(current) != revision.base_hash
     _mark_applied(revision, current, result, changes, admin)
+    _follow_qa(db, revision)
     revisions.supersede(db, revision.module_id, ("proposed",), besides=revision.id, target="activity",
                         activity_id=activity.id)
     if activity.status == "ready":  # its new lines, voiced (the others keep their clips)
@@ -547,6 +574,7 @@ def _revert_script(db: Session, revision: ModuleRevision, module: Module, admin:
                   "reverted_id": revision.id}
     revisions.write_script(module, restored)
     revision.status = "reverted"
+    _follow_qa(db, revision, undone=True)
     studio.queue_visuals(db, module)
     db.commit()
     logger.info("revision_reverted", extra={"revision_id": revision.id, "undo_id": undo.id, "module_id": module.id,
@@ -579,6 +607,7 @@ def _revert_quiz(db: Session, revision: ModuleRevision, module: Module, admin: U
     restored_ids = [(change["after"] or change["before"])["id"] for change in undo.changes["questions"]]
     undo.scope = {**revisions.empty_scope(), "question_ids": restored_ids, "reverted_id": revision.id}
     revision.status = "reverted"
+    _follow_qa(db, revision, undone=True)
     db.commit()
     logger.info("revision_reverted", extra={"revision_id": revision.id, "undo_id": undo.id, "module_id": module.id,
                                             "target": "quiz"})
@@ -605,6 +634,7 @@ def _revert_activity(db: Session, revision: ModuleRevision, admin: User) -> Revi
     undo.scope = {**revisions.empty_scope(), "reverted_id": revision.id}
     activity_revisions.write(activity, restored)  # a new version: open plays start again
     revision.status = "reverted"
+    _follow_qa(db, revision, undone=True)
     if activity.status == "ready":
         studio.queue_activity_voice(db, activity)
     db.commit()

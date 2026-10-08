@@ -45,6 +45,7 @@ from app.schemas.studio import (
     VoiceOut,
 )
 from app.services import revisions, studio
+from app.services.ai import llm
 from app.services.course_views import ACTIVE_GENERATION, course_detail
 from app.services.media_views import job_out
 from app.services.progress import ordered_modules, refresh_course_enrollments
@@ -80,8 +81,7 @@ CATALOG_CACHE_SECONDS = 10 * 60
 
 
 def _ai_available() -> bool:
-    settings = get_settings()
-    return settings.use_fake_providers or bool(settings.openai_api_key)
+    return llm.available()
 
 
 def _require_ai() -> None:

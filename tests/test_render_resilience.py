@@ -49,6 +49,11 @@ def _render_files(storage) -> list[str]:
     return sorted(str(path) for path in (storage.root / storage.bucket).rglob("render/*/*"))
 
 
+def _render_job(session) -> Job:
+    """The module's render (a published video also queues its review: another job)."""
+    return session.query(Job).filter(Job.type == "video.render").one()
+
+
 def _start_render(client, headers, module) -> None:
     response = client.post(f"/api/v1/courses/{module.course_id}/render", headers=headers, json=RENDER_CHOICES)
     assert response.status_code == 202, response.text
@@ -67,7 +72,7 @@ def test_a_worker_that_lost_the_job_while_uploading_does_not_publish(
     def upload(self, path, file_path, content_type):
         if path.endswith("/video.mp4") and not handed_back:
             with session_factory() as session:  # a deploy hands the job back while the video uploads
-                job = session.query(Job).one()
+                job = _render_job(session)
                 handed_back.append(queue.requeue(session, job.id, job.locked_by))
         return upload_file(self, path, file_path, content_type)
 
@@ -76,7 +81,7 @@ def test_a_worker_that_lost_the_job_while_uploading_does_not_publish(
     db.expire_all()
     assert handed_back == [True]
     assert db.get(Module, ai_module.id).video_asset_id is None  # the stale worker did not attach anything
-    assert db.query(Job).one().status == "queued"
+    assert _render_job(db).status == "queued"
     assert _render_files(storage)  # nor delete what the next owner needs
 
     monkeypatch.setattr(type(storage), "upload_file", upload_file)
@@ -84,7 +89,7 @@ def test_a_worker_that_lost_the_job_while_uploading_does_not_publish(
     db.expire_all()
     module = db.get(Module, ai_module.id)
     assert module.generation_status == "completed" and module.video_asset_id
-    assert db.query(Job).one().status == "succeeded"
+    assert _render_job(db).status == "succeeded"
     assert db.query(MediaAsset).filter(MediaAsset.kind == "video").count() == 1
     assert not _render_files(storage)
     videos = list((storage.root / storage.bucket).rglob("video.mp4"))
@@ -95,14 +100,14 @@ def test_a_rerun_after_publishing_does_nothing(client, db, admin_headers, ai_mod
     _start_render(client, admin_headers, ai_module)
     _run_until_done(db, worker)
     db.expire_all()
-    job = db.query(Job).one()
+    job = _render_job(db)
     published = db.get(Module, ai_module.id).video_asset_id
     job.status, job.run_after = "queued", queue.utcnow()  # e.g. the process died right after the commit
     db.commit()
 
     worker()
     db.expire_all()
-    assert db.query(Job).one().result == {"skipped": "already published"}
+    assert _render_job(db).result == {"skipped": "already published"}
     assert db.get(Module, ai_module.id).video_asset_id == published
 
 
@@ -152,7 +157,7 @@ def test_a_video_the_admin_uploads_during_the_render_wins(client, db, admin_head
     db.expire_all()
     module = db.get(Module, ai_module.id)
     assert module.video_asset_id == upload.id and module.generation_status == "completed"
-    assert db.query(Job).one().result == {"skipped": "module has its own video"}
+    assert _render_job(db).result == {"skipped": "module has its own video"}
     assert db.query(MediaAsset).filter(MediaAsset.kind == "video").count() == 1
     assert not _render_files(storage)
 
@@ -197,7 +202,7 @@ def test_a_retried_render_keeps_its_voice_and_never_pays_twice(
         worker()
 
     db.expire_all()
-    assert db.query(Job).one().status == "succeeded"
+    assert _render_job(db).status == "succeeded"
     assert [voice for _, voice in spoken] == ["fake-voice-es"] * 3  # each scene narrated once, in one voice
     assert len(uploads) == 1 and len(starts) == 2 and starts[0] == starts[1]  # the very same request again
     assert db.get(Module, ai_module.id).storyboard["render"]["voice_id"] == "fake-voice-es"
@@ -236,7 +241,7 @@ def test_a_failed_render_leaves_no_files(client, db, admin_headers, ai_module, s
         _fast_forward(db)
         worker()
     db.expire_all()
-    assert db.query(Job).one().status == "failed"
+    assert _render_job(db).status == "failed"
     module = db.get(Module, ai_module.id)
     assert module.generation_status == "failed" and "No pudimos procesar" in module.generation_error
     assert not _render_files(storage)
@@ -279,7 +284,7 @@ def test_a_presenter_video_that_keeps_arriving_damaged_is_left_out(
     _run_until_done(db, worker, rounds=10)
 
     db.expire_all()
-    assert db.query(Job).one().status == "succeeded"  # never rescheduled forever: the video is out
+    assert _render_job(db).status == "succeeded"  # never rescheduled forever: the video is out
     render = _module_render(db, ai_module.id)
     assert render["avatar_id"] == "" and render["warning"] == (
         "El video del presentador llegó dañado. El video se produjo sin presentador."
@@ -315,7 +320,7 @@ def test_a_storage_failure_after_heygen_finished_keeps_the_presenter(
     for _ in range(6):
         _fast_forward(db)
         worker()
-    assert failed and db.query(Job).one().status == "succeeded"
+    assert failed and _render_job(db).status == "succeeded"
     render = _module_render(db, ai_module.id)
     assert render["avatar_id"] == "fake-avatar" and render["warning"] is None  # retried, presenter kept
 
@@ -340,7 +345,7 @@ def test_a_database_hiccup_while_fetching_the_presenter_keeps_it(
     for _ in range(6):
         _fast_forward(db)
         worker()
-    assert failed and db.query(Job).one().status == "succeeded"
+    assert failed and _render_job(db).status == "succeeded"
     render = _module_render(db, ai_module.id)
     assert render["avatar_id"] == "fake-avatar" and render["warning"] is None
 
@@ -348,7 +353,7 @@ def test_a_database_hiccup_while_fetching_the_presenter_keeps_it(
 def test_a_new_render_waits_for_a_job_that_already_published(client, db, admin_headers, ai_module, storage, worker):
     _start_render(client, admin_headers, ai_module)
     _run_until_done(db, worker)
-    job = db.query(Job).one()
+    job = _render_job(db)
     job.status, job.run_after = "queued", queue.utcnow()  # e.g. handed back by a deploy right after publishing
     db.commit()
 
@@ -381,7 +386,7 @@ def test_a_retry_renders_the_script_it_started_with(client, db, admin_headers, a
         _fast_forward(db)
         worker()
 
-    assert db.query(Job).one().status == "succeeded"
+    assert _render_job(db).status == "succeeded"
     assert len(spoken) == 3 and not any("agregada" in text for text in spoken)
 
 
@@ -411,9 +416,10 @@ def test_a_video_the_admin_uploads_while_composing_wins(
     _run_until_done(db, worker)
 
     db.expire_all()
-    assert db.query(Job).one().result == {"skipped": "module has its own video"}
+    assert _render_job(db).result == {"skipped": "module has its own video"}
     assert db.get(Module, ai_module.id).video_asset_id == uploaded[0]
-    assert not list((storage.root / storage.bucket).rglob("video-*/*"))  # the render's copy is gone
+    copies = [path for path in (storage.root / storage.bucket).rglob("video-*/**/*") if path.is_file()]
+    assert not copies  # the render's copy is gone, its review's frames too
 
 
 def test_a_video_ffmpeg_cannot_compose_with_its_presenter_drops_only_the_bubble(
@@ -456,7 +462,7 @@ def test_a_copy_left_by_a_failed_publish_is_deleted_by_the_next_run(
         _fast_forward(db)
         worker()
 
-    assert failed and db.query(Job).one().status == "succeeded"
+    assert failed and _render_job(db).status == "succeeded"
     assert len(list((storage.root / storage.bucket).rglob("video.mp4"))) == 1  # only the published one
 
 
@@ -631,7 +637,7 @@ def test_a_render_started_before_a_second_presenter_existed_keeps_its_one_presen
     from app.worker.jobs import render as render_job
 
     _start_render(client, admin_headers, ai_module)
-    job = db.query(Job).one()
+    job = _render_job(db)
     # As the previous release left it: frozen input without the new fields, waiting on its one HeyGen video.
     calls = []
     original_presenter = render_job._presenter

@@ -13,11 +13,14 @@ import uuid
 from pathlib import Path
 
 from app.services.ai import designer
+from app.services.ai.llm import LLMError
 from app.services.video.avatar import AvatarLook, RenderStatus
 from app.services.video.voice import Alignment, Speech, VoiceInfo, Word
 
 SECONDS_PER_WORD = 0.32
 FALLBACK_SECONDS = 5.0  # length of a fake clip when it can't be measured
+# A video review's finding scripted in a scene's text: "[qa:cut_text]", "[qa:garbled_text:critical]"...
+QA_MARKER = re.compile(r"\[qa:([a-z_]+)(?::([a-z]+))?\]")
 
 
 def _topic(text: str) -> str:
@@ -31,7 +34,13 @@ def _fenced_after(prompt: str, marker: str) -> str:
 
 
 class FakeLLM:
-    def structured(self, system, user, schema, max_tokens=8000, usage=None):
+    model = "fake"
+
+    def structured(self, system, user, schema, max_tokens=8000, usage=None, images=None):
+        if schema is designer.FrameReview:
+            return self._frame_review(user, images or [])
+        if schema is designer.ContentReview:
+            return self._content_review(user)
         if schema is designer.CourseOutline:
             return self._outline(user)
         if schema is designer.ModuleDraft:
@@ -47,6 +56,52 @@ class FakeLLM:
         if schema is designer.ActivityPatchDraft:
             return self._activity_patch(user)
         raise NotImplementedError(schema.__name__)
+
+    def _frame_review(self, prompt: str, images: list[bytes]) -> designer.FrameReview:
+        """Clean, unless a frame's texts carry a marker: "[qa:<category>]" or "[qa:<category>:<severity>]" reports it
+        once, on the first frame of its scene (over the frame's top-left quarter); "[qa:error]" fails like a model
+        that refuses pictures, "[qa:busy]" like one that doesn't answer (a later try may pass)."""
+        frames = json.loads(_fenced_after(prompt, "FOTOGRAMAS"))
+        if len(images) != len(frames):  # each frame's picture must come with it, in order
+            raise LLMError(f"La revisión esperaba {len(frames)} fotogramas y llegaron {len(images)}.", permanent=True)
+        issues, seen = [], set()
+        for frame in frames:
+            for match in QA_MARKER.finditer(" ".join(frame.get("texts") or [])):
+                category, severity = match.group(1), match.group(2) or "major"
+                if category == "error":
+                    raise LLMError("El servicio de IA rechazó las imágenes.", permanent=True)
+                if category == "busy":
+                    raise LLMError("El servicio de IA no respondió. Intenta de nuevo en unos minutos.")
+                if category == "content" or (frame["scene_id"], category) in seen:
+                    continue
+                seen.add((frame["scene_id"], category))
+                number = frame.get("scene_number")
+                issues.append(designer.FrameIssueDraft(
+                    frame_index=frame["frame_index"], scene_id=frame["scene_id"], category=category, severity=severity,
+                    description=f"Revisión de prueba: «{category}» en la escena {number}.",
+                    suggested_observation=f"En la escena {number}, corrige lo que se ve mal ({category}).",
+                    box=[0, 0, 480, 270],
+                ))
+        minor = all(issue.severity == "minor" for issue in issues)
+        verdict = "ok" if not issues else "warnings" if minor else "problems"
+        summary = f"Encontré {len(issues)} problema(s) en los fotogramas." if issues else ""
+        return designer.FrameReview(verdict=verdict, summary=summary, issues=issues)
+
+    def _content_review(self, prompt: str) -> designer.ContentReview:
+        """Clean, unless a scene says "[qa:content]" (or "[qa:content:<severity>]"): one finding about it."""
+        issues = []
+        for scene in json.loads(_fenced_after(prompt, "GUION DEL VIDEO")):
+            match = re.search(r"\[qa:content(?::([a-z]+))?\]", json.dumps(scene, ensure_ascii=False))
+            if match:
+                issues.append(designer.ContentIssueDraft(
+                    scene_id=scene["id"], severity=match.group(1) or "major",
+                    description=f"Revisión de prueba: la narración de la escena {scene['number']} no dice lo mismo que "
+                                "su diapositiva.",
+                    suggested_observation=f"En la escena {scene['number']}, haz que la narración diga lo mismo que la "
+                                          "diapositiva.",
+                ))
+        return designer.ContentReview(summary=f"{len(issues)} problema(s) de contenido." if issues else "",
+                                      issues=issues)
 
     def _quiz_patch(self, prompt: str) -> designer.QuizPatchDraft:
         """Rewords the questions in scope ("Revisado: …"; without a scope, the first one). When the observation

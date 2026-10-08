@@ -20,6 +20,7 @@ from app.api.routes import (
     paths,
     profiles,
     ranking,
+    reviews,
     revisions,
     settings,
     studio,
@@ -50,6 +51,7 @@ ROUTERS = (
     certificates,
     ranking,
     revisions,
+    reviews,
 )
 
 

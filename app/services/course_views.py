@@ -14,7 +14,8 @@ from app.schemas.courses import (
     EvaluationSummary,
     ModuleAdmin,
 )
-from app.services import quiz, revisions
+from app.schemas.reviews import ReviewBadge
+from app.services import quiz, revisions, video_reviews
 from app.services.media import MediaResolver
 from app.services.metrics import percentage
 from app.services.progress import completed_enrollments, evaluations_by_module, ordered_modules
@@ -84,7 +85,8 @@ def course_summary(course: Course, counts: CourseCounts, cover_url: str | None) 
 
 
 def module_admin(
-    module: Module, media: MediaResolver, evaluation: Evaluation | None, revision_pending: bool = False
+    module: Module, media: MediaResolver, evaluation: Evaluation | None, revision_pending: bool = False,
+    review: ReviewBadge | None = None,
 ) -> ModuleAdmin:
     questions = quiz.evaluation_questions(evaluation)
     storyboard = module.storyboard or {}
@@ -108,6 +110,7 @@ def module_admin(
         video_warning=(storyboard.get("render") or {}).get("warning") if module.source == "ai" else None,
         stale_scene_ids=revisions.stale_scene_ids(storyboard) if ai_video else [],
         revision_pending=revision_pending,
+        review=review if ai_video else None,
         evaluation=(
             EvaluationSummary(
                 question_count=len(questions),
@@ -124,7 +127,8 @@ def module_admin(
 def module_out(db: Session, module: Module) -> ModuleAdmin:
     """One module as the editor shows it (e.g. right after it changed)."""
     pending = module.id in revisions.pending_modules(db, [module.id])
-    return module_admin(module, MediaResolver(db).prepare(modules=[module]), module.evaluation, pending)
+    review = video_reviews.badges(db, [module]).get(module.id)
+    return module_admin(module, MediaResolver(db).prepare(modules=[module]), module.evaluation, pending, review)
 
 
 def course_detail(db: Session, course: Course) -> CourseDetail:
@@ -134,8 +138,12 @@ def course_detail(db: Session, course: Course) -> CourseDetail:
     counts = course_counts(db, [course.id])[course.id]
     summary = course_summary(course, counts, media.url(course.cover_asset_id))
     pending = revisions.pending_modules(db, [module.id for module in modules])
+    reviews = video_reviews.badges(db, modules)
     return CourseDetail(
         **summary.model_dump(),
         settings=CourseSettings.model_validate(course.settings or {}),
-        modules=[module_admin(module, media, evaluations.get(module.id), module.id in pending) for module in modules],
+        modules=[
+            module_admin(module, media, evaluations.get(module.id), module.id in pending, reviews.get(module.id))
+            for module in modules
+        ],
     )
