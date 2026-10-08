@@ -67,6 +67,7 @@ def _schema_diff(url: str) -> list:
 
 
 _PATH_TABLES = ("job_profiles", "learning_paths", "learning_path_profiles", "learning_path_courses", "path_assignments")
+_CERTIFICATE_TABLES = ("app_settings", "learner_certificates")
 
 
 def _legacy_database(url: str) -> None:
@@ -96,7 +97,7 @@ def test_fresh_database_matches_the_models(database_url):
     run_migrations(database_url)
 
     assert _schema_diff(database_url) == []
-    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0004_learning_paths",)]
+    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0005_certificates_settings",)]
 
 
 def test_production_like_database_is_stamped_then_upgraded(database_url):
@@ -113,7 +114,7 @@ def test_production_like_database_is_stamped_then_upgraded(database_url):
         5: "ai",
     }
     assert [bool(revoked) for (revoked,) in _fetch(database_url, "SELECT revoked FROM refresh_tokens")] == [True]
-    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0004_learning_paths",)]
+    assert _fetch(database_url, f"SELECT version_num FROM {VERSION_TABLE}") == [("0005_certificates_settings",)]
     assert _schema_diff(database_url) == []
 
 
@@ -138,7 +139,8 @@ def test_new_tables_have_row_level_security_on_postgres(database_url):
         pytest.skip("RLS only exists on Postgres")
     run_migrations(database_url)
 
-    tables = ("media_assets", "jobs", "activities", "activity_attempts", *_PATH_TABLES, VERSION_TABLE)
+    tables = ("media_assets", "jobs", "activities", "activity_attempts", *_PATH_TABLES, *_CERTIFICATE_TABLES,
+              VERSION_TABLE)
     rows = _fetch(
         database_url,
         "SELECT relname, relrowsecurity FROM pg_class WHERE relname IN "
@@ -151,7 +153,7 @@ def test_downgrade_returns_to_the_baseline(database_url):
     run_migrations(database_url)
     command.downgrade(alembic_config(database_url), BASELINE_REVISION)
 
-    assert {"media_assets", "jobs", "activities", "activity_attempts", *_PATH_TABLES}.isdisjoint(
+    assert {"media_assets", "jobs", "activities", "activity_attempts", *_PATH_TABLES, *_CERTIFICATE_TABLES}.isdisjoint(
         _table_names(database_url)
     )
     assert "source" not in _column_names(database_url, "courses")

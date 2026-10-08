@@ -11,6 +11,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from app.api.routes import (
     activities,
     auth,
+    certificates,
     courses,
     dashboard,
     learn,
@@ -18,6 +19,7 @@ from app.api.routes import (
     participants,
     paths,
     profiles,
+    settings,
     studio,
     users,
 )
@@ -42,6 +44,8 @@ ROUTERS = (
     activities,
     paths,
     profiles,
+    settings,
+    certificates,
 )
 
 
@@ -113,6 +117,7 @@ def create_app() -> FastAPI:
     for module in ROUTERS:
         app.include_router(module.router, prefix=API_PREFIX)
     app.include_router(media.local_router, prefix=API_PREFIX)
+    app.include_router(certificates.public_router, prefix=API_PREFIX)  # verification: no session
 
     @app.get("/")
     def root():

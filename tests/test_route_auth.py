@@ -14,6 +14,9 @@ PUBLIC = {
     # Development-only local storage: each URL carries its own signed token instead of a session.
     ("put", "/api/v1/media/local/upload/{token}"),
     ("get", "/api/v1/media/local/file/{token}"),
+    # Certificate verification: anyone with the code (an employer, an auditor) checks it and gets its PDF.
+    ("get", "/api/v1/public/certificates/{code}"),
+    ("get", "/api/v1/public/certificates/{code}/pdf"),
 }
 LEARNER_PREFIXES = ("/api/v1/learn/", "/api/v1/auth/")
 

@@ -56,8 +56,10 @@ class Settings(BaseSettings):
     storage_backend: Literal["auto", "supabase", "local"] = "auto"
     media_bucket: str = "course-media"
     local_storage_dir: str = "./.storage"
-    # Public URL of this API, used to build local-storage links (development only).
+    # Public URL of this API: local-storage links (development) and the certificates' PDF links (always).
     public_api_url: str = "http://localhost:8001/api/v1"
+    # Public URL of the web app: the certificates' verification page. Empty: the first CORS origin.
+    public_app_url: str = ""
 
     # Background jobs run inside the API process unless disabled (e.g. a separate worker service).
     worker_enabled: bool = True
@@ -117,6 +119,8 @@ class Settings(BaseSettings):
                 )
         elif not self.jwt_secret:
             self.jwt_secret = _DEV_JWT_SECRET
+        if not self.public_app_url:
+            self.public_app_url = next(iter(self.cors_origin_list), "http://localhost:3001")
         return self
 
 

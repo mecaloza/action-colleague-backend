@@ -93,7 +93,7 @@ def test_completing_a_module_without_quiz_unlocks_the_next(client, enrolled, cou
 
     assert result.status_code == 200
     assert result.json() == {"module_completed": True, "next_module_id": epp.id, "course_completed": False,
-                             "next_course": None, "path_completed": None}
+                             "certificate": None, "next_course": None, "path_completed": None}
     body = client.get(f"/api/v1/learn/courses/{course.id}", headers=headers).json()
     assert [m["unlocked"] for m in body["modules"]] == [True, True, False]
 

@@ -7,7 +7,8 @@ Recordings, captions and the previous app's media.
   a transcript the AI can use for quizzes.
 - legacy.migrate: brings the previous app's videos into the private media bucket (from HeyGen while
   its v1 API lives, or from the public buckets the app used), then processes them like any upload;
-  marks the ones that are lost; converts old evaluations to the canonical format.
+  marks the ones that are lost; converts old evaluations to the canonical format; issues the
+  certificates missing for what was completed before they existed.
 """
 
 import logging
@@ -27,7 +28,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.db.models import Enrollment, Evaluation, Job, MediaAsset, Module, ModuleProgress
-from app.services import legacy_heygen, quiz
+from app.services import certificates, legacy_heygen, quiz
 from app.services.legacy_heygen import RETIRED_ON as HEYGEN_RETIRED_ON
 from app.services.media import SIGNED_URL_SECONDS, discard_assets
 from app.services.storage import Storage, StorageError, get_storage
@@ -574,9 +575,11 @@ def migrate_legacy(ctx: JobContext) -> dict | Reschedule:
         videos = _migrate_videos(db)  # first: HeyGen's v1 API retires on 2026-10-31
         converted = _step(db, _convert_legacy_evaluations)
         dated = _step(db, _date_old_completions)
+        issued = _step(db, certificates.backfill)  # after the dates: a certificate's snapshot keeps them
     logger.info(
         "legacy_migration_pass",
-        extra={"videos": dict(videos), "evaluations_converted": converted, "completions_dated": dated},
+        extra={"videos": dict(videos), "evaluations_converted": converted, "completions_dated": dated,
+               "certificates_issued": issued},
     )
     if videos["lost"]:
         logger.warning("legacy_videos_lost", extra={"modules": videos["lost"]})
@@ -584,4 +587,5 @@ def migrate_legacy(ctx: JobContext) -> dict | Reschedule:
         logger.error("legacy_heygen_key_missing", extra={"modules": videos["waiting"]})  # they'll be lost on HeyGen's shutdown
     if videos["waiting"] or videos["error"] or videos["retrying"]:  # e.g. a render not finished, a network error
         return Reschedule(LEGACY_RECHECK_SECONDS)
-    return {"videos": dict(videos), "evaluations_converted": converted, "completions_dated": dated}
+    return {"videos": dict(videos), "evaluations_converted": converted, "completions_dated": dated,
+            "certificates_issued": issued}

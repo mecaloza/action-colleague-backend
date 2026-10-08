@@ -24,7 +24,7 @@ from app.schemas.paths import (
     PathStatus,
     PathUpdate,
 )
-from app.services import paths
+from app.services import certificates, paths
 from app.services.path_views import path_detail, path_people, path_rows
 
 router = APIRouter(prefix="/paths", tags=["paths"], dependencies=[Depends(require_admin)])
@@ -33,8 +33,10 @@ router = APIRouter(prefix="/paths", tags=["paths"], dependencies=[Depends(requir
 def _path(db: Session, path_id: int, lock: bool = False) -> LearningPath:
     query = db.query(LearningPath).filter(LearningPath.id == path_id)
     if lock:
-        # Two admins changing the same path take turns: each sync then sees what the other one changed.
-        query = query.with_for_update().populate_existing()
+        # Two admins changing the same path take turns: each sync then sees what the other one changed. NO KEY
+        # UPDATE: a learner completing the path meanwhile writes its certificate (a foreign key check on this row)
+        # holding their assignment, which this change may then wait for; FOR UPDATE would make both wait forever.
+        query = query.with_for_update(key_share=True).populate_existing()
     path = query.first()
     if path is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Ruta no encontrada")
@@ -166,10 +168,11 @@ def put_path_courses(
 
 @router.delete("/{path_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_path(path_id: int, db: Session = Depends(get_db)):
-    """The path, its links and who had it go; everyone keeps their courses and progress."""
+    """The path, its links and who had it go; everyone keeps their courses, progress and certificates."""
     path = _path(db, path_id, lock=True)
     for model in (PathAssignment, LearningPathCourse, LearningPathProfile):
         db.execute(delete(model).where(model.path_id == path.id), execution_options=paths.NO_SYNC)
+    certificates.forget(db, path_id=path.id)
     db.delete(path)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

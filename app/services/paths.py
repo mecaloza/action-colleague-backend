@@ -10,7 +10,8 @@ Learning paths: who takes each one, their courses, the order they open in and wh
   completed. A course the person already started stays open (a reorder or a new path never takes back what they
   began); courses that are not published are skipped (learners can't open them anyway).
 - Completion. A path is completed once every one of its published courses is (and it has one). It is stored on the
-  assignment by the completion transitions of `progress` and derived again on read.
+  assignment by the completion transitions of `progress` and derived again on read; storing it issues the path's
+  certificate (`certificates`).
 
 Every write is one statement whatever the audience (a profile with hundreds of people, a course in many paths).
 """
@@ -38,6 +39,7 @@ from app.db.models import (
     User,
 )
 from app.schemas.paths import CourseRef, PathSettings
+from app.services import certificates
 from app.services.metrics import percentage
 
 NO_SYNC = {"synchronize_session": False}
@@ -112,7 +114,8 @@ def refresh_completion(db: Session, *, path_ids=None, user_ids=None, course_ids=
     Store which assignments of published paths are completed, and clear the ones that have a course to do again (a
     course added to the path, a module added to a course): the same rule as an enrollment's, except for a completed
     path kept only as history (its profile no longer gives it: reopened, the next sync would drop it). Draft and
-    archived paths keep what they had. Three statements; returns the assignments that just became completed.
+    archived paths keep what they had. Three statements; returns the assignments that just became completed, whose
+    certificates are issued (two more, only then).
     """
     db.flush()  # the enrollments this request changed are read below
     published = select(LearningPath.id).where(LearningPath.status == "published")
@@ -135,6 +138,7 @@ def refresh_completion(db: Session, *, path_ids=None, user_ids=None, course_ids=
         .values(completed_at=None),
         execution_options=NO_SYNC,
     )
+    certificates.issue_for_assignments(db, completed)
     return completed
 
 

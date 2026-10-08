@@ -132,6 +132,7 @@ def test_concurrent_passing_submissions_pass_once(client, db, admin, collaborato
     db.expire_all()
     assert codes.count(200) == 1 and codes.count(409) == 5
     assert db.query(Enrollment).one().status == "completed"
+    assert _count(db, "SELECT count(*) FROM learner_certificates") == 1
 
 
 def test_saving_the_position_never_undoes_a_completion(client, db, session_factory, admin, collaborator, monkeypatch):
@@ -608,7 +609,8 @@ def test_a_path_reaches_many_people_in_a_few_statements(client, db, engine, admi
 
 
 def test_bulk_completion_completes_and_reopens_paths_in_a_few_statements(client, db, engine, admin, collaborator):
-    """An admin's module change completes (or reopens) a course for everyone at once: their paths follow, set-based."""
+    """An admin's module change completes (or reopens) a course for everyone at once: their paths and certificates
+    follow, set-based (5 statements more for the 600 certificates: the parameters, a read and an insert each)."""
     admin_headers = auth_headers(client, admin.email)
     course, module_ids = _course(client, admin_headers, collaborator, modules=3)
     _seed_audience(db, course["id"], module_ids, learners=300)  # the first two modules completed by everyone
@@ -628,6 +630,9 @@ def test_bulk_completion_completes_and_reopens_paths_in_a_few_statements(client,
     assert completing <= 30 and reopening <= 30, (completing, reopening)
     assert completed == 300
     assert _count(db, "SELECT count(*) FROM path_assignments WHERE completed_at IS NOT NULL") == 0
+    issued = "SELECT count(*) FROM learner_certificates WHERE revoked_at IS NULL AND kind = '{}'"
+    # The course's: the 300 and the collaborator (enrolled with them, not in the path); none revoked by the reopening.
+    assert (_count(db, issued.format("course")), _count(db, issued.format("path"))) == (301, 300)
 
 
 def test_path_deletes_respect_foreign_keys(client, db, admin, collaborator):
@@ -709,7 +714,6 @@ def test_changing_a_path_while_giving_its_profile_assigns_it(
 def test_two_courses_of_a_path_completed_at_once_complete_it(client, db, session_factory, admin, collaborator):
     """Two tabs: the second completion waits for the first one's, then stores and reports the completed path."""
     from app.api.routes import learn
-    from app.schemas.paths import PathRef
 
     admin_headers = auth_headers(client, admin.email)
     (one, (first,)), (two, (second,)) = (_course(client, admin_headers, collaborator, quiz=False) for _ in range(2))
@@ -729,7 +733,10 @@ def test_two_courses_of_a_path_completed_at_once_complete_it(client, db, session
 
     assert not errors, errors
     assert _count(db, "SELECT count(*) FROM path_assignments WHERE completed_at IS NOT NULL") == 1
-    assert results[second].path_completed == PathRef(id=path["id"], title="Ruta")
+    completed = results[second].path_completed
+    assert (completed.id, completed.title) == (path["id"], "Ruta")
+    assert completed.certificate is not None  # issued once, by whichever completion stored the path's
+    assert _count(db, "SELECT count(*) FROM learner_certificates WHERE kind = 'path'") == 1
 
 
 @pytest.mark.parametrize("change", ["profile", "path"])
@@ -780,3 +787,43 @@ def test_a_course_completed_during_a_sync_never_deadlocks(
     assert not errors, errors  # DeadlockDetected, locking the assignment before the enrollment
     assert _count(db, f"SELECT count(*) FROM path_assignments WHERE path_id = {path['id']} "
                       "AND completed_at IS NOT NULL") == 1
+
+
+def test_a_path_completed_while_an_admin_changes_it_never_deadlocks(
+    client, db, session_factory, admin, collaborator, monkeypatch
+):
+    """The learner's completion holds their assignment, then writes the path's certificate (a foreign key check on the
+    path's row). The admin's change holds the path's row, then updates its assignments. With the path locked FOR
+    UPDATE each waits for the other; NO KEY UPDATE lets the certificate's check through."""
+    from app.api.routes import learn
+    from app.api.routes import paths as path_routes
+    from app.schemas.paths import PathSettings, PathUpdate
+    from app.services import certificates
+
+    admin_headers = auth_headers(client, admin.email)
+    course, (module_id,) = _course(client, admin_headers, collaborator, quiz=False)
+    path = _path_with(client, admin_headers, [course["id"]], status="published", settings={"due_days": 30})
+    client.post(f"/api/v1/paths/{path['id']}/people", headers=admin_headers, json={"user_ids": [collaborator.id]})
+    paused, release = threading.Event(), threading.Event()
+    issue = certificates.issue_for_assignments
+
+    def slow_issue(session, assignment_ids):
+        if assignment_ids and not paused.is_set():
+            paused.set()  # the learner holds their assignment, completed
+            release.wait(5)
+        return issue(session, assignment_ids)
+
+    monkeypatch.setattr(certificates, "issue_for_assignments", slow_issue)
+
+    def complete(session):
+        learn.complete_module(module_id, db=session, user=session.get(User, collaborator.id))
+
+    def drop_deadline(session):
+        path_routes.update_path(path["id"], PathUpdate(settings=PathSettings(due_days=None)), db=session,
+                                admin=session.get(User, admin.id))
+
+    errors = _race(session_factory, complete, drop_deadline, paused=paused, release=release)
+
+    assert not errors, errors  # DeadlockDetected, with the path locked FOR UPDATE
+    assert _count(db, "SELECT count(*) FROM learner_certificates WHERE kind = 'path'") == 1
+    assert _count(db, "SELECT count(*) FROM path_assignments WHERE completed_at IS NOT NULL") == 1

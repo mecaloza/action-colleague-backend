@@ -3,6 +3,7 @@
 from sqlalchemy.orm import Session
 
 from app.db.models import Course, Enrollment
+from app.schemas.certificates import CertificateRef
 from app.schemas.learn import (
     LearnerCourse,
     LearnerCourseDetail,
@@ -34,9 +35,11 @@ def path_fields(course_id: int, journey: Journey | None) -> dict:
 
 
 def learner_course(
-    enrollment: Enrollment, states: list[ModuleState], cover_url: str | None = None, journey: Journey | None = None
+    enrollment: Enrollment, states: list[ModuleState], cover_url: str | None = None, journey: Journey | None = None,
+    certificate: CertificateRef | None = None,
 ) -> LearnerCourse:
-    """A row of a person's course list: overall progress, the module that comes next and its place in a path."""
+    """A row of a person's course list: overall progress, the module that comes next, its place in a path and the
+    certificate it earned."""
     course = enrollment.course
     completed = sum(1 for state in states if state.completed)
     next_state = next((state for state in states if not state.completed), None)
@@ -55,6 +58,7 @@ def learner_course(
         enrolled_at=enrollment.enrolled_at,
         completed_at=enrollment.completed_at,
         **path_fields(enrollment.course_id, journey),
+        certificate=certificate,
     )
 
 
@@ -137,7 +141,7 @@ def _learner_enrollment(enrollment: Enrollment) -> LearnerEnrollment:
 
 def course_player_detail(
     db: Session, course: Course, states: list[ModuleState], enrollment: Enrollment | None,
-    journey: Journey | None = None,
+    journey: Journey | None = None, certificate: CertificateRef | None = None,
 ) -> LearnerCourseDetail:
     media = MediaResolver(db).prepare(modules=[state.module for state in states])
     resumable = _resumable_activities(db, enrollment, states) if enrollment else set()
@@ -148,4 +152,5 @@ def course_player_detail(
         enrollment=_learner_enrollment(enrollment) if enrollment else None,
         modules=[_learner_module(state, media, resumable) for state in states],
         **path_fields(course.id, journey),
+        certificate=certificate,
     )

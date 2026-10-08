@@ -104,3 +104,12 @@ def test_fake_providers_are_refused_outside_local_development(monkeypatch):
     monkeypatch.setenv("USE_FAKE_PROVIDERS", "true")
     with pytest.raises(ValidationError, match="USE_FAKE_PROVIDERS"):
         Settings(environment="production", _env_file=None)
+
+
+def test_the_web_apps_url_defaults_to_the_first_cors_origin(monkeypatch):
+    # Certificates link their verification page there.
+    monkeypatch.setenv("CORS_ORIGINS", "https://app.test, https://preview.test")
+    monkeypatch.delenv("PUBLIC_APP_URL", raising=False)
+    assert Settings(_env_file=None).public_app_url == "https://app.test"
+    monkeypatch.setenv("PUBLIC_APP_URL", "https://verificar.test")
+    assert Settings(_env_file=None).public_app_url == "https://verificar.test"

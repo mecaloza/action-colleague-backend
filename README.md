@@ -43,13 +43,17 @@ Tests:
 | Participantes y resultados | `/courses/{id}/participants`, `/courses/{id}/participants/{user_id}/attempts`, `/courses/{id}/analytics` | admin |
 | Equipo y panel | `/users` (con su perfil, `?profile_id=`), `/users/{id}/courses`, `/dashboard` | admin |
 | Perfiles y rutas | `/profiles`, `/profiles/{id}`, `/paths`, `/paths/{id}` (+ `courses`, `people`, `people/{user_id}`) | admin |
-| Aprender | `/learn/courses`, `/learn/courses/{id}`, `/learn/paths`, `/learn/modules/{id}/quiz`, `/quiz/attempts`, `/complete`, `/position` | colaborador inscrito |
+| Parámetros y certificados | `/settings` (GET y PATCH), `/certificates` (+ `{id}/revoke`, `{id}/reissue`) | admin |
+| Verificación de certificados | `/public/certificates/{code}` (+ `/pdf`) | cualquiera, sin sesión |
+| Aprender | `/learn/courses`, `/learn/courses/{id}`, `/learn/paths`, `/learn/certificates`, `/learn/modules/{id}/quiz`, `/quiz/attempts`, `/complete`, `/position` | colaborador inscrito |
 | Medios y trabajos | `/media/uploads`, `/media/{id}/complete`, `/media/{id}`, `/courses/{id}/cover`, `/courses/{id}/materials`, `/jobs` | admin |
 | Estudio IA y video | `/courses/{id}/outline` (+ `generate`), `/courses/{id}/draft`, `/modules/{id}/storyboard`, `/slides/preview`, `/studio/*`, `/courses/{id}/render`, `/modules/{id}/render`, `/modules/{id}/recording`, `/modules/{id}/transcribe` | admin |
 
 Reglas clave:
 - Los módulos se desbloquean en orden. Un módulo con evaluación se completa aprobándola y uno sin evaluación, al marcarlo como visto.
 - **Rutas de aprendizaje**: cursos en orden para las personas de uno o varios perfiles (colaboradores activos; los admins nunca la reciben por perfil) y para quien se asigne a mano (se queda aunque cambie de perfil). Al publicarla, cada persona queda inscrita en todos sus cursos, y no se la puede retirar de ellos mientras tenga la ruta. Si la persona cambia de perfil, recibe las rutas del nuevo y pierde las del anterior que no haya completado (las completadas quedan como historial y no se reabren); nunca se borran inscripciones ni progreso. Una ruta en orden abre cada curso cuando se completan los anteriores publicados (lo que la persona ya empezó queda abierto); se calcula al leer, no se guarda. Archivada o en borrador, no bloquea nada. La ruta se completa cuando se completan todos sus cursos publicados (se guarda en `path_assignments.completed_at` y se reabre si recibe un curso nuevo, como una inscripción).
+- **Parámetros** (`/settings`): una sola fila JSON con valores por defecto para todo (nombre de la empresa, zona horaria IANA, nota mínima e intentos con que nace cada evaluación nueva —a mano o de la IA—, y las reglas de los certificados). El PATCH cambia solo lo que se envía y responde 422 con el valor que está mal, en español.
+- **Certificados**: al completar un curso se emite su certificado si los parámetros lo permiten (o el curso lo pide: `settings.certificate` sí/no anula el parámetro general) y el promedio de las mejores notas de sus evaluaciones alcanza la nota mínima, si hay una. Al completar una ruta se emite el de la ruta si los parámetros y la ruta lo dan. Cada uno es una foto fija (persona, título, horas, nota, empresa y firmante de ese momento) con un código `RC-XXXX-XXXX` que cualquiera verifica en `/verify/{code}` del frontend; el PDF (A4 horizontal) se dibuja al pedirlo, sin guardarse. Se emite solo una vez por persona y curso o ruta: un curso reabierto no lo revoca y uno revocado no vuelve a salir solo; el admin puede emitirlo a mano, revocarlo o reemitirlo (código y foto nuevos). La tabla `certificates` de la app anterior queda intacta: los nuevos viven en `learner_certificates`.
 - Si el admin edita una evaluación mientras alguien la responde, ese intento no se califica ni se cuenta (409) y el quiz se recarga.
 - Cambiar la contraseña propia cierra todas las sesiones (el frontend vuelve a iniciar sesión con la nueva).
 - El colaborador nunca recibe las respuestas correctas. Las opciones llevan IDs opacos (HMAC) y la calificación ocurre en el servidor (`app/services/quiz.py`, la única implementación). La solución se muestra solo al aprobar: mostrada al agotar los intentos, bastaría con que el admin diera más intentos para aprobar sin saber. Antes de aprobar, cada intento dice qué preguntas estuvieron bien.
@@ -89,6 +93,7 @@ Cada arranque encola `legacy.migrate` (idempotente, una sola copia activa):
 
 - Convierte las evaluaciones antiguas (`questions_json`) al formato canónico (`spec`).
 - Pone fecha de finalización a los cursos completados antes de que existiera (la del último módulo completado).
+- Emite los certificados que faltan de cursos y rutas ya completados (con las mismas reglas; nunca repite ni vuelve a emitir uno revocado).
 - Copia al bucket privado los videos que la app anterior dejó en buckets públicos del proyecto y los procesa como cualquier subida (portada, duración, subtítulos). El archivo original no se toca.
 - Los videos que siguen en HeyGen esperan a que el copiado de abajo los pase a Storage; el trabajo lo vuelve a revisar cada 6 h hasta el apagado de la API de HeyGen.
 
@@ -132,7 +137,9 @@ Los tests de migraciones corren contra SQLite y contra un PostgreSQL 16 embebido
 | `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` | en producción | Storage de Supabase (solo backend). Acepta las llaves nuevas `sb_secret_…`. |
 | `MEDIA_BUCKET` | no | Bucket **privado** de los medios (por defecto `course-media`; se crea solo). |
 | `STORAGE_BACKEND` | no | `auto` (Supabase si está configurado; si no, disco local en desarrollo), `supabase` o `local`. |
-| `LOCAL_STORAGE_DIR`, `PUBLIC_API_URL` | no | Solo desarrollo: carpeta de los archivos y URL pública del API para sus enlaces. |
+| `LOCAL_STORAGE_DIR` | no | Solo desarrollo: carpeta de los archivos. |
+| `PUBLIC_API_URL` | en producción | URL pública del API (`https://…/api/v1`): enlaces de los PDF de certificados (y, en desarrollo, de los archivos locales). |
+| `PUBLIC_APP_URL` | en producción | URL pública del frontend: página de verificación de los certificados. Por defecto, el primer origen de `CORS_ORIGINS`. |
 | `WORKER_ENABLED`, `WORKER_CONCURRENCY` | no | Trabajos en segundo plano dentro del API (por defecto sí, 2 a la vez). |
 | `OPENAI_API_KEY`, `OPENAI_MODEL` | para IA | Estudio IA (estructura, guiones y evaluaciones con salidas estructuradas). |
 | `USE_FAKE_PROVIDERS` | no | Solo desarrollo y e2e: IA, voz y presentador falsos y deterministas, sin llaves ni red. |

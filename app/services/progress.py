@@ -6,7 +6,7 @@ A module with an evaluation is completed by passing it; a module without one is 
 explicitly by the learner (after watching or reading it). Either way, a module with interactive
 activities also needs each of them played to the end (any score). This is the only place that decides.
 A course locked by a learning path (`paths`) opens no module until it unlocks; completing a course
-completes the learner's paths that were waiting for it.
+completes the learner's paths that were waiting for it, and earns the certificates of both (`certificates`).
 """
 
 from dataclasses import dataclass, field
@@ -17,7 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, contains_eager, selectinload
 
 from app.db.models import Activity, ActivityAttempt, Course, Enrollment, Evaluation, Module, ModuleProgress
-from app.services import paths, quiz
+from app.services import certificates, paths, quiz
 from app.services.metrics import percentage
 
 
@@ -216,7 +216,9 @@ def refresh_enrollment(db: Session, enrollment: Enrollment) -> None:
     states = module_states(db, enrollment)
     done = sum(1 for state in states if state.completed)
     _apply_progress(enrollment, done, len(states), any(state.progress for state in states))
-    if (enrollment.status == "completed") != was_completed:  # the paths with this course follow
+    if (enrollment.status == "completed") != was_completed:  # its certificate, and the paths with this course follow
+        if not was_completed:
+            certificates.issue_for_enrollments(db, [enrollment.id])
         paths.refresh_completion(db, user_ids=[enrollment.user_id], course_ids=[enrollment.course_id])
 
 
@@ -246,11 +248,15 @@ def refresh_course_enrollments(db: Session, course: Course) -> None:
             .group_by(ModuleProgress.enrollment_id)
         )
         stats = {enrollment_id: (int(done or 0), True) for enrollment_id, done in rows}
-    completions_changed = False
+    completions_changed, completed = False, []
     for enrollment in enrollments:
         done, started = stats.get(enrollment.id, (0, False))
         was_completed = enrollment.status == "completed"
         _apply_progress(enrollment, done, len(module_ids), started)
         completions_changed |= (enrollment.status == "completed") != was_completed
-    if completions_changed:  # the paths with this course follow, for everyone at once
+        if enrollment.status == "completed" and not was_completed:
+            completed.append(enrollment.id)
+    # Their certificates and the paths with this course follow, for everyone at once.
+    certificates.issue_for_enrollments(db, completed)
+    if completions_changed:
         paths.refresh_completion(db, course_ids=[course.id])

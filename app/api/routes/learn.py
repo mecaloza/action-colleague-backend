@@ -1,4 +1,5 @@
-"""Learner endpoints: my courses and paths, the course player, quizzes, interactive activities and completion."""
+"""Learner endpoints: my courses, paths and certificates, the course player, quizzes, interactive activities and
+completion."""
 
 import json
 
@@ -8,7 +9,18 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
 from app.core.config import get_settings
-from app.db.models import Activity, ActivityAttempt, Course, Enrollment, EvaluationAttempt, Module, ModuleProgress, User
+from app.db.models import (
+    Activity,
+    ActivityAttempt,
+    Certificate,
+    Course,
+    Enrollment,
+    EvaluationAttempt,
+    Module,
+    ModuleProgress,
+    User,
+)
+from app.schemas.certificates import LearnerCertificate
 from app.schemas.learn import (
     ActivityFinishOut,
     ActivityMoveIn,
@@ -17,6 +29,7 @@ from app.schemas.learn import (
     ActivityStart,
     AttemptCreate,
     AttemptResult,
+    CompletedPath,
     CompletionResult,
     LearnerCourse,
     LearnerCourseDetail,
@@ -24,9 +37,9 @@ from app.schemas.learn import (
     PositionUpdate,
     QuestionResult,
 )
-from app.schemas.paths import LearnerPath, PathRef
+from app.schemas.paths import LearnerPath
 from app.services import activities as engine
-from app.services import paths, progress, quiz
+from app.services import certificates, paths, progress, quiz
 from app.services.learner_views import course_player_detail, learner_course
 from app.services.media import MediaResolver
 from app.services.path_views import learner_paths
@@ -87,15 +100,20 @@ def _next_module_id(states: list[progress.ModuleState], module_id: int) -> int |
 
 
 def _path_outcome(db: Session, enrollment: Enrollment) -> dict:
-    """Once the course is completed: the next course its path opened, or the path it completed."""
+    """Once the course is completed: its certificate, and the next course its path opened or the path it completed
+    (with that path's certificate)."""
     if enrollment.status != "completed":
         return {}
     db.flush()  # the completion is read back below
     journey = paths.journey(db, enrollment.user_id)
     step, path = journey.next_course(enrollment.course_id), journey.completed_path(enrollment.course_id)
+    earned = certificates.learner_refs(db, enrollment.user_id, course_ids=[enrollment.course_id],
+                                       path_ids=[path.id] if path else [])
     return {
+        "certificate": earned.courses.get(enrollment.course_id),
         "next_course": step.ref() if step else None,
-        "path_completed": PathRef(id=path.id, title=path.title) if path else None,
+        "path_completed": CompletedPath(id=path.id, title=path.title, certificate=earned.paths.get(path.id))
+        if path else None,
     }
 
 
@@ -121,12 +139,14 @@ def my_courses(db: Session = Depends(get_db), user: User = Depends(get_current_u
     media = MediaResolver(db).prepare(extra_asset_ids=[e.course.cover_asset_id for e in enrollments])
     evaluations = progress.evaluations_by_module(db, [m for e in enrollments for m in e.course.modules])
     journey = paths.journey(db, user.id)
+    earned = certificates.learner_refs(db, user.id, course_ids=[e.course_id for e in enrollments]).courses
     return [
         learner_course(
             e,
             progress.module_states(db, e, evaluations, course_unlocked=e.course_id not in journey.locked_by),
             media.url(e.course.cover_asset_id),
             journey,
+            earned.get(e.course_id),
         )
         for e in enrollments
     ]
@@ -138,13 +158,26 @@ def course_player(course_id: int, db: Session = Depends(get_db), user: User = De
     enrollment = _enrollment_for_course(db, user, course_id)
     journey = paths.journey(db, user.id)
     states = progress.module_states(db, enrollment, course_unlocked=course_id not in journey.locked_by)
-    return course_player_detail(db, enrollment.course, states, enrollment, journey)
+    certificate = certificates.learner_refs(db, user.id, course_ids=[course_id]).courses.get(course_id)
+    return course_player_detail(db, enrollment.course, states, enrollment, journey, certificate)
 
 
 @router.get("/paths", response_model=list[LearnerPath])
 def my_paths(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """My published learning paths, oldest first: each course's state, the one to go on with and the deadline."""
     return learner_paths(db, user.id)
+
+
+@router.get("/certificates", response_model=list[LearnerCertificate])
+def my_certificates(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Every certificate I earned, newest first: valid, expired or revoked (its status says which)."""
+    rows = (
+        db.query(Certificate)
+        .filter(Certificate.user_id == user.id)
+        .order_by(Certificate.issued_at.desc(), Certificate.id.desc())
+    )
+    now = certificates.utcnow()
+    return [certificates.learner_view(certificate, now) for certificate in rows]
 
 
 @router.get("/modules/{module_id}/quiz", response_model=LearnerQuiz)

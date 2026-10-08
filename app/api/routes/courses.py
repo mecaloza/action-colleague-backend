@@ -36,7 +36,8 @@ from app.schemas.courses import (
 )
 from app.schemas.learn import LearnerCourseDetail
 from app.schemas.media import PURPOSES_NEEDING_MODULE
-from app.services import legacy_data, paths, progress, quiz
+from app.services import certificates, legacy_data, paths, progress, quiz
+from app.services import settings as platform
 from app.services.course_views import ACTIVE_GENERATION, course_counts, course_detail, course_summary, module_admin
 from app.services.learner_views import course_player_detail
 from app.services.media import MediaResolver, discard_assets
@@ -192,6 +193,7 @@ def delete_course(course_id: int, db: Session = Depends(get_db)):
     media += [asset_id for (asset_id,) in db.execute(select(MediaAsset.id).where(MediaAsset.course_id == course_id))]
     enrollment_ids = [row[0] for row in db.execute(select(Enrollment.id).where(Enrollment.course_id == course_id))]
     legacy_data.delete_certificates(db, enrollment_ids)
+    certificates.forget(db, course_id=course_id)  # those earned stay, with their snapshot
     path_ids = paths.forget_course(db, course_id)
     _purge_modules(db, select(Module.id).where(Module.course_id == course_id))
     db.execute(delete(EvaluationAttempt).where(EvaluationAttempt.enrollment_id.in_(enrollment_ids)), execution_options=no_sync)
@@ -375,11 +377,18 @@ def put_evaluation(module_id: int, payload: EvaluationPut, db: Session = Depends
         questions = quiz.validate_questions(payload.questions)
     except quiz.InvalidQuestions as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
-    evaluation = module.evaluation or Evaluation(module_id=module.id)
+    evaluation = module.evaluation
+    if evaluation is None:  # a new one starts with the platform's defaults; an existing one keeps what it had
+        defaults = platform.get_settings(db).evaluations
+        evaluation = Evaluation(
+            module_id=module.id, max_attempts=defaults.max_attempts, passing_score=defaults.passing_score
+        )
     evaluation.spec = quiz.dump_questions(questions)
     evaluation.questions_json = "[]"  # the previous format is superseded by the spec
-    evaluation.max_attempts = payload.max_attempts
-    evaluation.passing_score = payload.passing_score
+    if payload.max_attempts is not None:
+        evaluation.max_attempts = payload.max_attempts
+    if payload.passing_score is not None:
+        evaluation.passing_score = payload.passing_score
     db.add(evaluation)
     db.commit()
     return _evaluation_admin(evaluation)
