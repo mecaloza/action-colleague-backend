@@ -22,7 +22,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from app.services.slides.render import BUBBLE_BOX, beat_count, is_hero
+from app.services.slides.render import BUBBLE_BOX, beat_count, chart_number, is_hero
 from app.services.slides.spec import CASE_PARTS, MAX_COLUMN_POINTS, MAX_POINTS, Slide, chart_bars, visible_points
 from app.services.video import compose, motion
 
@@ -306,19 +306,25 @@ def video_checks(video: Path, duration: float, bubble: list[tuple[float, float]]
 
 
 def slide_texts(slide: Slide) -> list[str]:
-    """The texts a slide shows, as the script has them: what its frames are read against."""
-    texts = [slide.eyebrow, slide.title, slide.subtitle]
+    """The texts a slide shows, as the script has them: what its frames are read against. Only those its layout
+    draws (`render.LAYOUTS`): a field it leaves out, such as a list's subtitle or any eyebrow, is never on screen."""
+    if slide.layout == "stat":  # the title stands in for a missing meaning
+        texts = [slide.stat_value, slide.stat_label or slide.title, slide.subtitle]
+    elif slide.layout == "cover":
+        texts = [slide.title, slide.subtitle]
+    else:
+        texts = [slide.title]
     if slide.layout in ("bullets", "steps", "closing", "calculation"):
         texts += visible_points(slide.points, MAX_POINTS)
     elif slide.layout == "case":
-        texts += [f"{heading}: {point}" for heading, point in zip(CASE_PARTS, slide.points)]
+        texts += [f"{heading}: {point or '—'}" for heading, point in zip(CASE_PARTS, slide.points)]
     elif slide.layout == "comparison":
         for column in (slide.left, slide.right):
             texts += [column.heading, *visible_points(column.points, MAX_COLUMN_POINTS)]
     elif slide.layout == "chart":
         unit = f" {slide.chart_unit.strip()}" if slide.chart_unit.strip() else ""
-        texts += [f"{label}: {value:g}{unit}" for label, value in chart_bars(slide)]
-    if slide.layout in ("stat", "calculation"):
+        texts += [f"{label}: {chart_number(value)}{unit}" for label, value in chart_bars(slide)]  # as drawn
+    if slide.layout == "calculation" and slide.stat_value.strip():  # without its result, no label either
         texts += [slide.stat_value, slide.stat_label]
     elif slide.layout == "statement":
         texts.append(slide.quote_author)
@@ -378,7 +384,8 @@ class Video:
         entry.update(
             scene_number=index + 1, layout=slide.layout,
             presenter="large" if self.hero()[index] else "bubble" if self.presenter else "none",
-            texts=[] if infographic and slide.layout == "visual" else slide_texts(slide),
+            # Over its picture, a "visual" scene draws nothing: the infographic, photo or clip is all there is.
+            texts=[] if picture and slide.layout == "visual" else slide_texts(slide),
         )
         parts = beat_count(slide) - 1  # those that appear one after the other, after the slide's frame
         if parts > 0 and self.timeline is not None:

@@ -21,6 +21,10 @@ from app.db.models import Course, Job, MediaAsset, Module, VideoReview
 from app.services import video_reviews
 from app.services.ai import designer
 from app.services.ai.llm import LLMError, OpenAILLM
+from app.services.slides import lint
+from app.services.slides.render import LAYOUTS
+from app.services.slides.render import render as render_slide
+from app.services.slides.spec import Slide, SlideContext
 from app.services.storage import StorageError
 from app.services.video import motion
 from app.services.video import review as video_review
@@ -605,6 +609,75 @@ def test_each_frame_tells_the_model_what_it_should_show():
     prompt = designer.frame_review_prompt("Seguridad", "Casco", [settled],
                                           ["En la escena 2: algo ya detectado."])
     assert '"texts": ["Reglas", "Siempre puesto", "Revisarlo"]' in prompt and "algo ya detectado" in prompt
+
+
+# Every text of a slide, each a word of its own, with more points, sides and bars than a slide shows (and a blank
+# point): whatever a layout draws shows up among the words it is read against, and nothing else.
+FULL_SLIDE = {
+    "eyebrow": "Charlie", "title": "Alfa", "subtitle": "Bravo", "stat_value": "Sierra", "stat_label": "Delta",
+    "quote_author": "Echo", "points": ["Foxtrot", "", "Golf", "Hotel", "India", "Uniform", "Victor"],
+    "icons": ["truck"] * 7, "icon": "truck",
+    "left": {"heading": "Juliet", "points": ["Kilo", "Lima", "Romeo", "Tango", "Whiskey"]},
+    "right": {"heading": "Mike", "points": ["November", "Oscar"]},
+    "chart_labels": ["Papa", "Quebec", "Xray", "Yankee", "Zulu", "Kappa", "Omega"],
+    "chart_values": [3, 4, 5, 6, 7, 8, 9], "chart_unit": "km",
+}
+SLIDE_WORDS = ("Charlie", "Alfa", "Bravo", "Sierra", "Delta", "Echo", "Foxtrot", "Golf", "Hotel", "India", "Uniform",
+               "Victor", "Juliet", "Kilo", "Lima", "Romeo", "Tango", "Whiskey", "Mike", "November", "Oscar", "Papa",
+               "Quebec", "Xray", "Yankee", "Zulu", "Kappa", "Omega")
+
+
+class _Drawing(lint.Recorder):
+    """Also keeps every string drawn, by the part it belongs to (one letter at a time for tracked text)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.strings: dict[str | None, str] = {}
+
+    def text(self, xy, text: str, **options):
+        self.strings[self._part] = self.strings.get(self._part, "") + text
+        return super().text(xy, text, **options)
+
+
+def _drawn_words(slide: Slide) -> set[str]:
+    drawing = _Drawing()
+    render_slide(slide, SlideContext(), draw_with=drawing)
+    drawn = " ".join(drawing.strings.values()).upper()  # some are drawn in capitals
+    return {word for word in SLIDE_WORDS if word.upper() in drawn}
+
+
+@pytest.mark.parametrize("layout, blank", [
+    *((layout, None) for layout in sorted(LAYOUTS)),
+    ("stat", "stat_label"),  # its title stands in for the meaning
+    ("calculation", "stat_value"),  # without its result, its label isn't drawn either
+    ("visual", "title"),  # nothing to stand in for its missing picture
+])
+def test_a_frame_is_read_only_against_the_texts_its_slide_draws(layout, blank):
+    # A list's subtitle or an eyebrow the script kept is never on screen: expecting it made "missing text" findings.
+    slide = Slide(layout=layout, **{**FULL_SLIDE, **({blank: ""} if blank else {})})
+    expected = " ".join(video_review.slide_texts(slide))
+    assert {word for word in SLIDE_WORDS if word in expected} == _drawn_words(slide)
+
+
+def test_a_chart_is_read_against_its_values_as_drawn():
+    slide = Slide(layout="chart", title="Costo", chart_labels=["Diésel", "Gas"], chart_values=[1500000, 3.5],
+                  chart_unit="MXN")
+    assert video_review.slide_texts(slide) == ["Costo", "Diésel: 1 500 000 MXN", "Gas: 3,5 MXN"]
+
+
+def test_a_visual_scene_over_its_picture_is_read_against_no_text():
+    scenes = [{
+        "id": "s1", "slide": {"layout": "visual", "title": "Cambio de llanta"}, "narration": "Mira el cambio.",
+        "visual": {"kind": "clip", "query": "", "prompt": "A mechanic changes a truck tire", "variant": 0},
+    }]
+    over_clip = video_review.Video(scenes, None, 5.0, presenter=False, pictures=frozenset({0}))
+    assert over_clip.context(video_review.Frame(0, 1.0, 0, "scene")) == {
+        "frame_index": 0, "at_seconds": 1.0, "scene_id": "s1", "scene_number": 1, "layout": "visual",
+        "presenter": "none", "texts": [], "backdrop": True,
+    }
+    # Its clip couldn't be made: the title stands in, like a statement.
+    without_clip = video_review.Video(scenes, None, 5.0, presenter=False)
+    assert without_clip.context(video_review.Frame(0, 1.0, 0, "scene"))["texts"] == ["Cambio de llanta"]
 
 
 def test_what_the_model_sees_is_kept_where_the_frame_shows_it():
