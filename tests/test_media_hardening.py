@@ -1,5 +1,6 @@
 """Uploads and processing under hostile or unusual input: Supabase contract, replays, big or odd files."""
 
+import json
 import subprocess
 
 import httpx
@@ -482,6 +483,26 @@ def test_a_job_claimed_while_stopping_is_handed_back_without_running(session_fac
     db.expire_all()
     stored = db.get(Job, job.id)
     assert ran == [] and (stored.status, stored.attempts, stored.locked_by) == ("queued", 0, None)
+
+
+def test_many_files_are_deleted_in_requests_supabase_accepts():
+    deleted = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE" and request.url.path.endswith("/object/course-media"):
+            prefixes = json.loads(request.content)["prefixes"]
+            if len(prefixes) > 1000:  # "At most 1000 objects can be deleted per request."
+                return httpx.Response(400, json={"statusCode": "400", "error": "InvalidRequest"})
+            deleted.append(prefixes)
+            return httpx.Response(200, json=[])
+        return httpx.Response(404)
+
+    storage = SupabaseStorage("https://x.supabase.co", "sb_secret_x", "course-media",
+                              client=httpx.Client(transport=httpx.MockTransport(handler)))
+    paths = [f"courses/1/narration/{n:04d}.mp3" for n in range(2500)]  # a course's kept speech, e.g.
+    storage.delete(paths)
+    assert [len(batch) for batch in deleted] == [1000, 1000, 500]
+    assert [path for batch in deleted for path in batch] == paths
 
 
 def test_a_text_file_size_is_read_uncompressed():

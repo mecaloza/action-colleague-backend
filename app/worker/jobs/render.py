@@ -29,7 +29,7 @@ import logging
 import tempfile
 import time
 import uuid
-from dataclasses import MISSING, asdict, dataclass, fields, replace
+from dataclasses import MISSING, asdict, dataclass, field, fields, replace
 from pathlib import Path
 
 import httpx
@@ -183,6 +183,8 @@ def _load(ctx: JobContext) -> RenderInput:
             raise _Skip("module has its own video")
         frozen = ctx.state.get("input")
         render = (_thaw(frozen) if frozen else None) or _read_input(module, ctx.payload)
+        if "recorded_speech" not in ctx.state:  # read once too, like the input
+            ctx.state["recorded_speech"] = _recorded_speech(module, render)
         module.generation_status, module.generation_error = "generating", None
         db.commit()
     ctx.state["input"] = asdict(render)
@@ -229,11 +231,25 @@ def _timings_file(index: int) -> str:
     return f"scene_{index:02d}.json"
 
 
+def _latest_file(index: int) -> str:
+    return f"scene_{index:02d}.latest.json"
+
+
+def _recorded_speech(module: Module, render: RenderInput) -> dict[str, str]:
+    """The speech clips the module's videos used for this render's scenes, as its record names them ({narration key:
+    digest}, see `video.cache.record`): what the cost of a change counted on (`revisions.impact`)."""
+    clips = video_cache.Kept(((module.storyboard or {}).get("render") or {}).get("cache")).clips
+    voices = _scene_voices(render)
+    keys = [video_cache.narration_key(voice, scene["narration"]) for voice, scene in zip(voices, render.scenes)]
+    return {key: clips[key] for key in keys if key in clips}
+
+
 def _speak_scenes(ctx: JobContext, render: RenderInput, work: Path) -> None:
     """Have every scene's speech in storage: the one an earlier video kept when the scene says the same in the same
     voice, else narrated now (and kept for the next videos). The state remembers the finished ones across restarts."""
-    storage, voice = get_storage(), None
+    voice = None
     done = ctx.state.setdefault("narration", {})
+    recorded = ctx.state.get("recorded_speech") or {}
     narrations = [scene["narration"] for scene in render.scenes]
     voices = _scene_voices(render)
 
@@ -244,10 +260,9 @@ def _speak_scenes(ctx: JobContext, render: RenderInput, work: Path) -> None:
         if str(index) in done:
             continue
         key = video_cache.narration_key(voices[index], text)
-        clip, timings = video_cache.narration_paths(render.course_id, key)
-        entry = {"path": clip, "timings": timings, "key": key}
-        if storage.size(timings) and storage.size(clip):  # kept by an earlier video: never paid twice
-            done[str(index)] = entry
+        kept = _kept_speech_for(render.course_id, key, recorded.get(key), work / _latest_file(index))
+        if kept is not None:  # never paid twice
+            done[str(index)] = kept
             continue
         ctx.progress(5 + int(40 * index / len(narrations)), f"Narrando la escena {index + 1} de {len(narrations)}")
         try:
@@ -257,22 +272,61 @@ def _speak_scenes(ctx: JobContext, render: RenderInput, work: Path) -> None:
             raise JobError(str(exc), permanent=exc.permanent) from exc
         local = work / _scene_file(index)
         local.write_bytes(speech.audio)
-        _check_speech(local, work, index)
-        sidecar = work / _timings_file(index)
-        sidecar.write_text(json.dumps(_timings(voices[index], text, speech)), encoding="utf-8")
-        storage.upload_file(clip, local, "audio/mpeg")
-        storage.upload_file(timings, sidecar, "application/json")  # last: a clip is kept once its timings are
-        done[str(index)] = {**entry, "paid": True}
+        _check_speech(ctx, local, work, index)
+        timings = work / _timings_file(index)
+        timings.write_text(json.dumps(_timings(voices[index], text, speech)), encoding="utf-8")
+        kept = _keep_speech(render.course_id, key, local, timings, work / _latest_file(index))
+        done[str(index)] = {**kept, "paid": True}
 
 
-def _check_speech(clip: Path, work: Path, index: int) -> None:
+def _speech_entry(course_id: int, key: str, digest: str) -> dict:
+    """A scene's speech in the state: where its clip and its timings are kept, its narration key and the clip's
+    digest (the presenter's takes are kept by it)."""
+    clip, timings = video_cache.narration_paths(course_id, key, digest)
+    return {"path": clip, "timings": timings, "key": key, "digest": digest}
+
+
+def _kept_speech_for(course_id: int, key: str, recorded: str | None, latest_copy: Path) -> dict | None:
+    """The speech kept for a narration key, if any: first the very clip the module's videos used (the one a change's
+    cost counted on, even if another render kept a newer one since), else the key's latest (another module saying the
+    same, a render that failed after paying for it)."""
+    storage = get_storage()
+
+    def whole(digest: str | None) -> dict | None:
+        if not digest:
+            return None
+        entry = _speech_entry(course_id, key, digest)
+        return entry if storage.size(entry["timings"]) and storage.size(entry["path"]) else None
+
+    kept = whole(recorded)
+    latest = video_cache.latest_path(course_id, key)
+    if kept is None and storage.size(latest):
+        storage.download_file(latest, latest_copy)
+        kept = whole(json.loads(latest_copy.read_text(encoding="utf-8")).get("digest"))
+    return kept
+
+
+def _keep_speech(course_id: int, key: str, clip: Path, timings: Path, latest: Path) -> dict:
+    """Keep a new speech clip with its timings for the next videos, under names of its own (they never change once
+    kept), then name it the key's latest: last, so the latest is always whole. Returns the scene's entry."""
+    storage = get_storage()
+    entry = _speech_entry(course_id, key, video_cache.digest(clip.read_bytes()))
+    storage.upload_file(entry["path"], clip, "audio/mpeg")
+    storage.upload_file(entry["timings"], timings, "application/json")
+    latest.write_text(json.dumps({"digest": entry["digest"]}), encoding="utf-8")
+    storage.upload_file(video_cache.latest_path(course_id, key), latest, "application/json")
+    return entry
+
+
+def _check_speech(ctx: JobContext, clip: Path, work: Path, index: int) -> None:
     """A new speech clip FFmpeg can read. One it can't is never kept (every later video would stumble on it): the job
     tries again, and asking again can bring a good one."""
     check = work / f"check_{index:02d}.wav"
     try:
         compose.to_wav(clip, check)
     except compose.ComposeError as exc:
-        logger.warning("narration_unreadable", extra={"scene": index, "error": str(exc)[:MAX_LOG_ERROR_CHARS]})
+        logger.warning("narration_unreadable", extra={"module_id": ctx.module_id, "scene": index,
+                                                      "error": str(exc)[:MAX_LOG_ERROR_CHARS]})
         raise JobError(f"La narración de la escena {index + 1} llegó dañada; vuelve a intentarlo.") from exc
     check.unlink(missing_ok=True)
 
@@ -304,14 +358,11 @@ def _beats(scene: dict, words: list[captions.TimedWord], start: float, length: f
 
 
 def _alignment(work: Path, index: int, entry: dict) -> dict | None:
-    """A scene's character timings: in the timings kept beside its speech, or in the state (a scene narrated by the
-    previous release, before speech was kept)."""
+    """A scene's character timings: in the timings kept beside its speech (named by the very clip: they always go
+    together), or in the state (a scene narrated by the previous release, before speech was kept)."""
     if "timings" not in entry:
         return entry.get("alignment")
     kept = json.loads(_local_copy(work, _timings_file(index), entry["timings"]).read_text(encoding="utf-8"))
-    if kept.get("digest") != entry["digest"]:  # two videos narrated the same at once: those timings are the other's
-        logger.warning("narration_timings_mismatch", extra={"scene": index, "key": entry.get("key")})
-        return None  # its words are spread over the scene instead
     return kept.get("alignment")
 
 
@@ -327,9 +378,7 @@ def _narrate(ctx: JobContext, render: RenderInput, work: Path) -> None:
 
     words, beats = [], []
     for index, scene in enumerate(render.scenes):
-        entry = done[str(index)]
-        entry["digest"] = video_cache.digest(scene_audio[index].read_bytes())  # the presenter's takes are kept by it
-        alignment = _alignment(work, index, entry)
+        alignment = _alignment(work, index, done[str(index)])
         scene_words = _caption_words(scene, alignment, narration.starts[index], narration.lengths[index])
         words += scene_words
         beats.append(_beats(scene, scene_words, narration.starts[index], narration.lengths[index]))
@@ -519,6 +568,10 @@ def _who(take: dict) -> str:
     return "el segundo presentador" if take["key"] == "heygen_co" else "el presentador"
 
 
+def _whose(take: dict) -> str:
+    return "del segundo presentador" if take["key"] == "heygen_co" else "del presentador"
+
+
 def _plan_presenter(ctx: JobContext, render: RenderInput) -> None:
     """After the narration: the presenter phase runs only if one was chosen and can be rendered."""
     configured = get_avatar_provider() is not None
@@ -634,7 +687,13 @@ def _poll_take(ctx: JobContext, render: RenderInput, work: Path, provider: Avata
     local = work / f"{take['key']}.mp4"
     provider.download(status.video_url, local)
     if not compose.clip_seconds(local) > 0:  # never kept unreadable: the next check brings a fresh link
-        raise AvatarError(f"El video de {_who(take)} llegó dañado.", retryable=True)
+        # Counted apart from `errors`, which HeyGen answering resets: a video that keeps arriving damaged is left out.
+        heygen["damaged"] = heygen.get("damaged", 0) + 1
+        reason = f"El video {_whose(take)} llegó dañado."
+        if heygen["damaged"] >= MAX_PRESENTER_ERRORS:
+            _skip_presenter(ctx, reason, take)
+            return None
+        raise AvatarError(reason, retryable=True)
     key = heygen.get("take")  # kept for the next videos (a render narrated by the previous release: its own)
     path = (
         video_cache.take_path(render.course_id, key) if key
@@ -722,6 +781,7 @@ class _Composition:
     vtt: Path
     duration: float
     presenter: bool  # whether the video carries the presenter bubble
+    damaged: dict[str, str] = field(default_factory=dict)  # kept takes it left out, damaged ({key: path})
 
 
 def _hero_scenes(render: RenderInput, presenter: bool) -> list[bool]:
@@ -880,8 +940,6 @@ def _publish(ctx: JobContext, render: RenderInput, made: _Composition) -> dict:
         module.video_url = ""
         module.generation_status, module.generation_error = "completed", None
         takes = _kept_takes(ctx, render)
-        # FFmpeg couldn't use the presenter's clip (the video came out without it): its takes are kept no longer.
-        unusable = takes if not made.presenter and ctx.state.get("avatar_path") else {}
         earlier = (module.storyboard or {}).get("render") or {}
         module.storyboard = {
             **(module.storyboard or {}),
@@ -893,8 +951,9 @@ def _publish(ctx: JobContext, render: RenderInput, made: _Composition) -> dict:
                 "duration_seconds": seconds,
                 # What the video shows: the script is compared with it (the scenes edited since it was made).
                 "scene_hashes": revisions.video_scenes(render.scenes),
-                # What it used and left for the next one: a change's cost is told from it (revisions.impact).
-                "cache": video_cache.record(earlier.get("cache"), _kept_speech(ctx), list(takes), dropped=unusable),
+                # What it used and left for the next one (a damaged take no longer: the next video asks HeyGen
+                # again); a change's cost is told from it (revisions.impact).
+                "cache": video_cache.record(earlier.get("cache"), _kept_speech(ctx), list(takes), dropped=made.damaged),
             },
         }
         db.commit()
@@ -905,7 +964,7 @@ def _publish(ctx: JobContext, render: RenderInput, made: _Composition) -> dict:
             db.rollback()
             logger.exception("render_replaced_cleanup_failed", extra={"module_id": ctx.module_id})
 
-    _delete_files(intermediate_paths(ctx.state) + list(unusable.values()), ctx.module_id)
+    _delete_files(intermediate_paths(ctx.state) + list(made.damaged.values()), ctx.module_id)
     narration = (ctx.state.get("narration") or {}).values()
     logger.info("render_paid", extra={
         "module_id": ctx.module_id, "scenes": len(render.scenes),
@@ -978,7 +1037,7 @@ def _compose_video(ctx: JobContext, render: RenderInput, work: Path) -> _Composi
         attempts.append((False, False))
     for number, (presenter, visuals) in enumerate(attempts):
         try:
-            return _compose(ctx, render, work, with_presenter=presenter, with_visuals=visuals)
+            made = _compose(ctx, render, work, with_presenter=presenter, with_visuals=visuals)
         except compose.ComposeError as exc:
             if number == len(attempts) - 1:
                 raise
@@ -990,7 +1049,27 @@ def _compose_video(ctx: JobContext, render: RenderInput, work: Path) -> _Composi
                 if not next_presenter
                 else "No pudimos usar las imágenes de fondo. El video se produjo con el diseño de marca."
             )
+            continue
+        if not made.presenter and ctx.state.get("avatar_path"):  # it came out without the presenter's clip
+            made.damaged = _damaged_takes(ctx, render, work)
+        return made
     raise AssertionError("unreachable")
+
+
+def _damaged_takes(ctx: JobContext, render: RenderInput, work: Path) -> dict[str, str]:
+    """The presenter's kept takes FFmpeg can't decode on their own: kept no longer, or every next video would leave
+    them out again. One that decodes stays: the composition failed for another reason (a busy worker, the two
+    presenters' track), and making it again would only pay HeyGen twice."""
+    damaged = {}
+    for key, path in _kept_takes(ctx, render).items():
+        try:
+            local = _local_copy(work, f"take-{key}.mp4", path)
+        except StorageError:
+            continue  # can't tell: kept
+        if not compose.decodes(local):
+            logger.warning("presenter_take_damaged", extra={"module_id": ctx.module_id, "take": key})
+            damaged[key] = path
+    return damaged
 
 
 # ── Visuals ahead of production ───────────────────────────────────────

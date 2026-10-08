@@ -1,16 +1,19 @@
 """
 What producing a module's video keeps for the next one, so producing it again pays only for what changed.
 
-  narration — each scene's speech (`courses/{id}/narration/{key}.mp3`), kept by what it says and in which voice, with
-              its timings beside it (`{key}.json`: the characters' alignment and the words they make up, which the
-              captions and the slides' beats are timed with). A scene that says the same in the same voice is never
-              narrated again, whatever else changed around it.
+  narration — each scene's speech, kept by what it says and in which voice (its key) and by the clip itself
+              (`courses/{id}/narration/{key}-{digest}.mp3`), with its timings beside it (`{key}-{digest}.json`: the
+              characters' alignment and the words they make up, which the captions and the slides' beats are timed
+              with), and `{key}.json` naming the key's latest clip. A clip and its timings never change once kept: two
+              renders narrating the same at once (two modules saying the same) each keep their own pair. A scene that
+              says the same in the same voice is never narrated again, whatever else changed around it.
   presenter — each presenter's take (`courses/{id}/presenter/{key}.mp4`), kept by the avatar, HeyGen's engine and the
               speech it lip-syncs, scene by scene. A change to the slides or the visuals only keeps every take.
 
 Both are kept by content, like the visuals (`visuals.cache_path`), and stay until the course is deleted. Each video
 records in its module what it used and left (`storyboard.render.cache`, see `record`): what a change will cost is told
-from there, without asking the storage (`revisions.impact`). The render itself always asks the storage.
+from there, without asking the storage (`revisions.impact`). The render reuses the very clips that record names, and
+asks the storage for the rest (a key's latest clip: another module saying the same, a render that failed after paying).
 """
 
 import hashlib
@@ -40,10 +43,15 @@ def narration_key(voice_id: str, text: str) -> str:
     return _key(json.dumps(asked, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
 
 
-def narration_paths(course_id: int, key: str) -> tuple[str, str]:
-    """Where a scene's speech is kept, and its timings."""
-    base = f"courses/{course_id}/{NARRATION}/{key}"
+def narration_paths(course_id: int, key: str, clip: str) -> tuple[str, str]:
+    """Where one speech clip of a narration key is kept (`clip`: its digest), and its timings."""
+    base = f"courses/{course_id}/{NARRATION}/{key}-{clip}"
     return f"{base}.mp3", f"{base}.json"
+
+
+def latest_path(course_id: int, key: str) -> str:
+    """Where the latest clip kept for a narration key is named ({"digest": ...}), written once that clip is whole."""
+    return f"courses/{course_id}/{NARRATION}/{key}.json"
 
 
 def digest(audio: bytes) -> str:

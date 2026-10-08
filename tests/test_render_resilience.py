@@ -13,6 +13,7 @@ from app.services.storage import StorageError
 from app.services.video.avatar import AvatarError, RenderStatus
 from app.services.video.voice import VoiceError
 from app.worker import queue
+from app.worker.jobs import render as render_job
 from tests.conftest import auth_headers
 from tests.test_video import RENDER_CHOICES, SCENES, _run_until_done
 
@@ -264,6 +265,29 @@ def test_any_presenter_failure_still_produces_the_video(client, db, admin_header
     assert "sin presentador" in detail["video_warning"]
 
 
+def test_a_presenter_video_that_keeps_arriving_damaged_is_left_out(
+    client, db, admin_headers, ai_module, storage, worker, monkeypatch
+):
+    downloads = []
+
+    def damaged(self, url, dest):  # HeyGen says it is done, but what it hands over can't be read (e.g. cut short)
+        downloads.append(url)
+        dest.write_bytes(b"\x00\x00\x00\x18ftypmp42 sin video")
+
+    monkeypatch.setattr(FakeAvatar, "download", damaged)
+    _start_render(client, admin_headers, ai_module)
+    _run_until_done(db, worker, rounds=10)
+
+    db.expire_all()
+    assert db.query(Job).one().status == "succeeded"  # never rescheduled forever: the video is out
+    render = _module_render(db, ai_module.id)
+    assert render["avatar_id"] == "" and render["warning"] == (
+        "El video del presentador llegó dañado. El video se produjo sin presentador."
+    )
+    assert len(downloads) == render_job.MAX_PRESENTER_ERRORS  # asked again a few times, never kept
+    assert not list((storage.root / storage.bucket).rglob("presenter/*")) and render["cache"]["takes"] == []
+
+
 def test_captions_escape_markup():
     words = [captions.TimedWord("Si", 0.0, 0.2), captions.TimedWord("x<y", 0.2, 0.5), captions.TimedWord("&", 0.5, 0.7)]
     vtt = captions.to_vtt(words)
@@ -392,14 +416,14 @@ def test_a_video_the_admin_uploads_while_composing_wins(
     assert not list((storage.root / storage.bucket).rglob("video-*/*"))  # the render's copy is gone
 
 
-def test_a_presenter_clip_ffmpeg_cannot_use_drops_only_the_bubble(
+def test_a_video_ffmpeg_cannot_compose_with_its_presenter_drops_only_the_bubble(
     client, db, admin_headers, ai_module, storage, worker, monkeypatch
 ):
     compose_video = compose.compose_video
 
     def no_presenter_please(scenes, narration, avatar, output, work, **options):
-        if avatar is not None:
-            raise compose.ComposeError("FFmpeg falló: presenter.mp4: Invalid data found when processing input")
+        if avatar is not None:  # e.g. the worker ran out of memory with the bubble's heavier filters
+            raise compose.ComposeError("FFmpeg falló: Cannot allocate memory")
         return compose_video(scenes, narration, avatar, output, work, **options)
 
     monkeypatch.setattr(compose, "compose_video", no_presenter_please)
@@ -409,8 +433,9 @@ def test_a_presenter_clip_ffmpeg_cannot_use_drops_only_the_bubble(
     render = _module_render(db, ai_module.id)
     assert db.get(Module, ai_module.id).generation_status == "completed"
     assert render["avatar_id"] == "" and "sin presentador" in render["warning"]
-    # A take FFmpeg can't use is not kept for the next video: that one asks HeyGen again.
-    assert render["cache"]["takes"] == [] and not list((storage.root / storage.bucket).rglob("presenter/*"))
+    # The take itself decodes fine: it stays for the next video, which never pays HeyGen for it again (only a take
+    # FFmpeg can't decode is dropped, see test_render_cache).
+    assert len(render["cache"]["takes"]) == 1 and list((storage.root / storage.bucket).rglob("presenter/*"))
     assert len(render["cache"]["clips"]) == len(THREE_SCENES)  # the speech is fine: kept
 
 

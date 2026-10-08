@@ -30,6 +30,7 @@ ACCENT = (233, 80, 30)  # the brand orange, #E9501E
 FFMPEG = ("ffmpeg", "-nostdin", "-y", "-loglevel", "error")
 LOUDNORM = "loudnorm=I=-16:TP=-1.5:LRA=11"  # loudness target of every narration and recording
 FFMPEG_TIMEOUT_SECONDS = 3600
+DECODE_TIMEOUT_SECONDS = 600  # reading a whole presenter take through, to tell whether it is damaged
 ERROR_TAIL_BYTES = 800  # of FFmpeg's stderr kept in the error message
 
 
@@ -138,6 +139,18 @@ def clip_seconds(path: Path) -> float:
         return float(out)
     except (subprocess.SubprocessError, ValueError):
         return 0.0
+
+
+def decodes(path: Path) -> bool:
+    """Whether FFmpeg decodes a video's picture from start to end without an error. A damaged file doesn't, even when
+    its length reads fine; FFmpeg too busy to finish in time is no verdict (it counts as decoding)."""
+    try:
+        run([*FFMPEG, "-xerror", "-i", str(path), "-map", "0:v:0", "-f", "null", "-"], timeout=DECODE_TIMEOUT_SECONDS)
+    except ComposeTimeout:
+        return True
+    except ComposeError:
+        return False
+    return True
 
 
 def presenter_track(clips: list[Path], speakers: list[int], segments: list[tuple[float, float]], dest: Path) -> Path:

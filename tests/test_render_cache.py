@@ -5,6 +5,7 @@ video again will pay, a render that fails or finishes never loses what was kept,
 import copy
 import json
 import shutil
+import subprocess
 
 import pytest
 
@@ -14,6 +15,7 @@ from app.services.ai.fake import FakeAvatar, FakeVoice
 from app.services.revisions import Production
 from app.services.storage import get_storage
 from app.services.video import cache as video_cache
+from app.services.video import compose
 from app.services.video.voice import Speech, VoiceError
 from app.worker.jobs import render as render_job
 from tests.conftest import auth_headers
@@ -95,9 +97,14 @@ def _edit(client, headers, module_id: int, edit) -> None:
     assert saved.status_code == 200, saved.text
 
 
-def _kept(storage, folder: str) -> list[str]:
+def _kept(storage, folder: str, pattern: str = "*") -> list[str]:
     """The files kept for the next videos in one of the course's folders (narration, presenter)."""
-    return sorted(path.name for path in (storage.root / storage.bucket).glob(f"courses/*/{folder}/*"))
+    return sorted(path.name for path in (storage.root / storage.bucket).glob(f"courses/*/{folder}/{pattern}"))
+
+
+def _speech_kept(storage) -> list[str]:
+    """The speech clips kept (each with its timings beside it, and its key's latest naming one)."""
+    return _kept(storage, "narration", "*.mp3")
 
 
 def _leftovers(storage) -> list[str]:
@@ -136,8 +143,8 @@ def test_a_change_to_the_slides_alone_is_produced_again_without_asking_any_provi
     [second] = [job for job in _renders(db) if job.id != first.id]
     assert {key: second.state[key] for key in ("starts", "beats")} == timings
     # What was kept stays for the next videos; the jobs' own files are gone.
-    assert len(_kept(storage, "narration")) == 6 and len(_kept(storage, "presenter")) == 1
-    assert not _leftovers(storage)
+    assert len(_speech_kept(storage)) == 3 and len(_kept(storage, "narration")) == 9  # with timings and latest
+    assert len(_kept(storage, "presenter")) == 1 and not _leftovers(storage)
 
 
 def test_each_scenes_speech_is_kept_with_its_timings_and_the_video_records_what_it_left(
@@ -148,7 +155,9 @@ def test_each_scenes_speech_is_kept_with_its_timings_and_the_video_records_what_
     record = module.storyboard["render"]["cache"]
     keys = [video_cache.narration_key("fake-voice-es", scene["narration"]) for scene in THREE_SCENES]
     assert list(record["clips"]) == keys and len(record["takes"]) == 1
-    clip, timings = video_cache.narration_paths(module.course_id, keys[0])
+    clip, timings = video_cache.narration_paths(module.course_id, keys[0], record["clips"][keys[0]])
+    latest = json.loads(storage.file_path(video_cache.latest_path(module.course_id, keys[0])).read_text())
+    assert latest == {"digest": record["clips"][keys[0]]}
     kept = json.loads(storage.file_path(timings).read_text(encoding="utf-8"))
     text = THREE_SCENES[0]["narration"]
     assert (kept["text"], kept["voice_id"], kept["model"]) == (text, "fake-voice-es", "eleven_multilingual_v2")
@@ -231,6 +240,28 @@ def test_a_proposed_change_says_exactly_what_producing_the_video_again_pays(
     assert revisions.stale_scene_ids(db.get(Module, ai_module.id).storyboard) == []
 
 
+def test_a_pending_proposal_tells_its_cost_as_of_now(client, db, admin_headers, ai_module, storage, worker):
+    course = db.get(Course, ai_module.course_id)
+    course.settings = dict(RENDER_CHOICES)  # the voice and the presenter are chosen; no video yet
+    db.commit()
+    asked = client.post(f"/api/v1/modules/{ai_module.id}/revisions", headers=admin_headers,
+                        json={"observation": "Haz el título más claro", "scene_ids": ["s2"]})
+    assert asked.status_code == 202, asked.text
+    worker()
+    url = f"/api/v1/revisions/{asked.json()['revision']['id']}"
+    impact = client.get(url, headers=admin_headers).json()["changes"]["impact"]
+    assert impact["narration_scenes"] == ["s1", "s2", "s3"] and impact["presenter_takes"] == 1  # nothing kept yet
+    assert not impact["needs_render"]
+
+    _produce(client, admin_headers, db, worker, ai_module)  # its video is made while the proposal waits
+
+    revision = client.get(url, headers=admin_headers).json()
+    assert revision["status"] == "proposed" and revision["changes"]["impact"] == {
+        "narration_scenes": [], "narration_chars": 0, "presenter_takes": 0, "reassigns_presenters": False,
+        "visuals_to_make": 0, "needs_render": True,
+    }
+
+
 # ── Nothing kept is lost ──────────────────────────────────────────────
 
 
@@ -250,7 +281,7 @@ def test_a_render_that_fails_keeps_the_speech_it_already_paid_for(
     _run_until_done(db, worker)
     db.expire_all()
     assert _renders(db)[0].status == "failed" and not _leftovers(storage)
-    assert len(_kept(storage, "narration")) == 4  # the first two scenes' speech and timings
+    assert len(_speech_kept(storage)) == 2  # the first two scenes' speech (the module has no video to record it)
 
     monkeypatch.setattr(FakeVoice, "speak", speak)  # the credits are back
     _forget(paid)
@@ -275,7 +306,7 @@ def test_speech_ffmpeg_cannot_read_is_never_kept(client, db, admin_headers, ai_m
     db.expire_all()
     job = _renders(db)[0]
     assert job.status == "queued" and "escena 2 llegó dañada" in job.error
-    assert len(_kept(storage, "narration")) == 2  # only the first scene's speech and timings
+    assert len(_speech_kept(storage)) == 1  # only the first scene's speech
 
     _run_until_done(db, worker)
     db.expire_all()
@@ -284,20 +315,50 @@ def test_speech_ffmpeg_cannot_read_is_never_kept(client, db, admin_headers, ai_m
     assert [text for text, _ in paid["speak"]] == [first, second, second, third]  # the second asked again, once
 
 
-def test_timings_kept_for_another_clip_are_never_applied_to_it(
-    client, db, admin_headers, ai_module, storage, worker, caplog
+def test_a_take_ffmpeg_cannot_decode_is_not_kept_for_the_next_video(
+    client, db, admin_headers, ai_module, storage, worker, paid, monkeypatch
+):
+    download = FakeAvatar.download
+
+    def without_picture(self, url, dest):  # it reads as long as it should, but there is no picture in it
+        subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-f", "lavfi", "-i", "sine=duration=8",
+                        "-c:a", "aac", "-f", "mp4", str(dest)], check=True, capture_output=True)
+
+    monkeypatch.setattr(FakeAvatar, "download", without_picture)
+    module = _produce(client, admin_headers, db, worker, ai_module, RENDER_CHOICES)
+    render = module.storyboard["render"]
+    assert render["avatar_id"] == "" and "sin presentador" in render["warning"]
+    assert render["cache"]["takes"] == [] and not _kept(storage, "presenter")  # it would leave the next one out too
+
+    monkeypatch.setattr(FakeAvatar, "download", download)
+    _forget(paid)
+    module = _produce(client, admin_headers, db, worker, ai_module)
+    assert paid["speak"] == [] and paid["start"] == ["fake-avatar"]  # HeyGen asked again; the speech is kept
+    assert module.storyboard["render"]["avatar_id"] == "fake-avatar" and len(_kept(storage, "presenter")) == 1
+
+
+def test_speech_another_render_keeps_meanwhile_never_changes_what_a_video_reuses(
+    client, db, admin_headers, ai_module, storage, worker, paid, tmp_path
 ):
     module = _produce(client, admin_headers, db, worker, ai_module, RENDER_CHOICES)
-    key = video_cache.narration_key("fake-voice-es", THREE_SCENES[0]["narration"])
-    timings = storage.file_path(video_cache.narration_paths(module.course_id, key)[1])
-    # Two videos narrated the same scene at once, and the clip of one stayed with the other's timings.
-    timings.write_text(json.dumps({**json.loads(timings.read_text(encoding="utf-8")), "digest": "otro"}))
-    _edit(client, admin_headers, ai_module.id, lambda scenes: scenes[0]["slide"].update(title="Otra portada"))
+    captions = _captions(db, storage, module)
+    # Another module says the same in the same voice and its render narrated it too, at the same time: its clip (it
+    # lasts and sounds a little different) is kept as well, with its own timings, and is that narration's latest.
+    text = THREE_SCENES[0]["narration"]
+    key = video_cache.narration_key("fake-voice-es", text)
+    other = FakeVoice().speak(f"{text} Otra toma.", "fake-voice-es")
+    (tmp_path / "otra.mp3").write_bytes(other.audio)
+    (tmp_path / "otra.json").write_text(json.dumps(render_job._timings("fake-voice-es", text, other)))
+    render_job._keep_speech(module.course_id, key, tmp_path / "otra.mp3", tmp_path / "otra.json", tmp_path / "l.json")
+    _forget(paid)
+    _edit(client, admin_headers, ai_module.id, lambda scenes: scenes[1]["slide"].update(title="Las reglas del casco"))
 
-    with caplog.at_level("WARNING", logger="app.worker.jobs.render"):
-        _produce(client, admin_headers, db, worker, ai_module)
+    module = _produce(client, admin_headers, db, worker, ai_module)
 
-    assert [record.key for record in caplog.records if record.getMessage() == "narration_timings_mismatch"] == [key]
+    # The module's video reuses the clip its last one used, the one the change's cost counted on: nothing is narrated
+    # or recorded again, and its words keep their timings. Both clips stay, each with its own timings.
+    assert paid == NOTHING and _captions(db, storage, module) == captions
+    assert len([name for name in _speech_kept(storage) if name.startswith(key)]) == 2
 
 
 def test_deleting_the_course_deletes_what_its_videos_kept(client, db, admin_headers, ai_module, storage, worker):
@@ -356,6 +417,20 @@ def test_the_record_keeps_what_every_video_left_but_the_takes_dropped():
     many = video_cache.record(None, {f"k{n}": "d" for n in range(400)}, [f"t{n}" for n in range(80)])
     assert len(many["clips"]) == video_cache.MAX_RECORDED_CLIPS and "k399" in many["clips"] and "k0" not in many["clips"]
     assert many["takes"][-1] == "t79" and len(many["takes"]) == video_cache.MAX_RECORDED_TAKES
+
+
+def test_a_take_is_told_damaged_only_when_ffmpeg_cannot_decode_it(tmp_path):
+    take = tmp_path / "toma.mp4"
+    subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x160:duration=4",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(take)], check=True, capture_output=True)
+    data = bytearray(take.read_bytes())
+    middle = len(data) // 3
+    data[middle:middle + 4000] = bytes((byte * 7 + 13) % 256 for byte in data[middle:middle + 4000])
+    damaged = tmp_path / "dañada.mp4"
+    damaged.write_bytes(bytes(data))
+
+    assert compose.decodes(take)
+    assert compose.clip_seconds(damaged) == 4 and not compose.decodes(damaged)  # its length reads fine all the same
 
 
 def test_a_take_is_told_apart_by_its_speech_and_where_it_starts_not_by_what_follows_it():
