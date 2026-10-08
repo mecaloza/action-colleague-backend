@@ -28,10 +28,12 @@ SCENES = [
 
 @pytest.fixture(autouse=True)
 def no_cached_pictures():
-    """The preview keeps the pictures it decoded in memory: every test starts without them."""
+    """The preview keeps the pictures it decoded (and what the bubble covers of each) in memory: every test starts
+    without them."""
     from app.api.routes import studio as studio_routes
 
     studio_routes._PICTURES.clear()
+    studio_routes._SHARES.clear()
 
 
 @pytest.fixture

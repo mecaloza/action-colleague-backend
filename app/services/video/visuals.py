@@ -45,12 +45,12 @@ DOWNLOAD_DOMAINS = ("pixabay.com", "googleapis.com", "googleusercontent.com")
 MIN_STOCK_SECONDS = 5
 CLIP_SECONDS = 8
 # An infographic explains: exact labels in the course's language, the brand's look, and the corner where the
-# presenter's bubble goes left empty.
+# presenter's bubble goes left empty (the bubble reaches 37% of the height up from the bottom: 40% leaves a margin).
 INFOGRAPHIC_STYLE = (
     "Clean, accurate technical infographic for a corporate training course. Dark charcoal background (#111111), flat "
     "vector illustration with precise technical drawings, orange (#E9501E) highlights, white sans-serif text. "
     "Write every label exactly as given, spelled correctly, large and legible; no other text. Keep the bottom-right "
-    "corner (the last 25% of the width and 35% of the height) completely empty. No logos, no watermarks."
+    "corner (the last 25% of the width and 40% of the height) completely empty. No logos, no watermarks."
 )
 STYLE = ("Cinematic, realistic, professional training video look, soft natural light. Absolutely no text, letters, "
          "numbers, signs, captions, watermarks, brand names or logos anywhere in the frame.")
@@ -327,8 +327,8 @@ class FakeVisuals:
         dest = dest.with_suffix(".png")
         image = Image.new("RGB", (1536, 1024), (17, 17, 17))
         draw = ImageDraw.Draw(image)
-        for n in range(3):  # three panels, like a comparison infographic
-            draw.rectangle([90 + n * 470, 220, 470 + n * 470, 760], outline=(233, 80, 30), width=10)
+        for n in range(3):  # three panels, like a comparison infographic, clear of the presenter's corner
+            draw.rectangle([90 + n * 470, 200, 470 + n * 470, 580], outline=(233, 80, 30), width=10)
         dest.parent.mkdir(parents=True, exist_ok=True)
         image.save(dest)
         return dest

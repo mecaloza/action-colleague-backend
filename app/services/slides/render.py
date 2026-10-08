@@ -1,11 +1,14 @@
 """
 Slide renderer: 1920x1080 PNG slides in the brand style (black, white, Rubinstein orange #E9501E).
 
-Every layout lays text out inside explicit boxes and shrinks the font until it fits, so a slide
-can never overflow, overlap the presenter bubble, or be distorted (always rendered at the exact
-video resolution).
+Every layout lays text out inside explicit boxes, clear of the presenter, the corner motif, the header and the
+footer, and shrinks the font until it fits; never distorted (always rendered at the exact video resolution).
+Text too long even at the smallest size is cut with an ellipsis: the layout lint (`lint`) tells the admin, and
+checks the boxes of everything drawn again.
 """
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from io import BytesIO
@@ -20,7 +23,9 @@ from app.services.slides.spec import (
     MAX_POINTS,
     Slide,
     SlideContext,
+    chart_bar_indexes,
     chart_bars,
+    visible_indexes,
     visible_items,
     visible_points,
 )
@@ -38,6 +43,17 @@ ICON_BADGE = 76  # the rounded square an item's icon sits in
 SCRIM_LEFT, SCRIM_RIGHT = 225, 60  # opacity of the darkening over a backdrop, at the left and right edges
 SCRIM_EDGE = 200  # and at the top and bottom edges (header and footer)
 MAX_ITEM_STEP = 150  # the most a list item is placed below the previous one
+# The brand motif in the top-right corner (see `_diamonds`): the faceted mark outlined, over a small orange one.
+MOTIF_X = WIDTH - 190
+MOTIF_MARKS = ((200, 250, 4), (382, 70, 5))  # each mark's center y, height and stroke width
+MOTIF_BOTTOM = max(cy + height // 2 + stroke for cy, height, stroke in MOTIF_MARKS)
+MIN_BAR_ROOM = 360  # a chart's longest bar, whatever its values' text takes
+VALUE_GAP = 20  # between a bar and its value
+MIN_RESULT_LABEL = 320  # width the label beside a calculation's result keeps
+RESULT_GAP = 30  # between the result and its label
+# What a slide draws besides its content (see `part`): the layout lint keeps the content off them.
+MOTIF, HEADER, FOOTER = "motif", "header", "footer"
+FRAME_PARTS = (MOTIF, HEADER, FOOTER)
 
 FONTS_DIR = Path(__file__).resolve().parent / "fonts"  # SIL Open Font License (see the OFL files)
 DISPLAY_FONT = FONTS_DIR / "InterTight.ttf"
@@ -152,6 +168,9 @@ class FittedText:
     font: ImageFont.FreeTypeFont
     lines: list[str]
     line_height: int
+    at_min_size: bool = False  # it needed the smallest size allowed
+    broken_word: bool = False  # a word wider than the box is split across lines
+    truncated: bool = False  # it doesn't fit even so: the rest is left out (an ellipsis closes it)
 
     @property
     def height(self) -> int:
@@ -180,7 +199,7 @@ def fit(
     leading: float = 1.15,
 ) -> FittedText:
     """Largest font size (stepping down) whose wrapped text fits the box with every word whole; then one that fits
-    cutting a long word; truncates as a last resort."""
+    cutting a long word; truncates as a last resort. The result says which of these it took (for the lint)."""
     words = text.split()
     for whole_words in (True, False):
         for size in range(max_size, min_size - 1, -2):
@@ -191,15 +210,18 @@ def fit(
             lines_that_fit = min(max_lines, max_height // line_height)
             lines = wrap(draw, text, fnt, max_width, max_lines=lines_that_fit)
             if len(lines) <= lines_that_fit:
-                return FittedText(fnt, lines, line_height)
+                # On the second pass every size where the words fit whole has failed already: one is cut.
+                return FittedText(fnt, lines, line_height, at_min_size=size - 2 < min_size, broken_word=not whole_words)
 
     fnt = font(path, min_size, weight)
     line_height = round(min_size * leading)
     limit = max(1, min(max_lines, max_height // line_height))
     lines = wrap(draw, text, fnt, max_width, max_lines=limit)
-    if len(lines) > limit:
+    truncated = len(lines) > limit
+    if truncated:
         lines = _ellipsize(draw, lines[:limit], fnt, max_width)
-    return FittedText(fnt, lines, line_height)
+    broken = any(text_width(draw, word, fnt) > max_width for word in words)
+    return FittedText(fnt, lines, line_height, at_min_size=True, broken_word=broken, truncated=truncated)
 
 
 def fit_all(
@@ -222,12 +244,30 @@ def fit_all(
     return [fit(draw, text, path, weight, max_width, max_height, size, min_size, max_lines=max_lines) for text in texts]
 
 
+def lines_width(draw: ImageDraw.ImageDraw, fitted: FittedText) -> int:
+    """Width of the widest of the lines."""
+    return round(max(text_width(draw, line, fitted.font) for line in fitted.lines))
+
+
 def draw_lines(draw: ImageDraw.ImageDraw, fitted: FittedText, x: int, y: int, fill: Color) -> int:
     """Draw the lines top-down; returns the y just below the last one."""
     for line in fitted.lines:
         draw.text((x, y), line, font=fitted.font, fill=fill)
         y += fitted.line_height
     return y
+
+
+@contextmanager
+def part(draw: ImageDraw.ImageDraw, name: str, fitted: FittedText | None = None) -> Iterator[None]:
+    """What is drawn inside is `name`: the slide's field ("title", "points.2"...) laid out as `fitted`, or a piece
+    of the frame (FRAME_PARTS). The layout lint's drawing handle (`lint.Recorder`) notes it, so it reports a
+    problem on the field the admin edits; a plain handle has nothing to note."""
+    tag = getattr(draw, "tag", None)
+    if tag is None:
+        yield
+        return
+    with tag(name, fitted):
+        yield
 
 
 def draw_tracked(
@@ -282,10 +322,10 @@ def is_hero(slide: Slide, index: int, total: int, presenter: bool) -> bool:
 # ── Frame (background, header, footer) ────────────────────────────────
 
 
-def _scrim(full: bool = True) -> Image.Image:
+def _scrim() -> Image.Image:
     """Transparent, darkened where the text goes (left and bottom): a backdrop shows through, the text reads."""
     across = Image.linear_gradient("L").rotate(90, expand=True).resize((WIDTH, HEIGHT))  # 255 left -> 0 right
-    alpha = across.point(lambda value: round(SCRIM_RIGHT + (SCRIM_LEFT - SCRIM_RIGHT) * value / 255) if full else 0)
+    alpha = across.point(lambda value: round(SCRIM_RIGHT + (SCRIM_LEFT - SCRIM_RIGHT) * value / 255))
     # The header and footer rows read over any picture: the top and bottom edges darken too.
     down = Image.linear_gradient("L").resize((WIDTH, HEIGHT))  # 0 top -> 255 bottom
     edges = down.point(lambda value: round(SCRIM_EDGE * max(0, 1 - value / 60, (value - 215) / 40)))
@@ -320,40 +360,45 @@ def brand_mark(draw: ImageDraw.ImageDraw, cx: float, cy: float, height: float, c
 
 def _diamonds(draw: ImageDraw.ImageDraw, theme: Theme) -> None:
     """Brand motif in the top-right corner: the faceted mark, outlined, over a small orange one."""
-    cx = WIDTH - 190
-    brand_mark(draw, cx, 200, 250, theme.line, 4)
-    brand_mark(draw, cx, 382, 70, theme.accent, 5)
+    for (cy, height, stroke), color in zip(MOTIF_MARKS, (theme.line, theme.accent)):
+        brand_mark(draw, MOTIF_X, cy, height, color, stroke)
 
 
-def _frame(ctx: SlideContext, theme: Theme) -> tuple[Image.Image, ImageDraw.ImageDraw]:
-    """Background, corner motif, header label and page counter; returns the image and its drawing handle.
+def _canvas(ctx: SlideContext, theme: Theme) -> Image.Image:
+    """What the slide is drawn on. Over a backdrop (a photo or video behind) it is RGBA: transparent but for a dark
+    scrim; over an infographic, transparent all over (its own title is at the top, nothing must dim it)."""
+    if ctx.picture_only:
+        return Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    return _scrim() if ctx.backdrop else _background(theme)
 
-    Over a backdrop (a photo or video behind) the slide is RGBA: transparent but for a dark scrim and its text."""
-    image = _scrim(full=not ctx.picture_only) if ctx.backdrop else _background(theme)
-    draw = ImageDraw.Draw(image)
+
+def _frame(ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageDraw) -> None:
+    """Corner motif, header label and page counter."""
     if not ctx.hero and not ctx.backdrop:  # the large presenter (or the photo) takes that side
-        _diamonds(draw, theme)
+        with part(draw, MOTIF):
+            _diamonds(draw, theme)
+    if ctx.picture_only:  # an infographic fills the frame, its own title at the top: no header or counter over it
+        return
 
     label_font = font(BODY_FONT, 24, 700)
     header_y = MARGIN_TOP - 44
-    label = " · ".join(part for part in (ctx.module_label.upper(), ctx.course_title.upper()) if part)
-    if ctx.picture_only:  # an infographic fills the frame, its own title at the top: no header or counter over it
-        return image, draw
+    label = " · ".join(piece for piece in (ctx.module_label.upper(), ctx.course_title.upper()) if piece)
     if label:
-        diamond(draw, MARGIN_X + 9, header_y + 14, 9, theme.accent)
-        draw_tracked(draw, label[:70], (MARGIN_X + 32, header_y), label_font, theme.muted, 3)
+        with part(draw, HEADER):
+            diamond(draw, MARGIN_X + 9, header_y + 14, 9, theme.accent)
+            draw_tracked(draw, label[:70], (MARGIN_X + 32, header_y), label_font, theme.muted, 3)
 
     counter = f"{ctx.index:02d} / {ctx.total:02d}"
     counter_font = font(BODY_FONT, 24, 600)
     footer_y = HEIGHT - MARGIN_BOTTOM + 28
-    draw.line([(MARGIN_X, footer_y - 18), (MARGIN_X + 80, footer_y - 18)], fill=theme.accent, width=4)
-    draw.text((MARGIN_X, footer_y - 4), counter, font=counter_font, fill=theme.muted)
-    return image, draw
+    with part(draw, FOOTER):
+        draw.line([(MARGIN_X, footer_y - 18), (MARGIN_X + 80, footer_y - 18)], fill=theme.accent, width=4)
+        draw.text((MARGIN_X, footer_y - 4), counter, font=counter_font, fill=theme.muted)
 
 
 def _content_box(top: int) -> tuple[int, int, int, int]:
-    """(left, top, right, bottom) of the area text may use; avoids the corner motif."""
-    right = WIDTH - MARGIN_X - (180 if top < 360 else 0)
+    """(left, top, right, bottom) of the area text may use: narrower while it is beside the corner motif."""
+    right = WIDTH - MARGIN_X - (180 if top < MOTIF_BOTTOM + 20 else 0)
     bottom = HEIGHT - MARGIN_BOTTOM - 40
     return MARGIN_X, top, right, bottom
 
@@ -377,11 +422,13 @@ def _cover(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageD
     title = fit(draw, slide.title, DISPLAY_FONT, 600, right - left, 420, 150, 84, leading=1.0, max_lines=3)
     y = title.height + top + 36
     if shown(ctx, 1):
-        draw_lines(draw, title, left, top, theme.text)
+        with part(draw, "title", title):
+            draw_lines(draw, title, left, top, theme.text)
     if slide.subtitle and shown(ctx, 2):
         sub_right = _text_right_limit(ctx, bottom, right)
         subtitle = fit(draw, slide.subtitle, BODY_FONT, 400, sub_right - left, bottom - y, 46, 30, max_lines=3)
-        draw_lines(draw, subtitle, left, y, theme.muted)
+        with part(draw, "subtitle", subtitle):
+            draw_lines(draw, subtitle, left, y, theme.muted)
 
 
 def _numbered_list(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageDraw, top: int) -> None:
@@ -389,31 +436,31 @@ def _numbered_list(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDra
     items = visible_items(slide, MAX_POINTS)
     if not items:
         return
+    fields = [f"points.{index}" for index in visible_indexes(slide.points, MAX_POINTS)]
     points, icons = [point for point, _ in items], [icon for _, icon in items]
     gap = 28
     per_item = (bottom - top - gap * (len(points) - 1)) // len(points)
     prefix_font = font(DISPLAY_FONT, 44, 600)
     prefix_w = int(text_width(draw, f"{MAX_POINTS}.", prefix_font)) + 18  # room for the last number
-    text_left = left + 44 + prefix_w
+    with_icons = any(icon in ICONS for icon in icons)
+    # With icons the badge takes the marker's place.
+    text_left = left + (ICON_BADGE + 36 if with_icons else 44 + prefix_w)
     # The presenter bubble narrows the lowest items; size every item for the narrowest width.
     width = _text_right_limit(ctx, bottom, right) - text_left
-    with_icons = any(icon in ICONS for icon in icons)
-    if with_icons:  # the icon badge takes the marker's place
-        text_left = left + ICON_BADGE + 36
-        width = _text_right_limit(ctx, bottom, right) - text_left
     fitted_items = fit_all(draw, points, BODY_FONT, 500, width, per_item, 52, 30, max_lines=3)
     y = top
-    for number, fitted in enumerate(fitted_items, start=1):
+    for number, (field, fitted) in enumerate(zip(fields, fitted_items), start=1):
         if shown(ctx, number):
-            middle = y + fitted.line_height / 2
-            if not (with_icons and icon_badge(draw, icons[number - 1], left, middle, theme)):
-                if with_icons:  # a point without an icon keeps the column aligned with a plain marker
-                    diamond(draw, left + ICON_BADGE / 2, middle, 12, theme.accent)
-                else:
-                    diamond(draw, left + 12, middle, 12, theme.accent)
-                    draw.text((left + 44, y + (fitted.line_height - 44) / 2 - 4), f"{number}.", font=prefix_font,
-                              fill=theme.accent)
-            draw_lines(draw, fitted, text_left, y, theme.text)
+            with part(draw, field, fitted):
+                middle = y + fitted.line_height / 2
+                if not (with_icons and icon_badge(draw, icons[number - 1], left, middle, theme)):
+                    if with_icons:  # a point without an icon keeps the column aligned with a plain marker
+                        diamond(draw, left + ICON_BADGE / 2, middle, 12, theme.accent)
+                    else:
+                        diamond(draw, left + 12, middle, 12, theme.accent)
+                        draw.text((left + 44, y + (fitted.line_height - 44) / 2 - 4), f"{number}.", font=prefix_font,
+                                  fill=theme.accent)
+                draw_lines(draw, fitted, text_left, y, theme.text)
         # Spread over the area (up to MAX_ITEM_STEP apart), so a short list doesn't bunch up under the title.
         y += max(fitted.height + gap, min(per_item + gap, MAX_ITEM_STEP), ICON_BADGE + gap if with_icons else 0)
 
@@ -422,7 +469,8 @@ def _title_block(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.
     """Slide title with a rule under it; returns the y where the body starts."""
     left, top, right, _ = _content_box(MARGIN_TOP + 40)
     title = fit(draw, slide.title, DISPLAY_FONT, 600, right - left, 230, 88, 56, leading=1.02, max_lines=max_lines)
-    y = draw_lines(draw, title, left, top, theme.text)
+    with part(draw, "title", title):
+        y = draw_lines(draw, title, left, top, theme.text)
     draw.line([(left, y + 26), (right, y + 26)], fill=theme.line, width=2)
     return y + 64
 
@@ -437,21 +485,24 @@ def _steps(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageD
     steps = visible_points(slide.points, MAX_POINTS)
     if not steps:
         return
+    fields = [f"points.{index}" for index in visible_indexes(slide.points, MAX_POINTS)]
     per_item = (bottom - top) // len(steps)
     number_font = font(DISPLAY_FONT, 40, 700)
     width = _text_right_limit(ctx, bottom, right) - (left + 100)
     fitted_steps = fit_all(draw, steps, BODY_FONT, 500, width, per_item - 12, 44, 28, max_lines=2)
-    for index, fitted in enumerate(fitted_steps):
+    for index, (field, fitted) in enumerate(zip(fields, fitted_steps)):
         if not shown(ctx, index + 1):
             continue
         y = top + index * per_item
         cx, cy = left + 34, y + 30
-        draw.ellipse([cx - 30, cy - 30, cx + 30, cy + 30], outline=theme.accent, width=3)
-        label = f"{index + 1:02d}"
-        draw.text((cx - text_width(draw, label, number_font) / 2, cy - 26), label, font=number_font, fill=theme.accent)
-        if index < len(steps) - 1 and shown(ctx, index + 2):  # the line leads to the next step once it is there
-            draw.line([(cx, cy + 34), (cx, y + per_item - 4)], fill=theme.line, width=3)
-        draw_lines(draw, fitted, left + 100, y + 30 - fitted.line_height // 2, theme.text)
+        with part(draw, field, fitted):
+            draw.ellipse([cx - 30, cy - 30, cx + 30, cy + 30], outline=theme.accent, width=3)
+            label = f"{index + 1:02d}"
+            draw.text((cx - text_width(draw, label, number_font) / 2, cy - 26), label, font=number_font,
+                      fill=theme.accent)
+            if index < len(steps) - 1 and shown(ctx, index + 2):  # the line leads to the next step once it is there
+                draw.line([(cx, cy + 34), (cx, y + per_item - 4)], fill=theme.line, width=3)
+            draw_lines(draw, fitted, left + 100, y + 30 - fitted.line_height // 2, theme.text)
 
 
 def _statement(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageDraw) -> None:
@@ -461,29 +512,41 @@ def _statement(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.Im
     statement = fit(draw, slide.title, DISPLAY_FONT, 500, right - text_left, 470, 96, 52, leading=1.08, max_lines=5)
     y = top + 20 + statement.height
     if shown(ctx, 1):
-        draw_icon(draw, slide.icon, left + 44, top - 70, 88, theme.accent)
-        draw_lines(draw, statement, text_left, top + 20, theme.text)
+        with part(draw, "icon"):
+            draw_icon(draw, slide.icon, left + 44, top - 70, 88, theme.accent)
+        with part(draw, "title", statement):
+            draw_lines(draw, statement, text_left, top + 20, theme.text)
         draw.rectangle([left, top + 28, left + 10, y - 12], fill=theme.accent)
     if slide.quote_author and shown(ctx, 2):
-        draw_tracked(draw, slide.quote_author.upper()[:60], (text_left, y + 30), font(BODY_FONT, 26, 700), theme.muted, 3)
+        with part(draw, "quote_author"):
+            draw_tracked(draw, slide.quote_author.upper()[:60], (text_left, y + 30), font(BODY_FONT, 26, 700),
+                         theme.muted, 3)
 
 
 def _stat(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageDraw) -> None:
     left, top, right, bottom = _content_box(230)
     value = fit(draw, slide.stat_value, DISPLAY_FONT, 700, min(right, 1500) - left, 330, 300, 120, leading=1.0, max_lines=1)
     if shown(ctx, 1):
-        draw_icon(draw, slide.icon, left + 44, top - 60, 80, theme.accent)
-        draw_lines(draw, value, left - 6, top, theme.accent)
-    y = top + value.height + 10
+        with part(draw, "icon"):
+            draw_icon(draw, slide.icon, left + 44, top - 60, 80, theme.accent)
+        with part(draw, "stat_value", value):
+            draw_lines(draw, value, left - 6, top, theme.accent)
+    # A comma or a descender of the large value hangs below its line ("87,5 %"): the label starts under its ink.
+    ink_bottom = draw.textbbox((left - 6, top), value.lines[0], font=value.font)[3]
+    y = max(top + value.height, round(ink_bottom)) + 10
     label_right = _text_right_limit(ctx, y + 170, right)  # a two-line label can reach the presenter bubble
     label = fit(draw, slide.stat_label or slide.title, DISPLAY_FONT, 600, label_right - left, 170, 72, 44, max_lines=2)
     if not shown(ctx, 2):
         return
-    y = draw_lines(draw, label, left, y, theme.text) + 20
+    # Without its meaning the title takes its place, and the admin fixes it by writing the meaning (a figure's editor
+    # has no title).
+    with part(draw, "stat_label", label):
+        y = draw_lines(draw, label, left, y, theme.text) + 20
     if slide.subtitle:
         sub_right = _text_right_limit(ctx, bottom, right)
         context = fit(draw, slide.subtitle, BODY_FONT, 400, sub_right - left, bottom - y, 40, 28, max_lines=3)
-        draw_lines(draw, context, left, y, theme.muted)
+        with part(draw, "subtitle", context):
+            draw_lines(draw, context, left, y, theme.muted)
 
 
 def _comparison(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageDraw) -> None:
@@ -501,20 +564,23 @@ def _comparison(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.I
     # Both columns share one text size, so neither side looks more important.
     fitted = fit_all(draw, left_points + right_points, BODY_FONT, 500, item_width, per_item - 10, 38, 26, max_lines=3)
     columns = [
-        (slide.left, theme.accent, fitted[: len(left_points)]),
-        (slide.right, theme.text, fitted[len(left_points):]),
+        ("left", slide.left, theme.accent, fitted[: len(left_points)]),
+        ("right", slide.right, theme.text, fitted[len(left_points):]),
     ]
-    for column_index, (column, color, items) in enumerate(columns):
+    for column_index, (side, column, color, items) in enumerate(columns):
         x = left + column_index * (column_width + gutter)
         heading = fit(draw, column.heading.upper(), BODY_FONT, 800, column_width, 60, 34, 24, max_lines=1)
-        y = draw_lines(draw, heading, x, top, color)
-        draw.rectangle([x, y + 8, x + 60, y + 14], fill=color)
+        with part(draw, f"{side}.heading", heading):
+            y = draw_lines(draw, heading, x, top, color)
+            draw.rectangle([x, y + 8, x + 60, y + 14], fill=color)
         y = list_top
         first_beat = 1 + (len(left_points) if column_index else 0)  # the left column's items come first
-        for offset, item in enumerate(items):
+        indexes = visible_indexes(column.points, MAX_COLUMN_POINTS)
+        for offset, (index, item) in enumerate(zip(indexes, items)):
             if shown(ctx, first_beat + offset):
-                diamond(draw, x + 10, y + item.line_height / 2, 9, color)
-                draw_lines(draw, item, x + 40, y, theme.text)
+                with part(draw, f"{side}.points.{index}", item):
+                    diamond(draw, x + 10, y + item.line_height / 2, 9, color)
+                    draw_lines(draw, item, x + 40, y, theme.text)
             y += max(item.height + 22, per_item // 2)
     mid_x = left + column_width + gutter // 2
     draw.line([(mid_x, top), (mid_x, bottom)], fill=theme.line, width=2)
@@ -544,20 +610,26 @@ def _chart(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageD
     row = min(130, (bottom - top - gap * (len(bars) - 1)) // len(bars))
     labels = fit_all(draw, [label for label, _ in bars], BODY_FONT, 600, label_width - 30, row, 40, 24, max_lines=2)
     biggest = max(abs(value) for _, value in bars) or 1
-    value_font = font(DISPLAY_FONT, min(52, row - 30), 700)
     unit = f" {slide.chart_unit}" if slide.chart_unit.strip() else ""
-    for index, ((_, value), label) in enumerate(zip(bars, labels)):
+    bar_left = left + label_width
+    # The values share one size and always leave the bars MIN_BAR_ROOM: a long unit wraps or shrinks (cut as a last
+    # resort), never past the right edge, and the largest bar never collapses.
+    value_room = right - bar_left - VALUE_GAP - MIN_BAR_ROOM
+    values = fit_all(draw, [_number(value) + unit for _, value in bars], DISPLAY_FONT, 700, value_room, row,
+                     max(24, min(52, row - 30)), 24, max_lines=2)
+    room = right - bar_left - VALUE_GAP - max(lines_width(draw, text) for text in values)  # one scale for all
+    fields = chart_bar_indexes(slide)
+    for index, ((_, value), label, text) in enumerate(zip(bars, labels, values)):
         if not shown(ctx, index + 1):
             continue
         y = top + index * (row + gap)
-        draw_lines(draw, label, left, y + (row - label.height) // 2, theme.text)
-        bar_left = left + label_width
-        text = _number(value) + unit
-        room = right - bar_left - text_width(draw, text, value_font) - 30
+        with part(draw, f"chart_labels.{fields[index]}", label):
+            draw_lines(draw, label, left, y + (row - label.height) // 2, theme.text)
         length = max(8, round(room * abs(value) / biggest))
         color = theme.accent if abs(value) == biggest else theme.muted
-        draw.rectangle([bar_left, y + row * 0.18, bar_left + length, y + row * 0.82], fill=color)
-        draw.text((bar_left + length + 20, y + row / 2), text, font=value_font, fill=theme.text, anchor="lm")
+        with part(draw, f"chart_values.{fields[index]}", text):
+            draw.rectangle([bar_left, y + row * 0.18, bar_left + length, y + row * 0.82], fill=color)
+            draw_lines(draw, text, bar_left + length + VALUE_GAP, y + (row - text.height) // 2, theme.text)
 
 
 def _calculation(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageDraw) -> None:
@@ -566,49 +638,60 @@ def _calculation(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.
     left, _, right, bottom = _content_box(top)
     right = _text_right_limit(ctx, bottom, right)
     steps = visible_points(slide.points, MAX_POINTS)
+    fields = [f"points.{index}" for index in visible_indexes(slide.points, MAX_POINTS)]
     result_height = 190 if slide.stat_value.strip() else 0
     per_step = min(96, (bottom - top - result_height) // max(1, len(steps)))
-    fitted = fit_all(draw, steps, BODY_FONT, 500, right - left - 60, per_step, 42, 26, max_lines=2)
+    # 12 px apart at least, within their share: two-line steps never push the result below the content box.
+    fitted = fit_all(draw, steps, BODY_FONT, 500, right - left - 60, per_step - 12, 42, 26, max_lines=2)
     y = top
-    for index, item in enumerate(fitted):
+    for index, (field, item) in enumerate(zip(fields, fitted)):
         if shown(ctx, index + 1):
-            diamond(draw, left + 14, y + item.line_height / 2, 11, theme.accent)
-            draw_lines(draw, item, left + 60, y, theme.text)
-        y += max(per_step, item.height + 12)
+            with part(draw, field, item):
+                diamond(draw, left + 14, y + item.line_height / 2, 11, theme.accent)
+                draw_lines(draw, item, left + 60, y, theme.text)
+        y += per_step
     if result_height and shown(ctx, len(steps) + 1):
         y += 10
         draw.line([(left, y), (right, y)], fill=theme.line, width=2)
-        value = fit(draw, slide.stat_value, DISPLAY_FONT, 700, right - left, 120, 110, 60, leading=1.0, max_lines=1)
-        draw_lines(draw, value, left, y + 24, theme.accent)
-        if slide.stat_label.strip():
-            label_left = left + int(text_width(draw, value.lines[0], value.font)) + 30
-            label = fit(draw, slide.stat_label, BODY_FONT, 600, max(200, right - label_left), 110, 40, 24, max_lines=2)
-            draw_lines(draw, label, label_left, y + 24 + (value.height - label.height) // 2, theme.text)
+        labeled = bool(slide.stat_label.strip())
+        # Two lines only fit at the smallest size: a long result shrinks first, then wraps.
+        value = fit(draw, slide.stat_value, DISPLAY_FONT, 700, right - left, 120, 110, 60, leading=1.0, max_lines=2)
+        if labeled and right - left - lines_width(draw, value) - RESULT_GAP < MIN_RESULT_LABEL:
+            # The label keeps a readable width beside the result: the result shrinks, it never pushes the label out.
+            value = fit(draw, slide.stat_value, DISPLAY_FONT, 700, right - left - RESULT_GAP - MIN_RESULT_LABEL, 120,
+                        110, 60, leading=1.0, max_lines=2)
+        with part(draw, "stat_value", value):
+            draw_lines(draw, value, left, y + 24, theme.accent)
+        if labeled:
+            label_left = left + lines_width(draw, value) + RESULT_GAP
+            label = fit(draw, slide.stat_label, BODY_FONT, 600, right - label_left, 110, 40, 24, max_lines=2)
+            with part(draw, "stat_label", label):
+                draw_lines(draw, label, label_left, y + 24 + (value.height - label.height) // 2, theme.text)
 
 
 def _case(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageDraw) -> None:
     """A practical case in four cards (situation, diagnosis, solution, result), revealed one after the other."""
     top = _title_block(slide, ctx, theme, draw)
     left, _, right, bottom = _content_box(top)
-    right = _text_right_limit(ctx, bottom, right) if ctx.presenter else right
-    parts = slide.points[: len(CASE_PARTS)]
+    # With the presenter the cards end left of its bubble: the last one needs no narrower text of its own.
+    right = _text_right_limit(ctx, bottom, right)
+    sections = slide.points[: len(CASE_PARTS)]
     gutter = 36
     width = (right - left - gutter) // 2
     height = (bottom - top - gutter) // 2
     heading_font = font(BODY_FONT, 24, 800)
-    texts = fit_all(draw, [part or "—" for part in parts], BODY_FONT, 500, width - 56, height - 90, 36, 22, max_lines=5)
+    texts = fit_all(draw, [section or "—" for section in sections], BODY_FONT, 500, width - 56, height - 90, 36, 22,
+                    max_lines=5)
     for index, (heading, text) in enumerate(zip(CASE_PARTS, texts)):
         if not shown(ctx, index + 1):
             continue
         x = left + (index % 2) * (width + gutter)
         y = top + (index // 2) * (height + gutter)
-        if ctx.presenter and index == 3:  # the bubble sits over the last card's corner: keep its text clear
-            text = fit(draw, parts[3] or "—", BODY_FONT, 500, width - 56 - BUBBLE_SIZE // 2, height - 90, 36, 22,
-                       max_lines=5)
-        draw.rounded_rectangle([x, y, x + width, y + height], radius=16, outline=theme.line, width=2)
-        draw.rectangle([x, y + 28, x + 6, y + 64], fill=theme.accent)
-        draw_tracked(draw, heading.upper(), (x + 28, y + 30), heading_font, theme.accent, 3)
-        draw_lines(draw, text, x + 28, y + 80, theme.text)
+        with part(draw, f"points.{index}", text):
+            draw.rounded_rectangle([x, y, x + width, y + height], radius=16, outline=theme.line, width=2)
+            draw.rectangle([x, y + 28, x + 6, y + 64], fill=theme.accent)
+            draw_tracked(draw, heading.upper(), (x + 28, y + 30), heading_font, theme.accent, 3)
+            draw_lines(draw, text, x + 28, y + 80, theme.text)
 
 
 def _visual(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageDraw) -> None:
@@ -656,11 +739,16 @@ def beat_count(slide: Slide) -> int:
     return 3  # stat: frame, value, label
 
 
-def render(slide: Slide, ctx: SlideContext) -> Image.Image:
+def render(
+    slide: Slide, ctx: SlideContext, draw_with: Callable[[Image.Image], ImageDraw.ImageDraw] = ImageDraw.Draw
+) -> Image.Image:
+    """The slide at the video's size. `draw_with` makes its drawing handle: the layout lint's records what is drawn."""
     if slide.layout == "visual" and ctx.backdrop:
         ctx = replace(ctx, picture_only=True)
     theme = DARK if ctx.backdrop else THEMES.get(ctx.theme, DARK)  # light text over a darkened photo
-    image, draw = _frame(ctx, theme)
+    image = _canvas(ctx, theme)
+    draw = draw_with(image)
+    _frame(ctx, theme, draw)
     LAYOUTS[slide.layout](slide, ctx, theme, draw)
     return image
 

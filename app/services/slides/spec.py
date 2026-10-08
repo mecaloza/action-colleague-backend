@@ -72,15 +72,23 @@ class Slide(BaseModel):
 
 def visible_points(points: list[str], limit: int) -> list[str]:
     """The non-blank points a layout shows: the first `limit` of them."""
-    return [point for point in points if point.strip()][:limit]
+    return [points[index] for index in visible_indexes(points, limit)]
+
+
+def visible_indexes(points: list[str], limit: int) -> list[int]:
+    """Where the points a layout shows are in the list (see `visible_points`): the field the admin edits."""
+    return [index for index, point in enumerate(points) if point.strip()][:limit]
+
+
+def chart_bar_indexes(slide: "Slide") -> list[int]:
+    """Which labels become bars: those with a value, not blank (see `chart_bars`)."""
+    values = slide.chart_values
+    return [index for index, label in enumerate(slide.chart_labels) if label.strip() and index < len(values)][:MAX_BARS]
 
 
 def chart_bars(slide: "Slide") -> list[tuple[str, float]]:
     """The chart's bars: each label with its value (labels without a value, or blank, are left out)."""
-    values = slide.chart_values
-    return [
-        (label, values[index]) for index, label in enumerate(slide.chart_labels) if label.strip() and index < len(values)
-    ][:MAX_BARS]
+    return [(slide.chart_labels[index], slide.chart_values[index]) for index in chart_bar_indexes(slide)]
 
 
 def visible_items(slide: "Slide", limit: int) -> list[tuple[str, str]]:
@@ -115,4 +123,4 @@ class SlideContext:
     hero: bool = False  # the presenter is shown large on the right (cover and closing): text keeps to the left
     reveal: int | None = None  # beats shown (see `render.beat_count`); None shows the whole slide
     backdrop: bool = False  # a photo or video fills the screen behind: transparent background with a dark scrim
-    picture_only: bool = False  # the picture is the content (an infographic): only its edges darken
+    picture_only: bool = False  # the picture is the content (an infographic): nothing is drawn over it

@@ -131,7 +131,9 @@ def _frames(seconds: float) -> int:
 
 def entrance(before: Image.Image, after: Image.Image, count: int) -> list[Image.Image]:
     """The part of `after` that `before` lacks rising into place while it fades in (`count` frames)."""
-    box = ImageChops.difference(before, after).getbbox()
+    # Every channel: on RGBA frames Pillow's default bounds only the alpha, unchanged on an opaque slide (the beat
+    # would pop in on a single frame).
+    box = ImageChops.difference(before, after).getbbox(alpha_only=False)
     if box is None:
         return [after] * count
     left, top, right, bottom = box
