@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 from app.schemas.courses import MAX_AUDIENCE_CHARS, MAX_MODULES, AvatarEngine, ModuleCount
 from app.services.ai.designer import MAX_NARRATION_CHARS, MAX_STORYBOARD_SCENES, CourseOutline, OutlineModule
+from app.services.slides.lint import LintCode, Severity
 from app.services.slides.spec import SceneVisual, Slide
 
 __all__ = [
@@ -13,12 +14,16 @@ __all__ = [
     "CourseOutline",
     "CourseOutlineIn",
     "DraftRequest",
+    "LayoutWarning",
     "OutlineGenerate",
     "QuizGenerate",
     "RecordingCompose",
     "RenderRequest",
     "SlidePreview",
     "Storyboard",
+    "StoryboardDraft",
+    "StoryboardLint",
+    "StoryboardOut",
     "StoryboardRegenerate",
     "StoryboardScene",
     "VoiceOut",
@@ -71,6 +76,37 @@ class StoryboardScene(BaseModel):
 
 class Storyboard(BaseModel):
     scenes: list[StoryboardScene] = Field(max_length=MAX_STORYBOARD_SCENES)
+
+
+class LayoutWarning(BaseModel):
+    """Something on a scene's slide that doesn't fit or overlaps (see `app.services.slides.lint`)."""
+
+    scene_id: str
+    code: LintCode
+    severity: Severity
+    # The slide's field the admin edits: "title", "subtitle", "points.2", "left.heading", "right.points.0",
+    # "stat_value", "stat_label", "quote_author", "icon", "chart_labels.1", "chart_values.1", "visual" (the
+    # infographic); None for a decoration of the layout.
+    field: str | None
+    message: str  # in Spanish, for the admin
+
+
+class StoryboardOut(Storyboard):
+    warnings: list[LayoutWarning] = Field(default_factory=list)
+
+
+class DraftScene(StoryboardScene):
+    narration: str = Field(default="", max_length=MAX_NARRATION_CHARS)  # the lint only looks at the slide
+
+
+class StoryboardDraft(BaseModel):
+    """A script being edited (not saved: its narrations may still be empty)."""
+
+    scenes: list[DraftScene] = Field(max_length=MAX_STORYBOARD_SCENES)
+
+
+class StoryboardLint(BaseModel):
+    warnings: list[LayoutWarning]
 
 
 class StoryboardRegenerate(BaseModel):

@@ -3,6 +3,7 @@ AI course studio: outline, per-module storyboards, quiz suggestions and slide pr
 presenters to choose from, the production of each module's video, and camera recordings with their captions.
 """
 
+import logging
 import tempfile
 import threading
 import time
@@ -35,15 +36,20 @@ from app.schemas.studio import (
     RenderRequest,
     SlidePreview,
     Storyboard,
+    StoryboardDraft,
+    StoryboardLint,
+    StoryboardOut,
     StoryboardRegenerate,
+    StoryboardScene,
     VoiceOut,
 )
 from app.services import studio
 from app.services.course_views import ACTIVE_GENERATION, course_detail
 from app.services.media_views import job_out
 from app.services.progress import ordered_modules, refresh_course_enrollments
+from app.services.slides import lint
 from app.services.slides.render import is_hero, render_png
-from app.services.slides.spec import SlideContext
+from app.services.slides.spec import SceneVisual, Slide, SlideContext
 from app.services.storage import StorageError, get_storage
 from app.services.video.avatar import AvatarError, get_avatar_provider
 from app.services.video.visuals import VisualRequest, cache_path, get_visuals
@@ -53,6 +59,7 @@ from app.worker.jobs.recording import enqueue_transcription, voice_available
 from app.worker.jobs.render import scene_prompt
 
 router = APIRouter(tags=["studio"], dependencies=[Depends(require_admin)])
+logger = logging.getLogger(__name__)
 
 AI_JOB_ATTEMPTS = 2  # a second try covers a transient provider error
 BUSY_WITH_OTHER_REQUEST = "Ya se está generando con otras indicaciones; espera a que termine para pedir cambios."
@@ -248,12 +255,36 @@ def draft_modules(
     return [job_out(job) for job in jobs]
 
 
-@router.get("/modules/{module_id}/storyboard", response_model=Storyboard)
+def _storyboard_out(module: Module) -> StoryboardOut:
+    """The module's script, with what doesn't fit or overlaps on its slides."""
+    scenes = Storyboard(scenes=studio.scenes_of(module)).scenes
+    try:
+        warnings = _layout_warnings(module, scenes)
+    except Exception:  # advice only: it never keeps the admin from opening (or having saved) the script
+        logger.exception("storyboard_lint_failed", extra={"module_id": module.id})
+        warnings = []
+    return StoryboardOut(scenes=scenes, warnings=warnings)
+
+
+@router.get("/modules/{module_id}/storyboard", response_model=StoryboardOut)
 def get_storyboard(module_id: int, db: Session = Depends(get_db)):
-    return Storyboard(scenes=studio.scenes_of(module_or_404(db, module_id)))
+    return _storyboard_out(module_or_404(db, module_id))
 
 
-@router.put("/modules/{module_id}/storyboard", response_model=Storyboard)
+@router.post("/modules/{module_id}/storyboard/lint", response_model=StoryboardLint)
+def lint_storyboard(module_id: int, payload: StoryboardDraft, db: Session = Depends(get_db)):
+    """What doesn't fit or overlaps on the slides of a script being edited (not saved), checked as the admin types:
+    the slides only, over the infographics already made; nothing is asked of a provider."""
+    module = module_or_404(db, module_id)
+    if not _PREVIEW_SLOTS.acquire(timeout=PREVIEW_WAIT_SECONDS):  # drawing, like the previews: one budget
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Hay muchas revisiones en curso; intenta de nuevo.")
+    try:
+        return StoryboardLint(warnings=_layout_warnings(module, payload.scenes))
+    finally:
+        _PREVIEW_SLOTS.release()
+
+
+@router.put("/modules/{module_id}/storyboard", response_model=StoryboardOut)
 def save_storyboard(module_id: int, payload: Storyboard, db: Session = Depends(get_db)):
     module = module_or_404(db, module_id)
     db.refresh(module, with_for_update=True)
@@ -270,7 +301,7 @@ def save_storyboard(module_id: int, payload: Storyboard, db: Session = Depends(g
     module.storyboard = {**(module.storyboard or {}), "scenes": [scene.model_dump() for scene in payload.scenes]}
     studio.queue_visuals(db, module)  # a new or changed infographic is made now, for the preview
     db.commit()
-    return Storyboard(scenes=studio.scenes_of(module))
+    return _storyboard_out(module)
 
 
 @router.post("/modules/{module_id}/storyboard/regenerate", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
@@ -338,36 +369,74 @@ MAX_CACHED_PICTURES = 16
 PICTURE_SIZE = (960, 960)  # enough to fill (or fit in) the 960x540 preview
 
 
+def _visual_request(slide: Slide, visual: SceneVisual) -> VisualRequest:
+    """What the scene's visual is made from: the same request (and cached file) as the video's."""
+    scene = {"slide": slide.model_dump(), "visual": visual.model_dump()}
+    return VisualRequest(visual.kind, visual.query, scene_prompt(scene), visual.variant)
+
+
+def _stored_picture(path: str) -> Image.Image | None:
+    """The visual made at `path` (None while it isn't), decoded and shrunk; kept in memory for the next preview.
+    Raises StorageError or OSError when it can't be read."""
+    with _PICTURES_LOCK:
+        if path in _PICTURES:
+            _PICTURES.move_to_end(path)
+            return _PICTURES[path]
+    storage = get_storage()
+    if not storage.size(path):
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        local = Path(tmp) / "picture.png"
+        storage.download_file(path, local)
+        with Image.open(local) as opened:
+            picture = opened.convert("RGB")
+            picture.thumbnail(PICTURE_SIZE)
+    with _PICTURES_LOCK:
+        _PICTURES[path] = picture
+        while len(_PICTURES) > MAX_CACHED_PICTURES:
+            _PICTURES.popitem(last=False)
+    return picture
+
+
 def _prepared_picture(db: Session, payload: SlidePreview) -> tuple[Image.Image | None, bool]:
     """The infographic or image made for the scene (None if none), and whether it is still being made: only
     while the course has a preparation job running (never for one that failed or was never asked for)."""
     visual = payload.visual
     if visual is None or payload.course_id is None or visual.kind not in studio.PREPARED_VISUALS:
         return None, False
-    scene = {"slide": payload.slide.model_dump(), "visual": visual.model_dump()}
-    request = VisualRequest(visual.kind, visual.query, scene_prompt(scene), visual.variant)
-    path = cache_path(payload.course_id, request)
-    with _PICTURES_LOCK:
-        if path in _PICTURES:
-            _PICTURES.move_to_end(path)
-            return _PICTURES[path], False
-    storage = get_storage()
+    request = _visual_request(payload.slide, visual)
     try:
-        if not storage.size(path):
-            return None, _preparing(db, payload.course_id, request)
-        with tempfile.TemporaryDirectory() as tmp:
-            local = Path(tmp) / "picture.png"
-            storage.download_file(path, local)
-            with Image.open(local) as opened:
-                picture = opened.convert("RGB")
-                picture.thumbnail(PICTURE_SIZE)
+        picture = _stored_picture(cache_path(payload.course_id, request))
     except (StorageError, OSError):
         return None, False  # the preview still shows the slide over the sample
-    with _PICTURES_LOCK:
-        _PICTURES[path] = picture
-        while len(_PICTURES) > MAX_CACHED_PICTURES:
-            _PICTURES.popitem(last=False)
+    if picture is None:
+        return None, _preparing(db, payload.course_id, request)
     return picture, False
+
+
+def _layout_warnings(module: Module, scenes: list[StoryboardScene]) -> list[dict]:
+    """What doesn't fit or overlaps on the scenes' slides as the editor previews them, which is how the video draws
+    them: the course's look and presenter, the text over a picture when the scene has a visual, and the bubble over
+    each infographic already made (one not made yet is checked once it is)."""
+    course = module.course
+    settings = course.settings or {}
+    presenter = bool(settings.get("presenter", True))
+    warnings = []
+    for index, scene in enumerate(scenes, start=1):
+        hero = is_hero(scene.slide, index, len(scenes), presenter)
+        context = SlideContext(
+            course_title=course.title, module_label=f"Módulo {module.order}", index=index, total=len(scenes),
+            theme=settings.get("theme") or "dark", presenter=presenter and not hero, hero=hero,
+            backdrop=scene.visual.kind != "none",
+        )
+        infographic = None
+        if scene.visual.kind == "infographic" and context.presenter:
+            try:
+                infographic = _stored_picture(cache_path(course.id, _visual_request(scene.slide, scene.visual)))
+            except (StorageError, OSError):
+                pass  # checked on the next lint
+        warnings += lint.scene_warnings(scene.id, scene.slide, context, infographic)
+    return warnings
 
 
 def _preparing(db: Session, course_id: int, request: VisualRequest) -> bool:

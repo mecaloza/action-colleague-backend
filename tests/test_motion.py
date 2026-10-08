@@ -229,6 +229,18 @@ def test_the_presenter_is_large_on_the_cover_and_in_the_bubble_after(tmp_path):
     assert presenter_at(on_bullets, bubble_center) and not presenter_at(on_bullets, hero_center)
 
 
+def test_a_point_rises_into_place_instead_of_popping_in():
+    # The timeline reads every image as RGBA (a slide over a backdrop is see-through), opaque slides too.
+    before = render_slide(BULLETS, SlideContext(reveal=1)).convert("RGBA")
+    after = render_slide(BULLETS, SlideContext(reveal=2)).convert("RGBA")
+    frames = motion.entrance(before, after, 12)
+
+    final = after.convert("RGB")
+    point = ImageChops.difference(before.convert("RGB"), final).getbbox()
+    distances = [_mean_difference(frame.convert("RGB"), final, point) for frame in frames]
+    assert distances[0] > distances[len(frames) // 2] > distances[-1] == 0  # it arrives over the frames, then lands
+
+
 def test_points_with_shared_words_never_arrive_together():
     slide = Slide(layout="bullets", title="T", points=["Primera idea clave", "Segunda idea clave", "Tercera idea clave"])
     from app.services.video.captions import words_from_text

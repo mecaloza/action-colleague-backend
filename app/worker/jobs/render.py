@@ -36,6 +36,7 @@ from app.db.models import Job, MediaAsset, Module
 from app.services import studio
 from app.services.course_views import ACTIVE_GENERATION
 from app.services.media import SIGNED_URL_SECONDS, discard_assets
+from app.services.slides import lint
 from app.services.slides.render import beat_count, is_hero
 from app.services.slides.render import render as render_slide
 from app.services.slides.spec import Slide, SlideContext
@@ -642,13 +643,14 @@ def _hero_scenes(render: RenderInput, presenter: bool) -> list[bool]:
 def _draw_scenes(
     ctx: JobContext, render: RenderInput, work: Path, presenter: bool, visuals: bool = True
 ) -> list[motion.Scene]:
-    """Each scene's slide drawn beat by beat; with a presenter, the layouts leave its place free."""
+    """Each scene's slide drawn beat by beat; with a presenter, the layouts leave its place free. What doesn't fit
+    or overlaps on them is kept in the state (`lint`) for the video's review."""
     narration_starts, lengths = ctx.state["starts"], ctx.state["lengths"]
     saved_beats = ctx.state.get("beats")  # a render narrated before beats existed spreads them evenly
     hero = _hero_scenes(render, presenter)
     backdrops = _backdrops(ctx, render, work) if visuals else {}
     mode = "RGBA" if backdrops else "RGB"  # one pixel format for every image of the video (see motion.image_mode)
-    scenes = []
+    scenes, warnings = [], []
     for index, scene in enumerate(render.scenes):
         slide = Slide.model_validate(scene["slide"])
         context = SlideContext(
@@ -671,7 +673,24 @@ def _draw_scenes(
             images, start, times[: len(images) - 1], push=plain and index not in (0, len(render.scenes) - 1),
             backdrop=backdrops.get(index), fit="contain" if explains else "cover",
         ))
+        warnings += _layout_warnings(ctx, scene, slide, context, backdrops.get(index) if explains else None)
+    ctx.state["lint"] = {"warnings": warnings}
     return scenes
+
+
+def _layout_warnings(
+    ctx: JobContext, scene: dict, slide: Slide, context: SlideContext, infographic: Path | None
+) -> list[dict]:
+    """The layout lint of a scene as this video draws it. Only advice: a failure here never costs the video."""
+    try:
+        picture = None
+        if infographic is not None and infographic.suffix == ".png":
+            with Image.open(infographic) as opened:
+                picture = opened.convert("RGB")
+        return lint.scene_warnings(str(scene.get("id", "")), slide, context, picture)
+    except Exception:
+        logger.exception("render_lint_failed", extra={"module_id": ctx.module_id, "scene": scene.get("id")})
+        return []
 
 
 def _backdrops(ctx: JobContext, render: RenderInput, work: Path) -> dict[int, Path]:
