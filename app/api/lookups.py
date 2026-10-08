@@ -5,7 +5,7 @@ from typing import TypeVar
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.db.models import Course, Module, User
+from app.db.models import Course, JobProfile, Module, User
 
 T = TypeVar("T")
 
@@ -27,3 +27,7 @@ def module_or_404(db: Session, module_id: int) -> Module:
 
 def user_or_404(db: Session, user_id: int) -> User:
     return _get_or_404(db, User, user_id, "Persona no encontrada")
+
+
+def profile_or_404(db: Session, profile_id: int) -> JobProfile:
+    return _get_or_404(db, JobProfile, profile_id, "Perfil no encontrado")

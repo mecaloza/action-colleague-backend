@@ -554,3 +554,229 @@ def test_assigning_many_people_is_one_insert(client, db, engine, admin, collabor
     with ThreadPoolExecutor(4) as pool:
         assert list(pool.map(assign, range(4))) == [200] * 4
     assert db.query(Enrollment).filter(Enrollment.user_id == collaborator.id).count() == 1
+
+
+# ── Learning paths ────────────────────────────────────────────────────
+
+
+def _audience_with_profile(db, learners: int) -> tuple[int, list[int]]:
+    """A profile and `learners` active collaborators who have it."""
+    profile_id = db.execute(text("INSERT INTO job_profiles (name) VALUES ('Asesor') RETURNING id")).scalar()
+    db.execute(
+        text(
+            "INSERT INTO users (name, email, role, password_hash, is_active, profile_id) "
+            "SELECT 'p' || g, 'p' || g || '@x.test', 'collaborator', 'x', true, :p FROM generate_series(1, :n) g"
+        ),
+        {"p": profile_id, "n": learners},
+    )
+    db.commit()
+    return profile_id, [user_id for (user_id,) in db.execute(text("SELECT id FROM users WHERE email LIKE 'p%@x.test'"))]
+
+
+def _path_with(client, admin_headers, course_ids: list[int], **changes) -> dict:
+    path = client.post("/api/v1/paths", headers=admin_headers, json={"title": "Ruta"}).json()
+    client.put(f"/api/v1/paths/{path['id']}/courses", headers=admin_headers, json={"course_ids": course_ids})
+    if changes:
+        client.patch(f"/api/v1/paths/{path['id']}", headers=admin_headers, json=changes)
+    return path
+
+
+def test_a_path_reaches_many_people_in_a_few_statements(client, db, engine, admin, collaborator):
+    admin_headers = auth_headers(client, admin.email)
+    course_ids = [_course(client, admin_headers, collaborator, quiz=False)[0]["id"] for _ in range(3)]
+    profile_id, user_ids = _audience_with_profile(db, learners=300)
+    by_profile = _path_with(client, admin_headers, course_ids, profile_ids=[profile_id], settings={"due_days": 30})
+    by_hand = _path_with(client, admin_headers, course_ids, status="published")
+    counter = QueryCounter(engine)
+
+    with counter:
+        published = client.patch(f"/api/v1/paths/{by_profile['id']}", headers=admin_headers,
+                                 json={"status": "published"})
+    assert published.status_code == 200, published.text
+    publish_statements = counter.count
+    with counter:
+        assigned = client.post(f"/api/v1/paths/{by_hand['id']}/people", headers=admin_headers,
+                               json={"user_ids": user_ids})
+    assert assigned.status_code == 200 and len(assigned.json()) == 300
+    assign_statements = counter.count  # the response's progress of 300 people included
+
+    assert publish_statements <= 20 and assign_statements <= 20, (publish_statements, assign_statements)
+    assert _count(db, "SELECT count(*) FROM path_assignments WHERE source = 'profile' AND due_at IS NOT NULL") == 300
+    assert _count(db, "SELECT count(*) FROM path_assignments WHERE source = 'manual'") == 300
+    assert _count(db, "SELECT count(*) FROM enrollments e JOIN users u ON u.id = e.user_id "
+                      "WHERE u.email LIKE 'p%@x.test'") == 900
+
+
+def test_bulk_completion_completes_and_reopens_paths_in_a_few_statements(client, db, engine, admin, collaborator):
+    """An admin's module change completes (or reopens) a course for everyone at once: their paths follow, set-based."""
+    admin_headers = auth_headers(client, admin.email)
+    course, module_ids = _course(client, admin_headers, collaborator, modules=3)
+    _seed_audience(db, course["id"], module_ids, learners=300)  # the first two modules completed by everyone
+    learners = [user_id for (user_id,) in db.execute(text("SELECT id FROM users WHERE email LIKE 'u%@x.test'"))]
+    path = _path_with(client, admin_headers, [course["id"]], status="published")
+    client.post(f"/api/v1/paths/{path['id']}/people", headers=admin_headers, json={"user_ids": learners})
+    counter = QueryCounter(engine)
+
+    with counter:
+        assert client.delete(f"/api/v1/modules/{module_ids[-1]}", headers=admin_headers).status_code == 204
+    completing = counter.count
+    completed = _count(db, "SELECT count(*) FROM path_assignments WHERE completed_at IS NOT NULL")
+    with counter:
+        client.post(f"/api/v1/courses/{course['id']}/modules", headers=admin_headers, json={"title": "Nuevo"})
+    reopening = counter.count
+
+    assert completing <= 30 and reopening <= 30, (completing, reopening)
+    assert completed == 300
+    assert _count(db, "SELECT count(*) FROM path_assignments WHERE completed_at IS NOT NULL") == 0
+
+
+def test_path_deletes_respect_foreign_keys(client, db, admin, collaborator):
+    admin_headers = auth_headers(client, admin.email)
+    (course, _), (kept, _) = (_course(client, admin_headers, collaborator, quiz=False) for _ in range(2))
+    profile = client.post("/api/v1/profiles", headers=admin_headers, json={"name": "Asesor"}).json()
+    client.patch(f"/api/v1/users/{collaborator.id}", headers=admin_headers, json={"profile_id": profile["id"]})
+    path = _path_with(client, admin_headers, [course["id"], kept["id"]], status="published",
+                      profile_ids=[profile["id"]])
+    assert _count(db, "SELECT count(*) FROM path_assignments") == 1
+
+    assert client.delete(f"/api/v1/courses/{course['id']}", headers=admin_headers).status_code == 204
+    assert _count(db, "SELECT count(*) FROM learning_path_courses") == 1
+    assert client.delete(f"/api/v1/profiles/{profile['id']}", headers=admin_headers).status_code == 204
+    assert _count(db, "SELECT count(*) FROM users WHERE profile_id IS NOT NULL") == 0
+    assert _count(db, "SELECT count(*) FROM learning_path_profiles") == 0
+    assert _count(db, "SELECT count(*) FROM path_assignments") == 0  # given by the profile, not completed
+    client.post(f"/api/v1/paths/{path['id']}/people", headers=admin_headers, json={"user_ids": [collaborator.id]})
+    assert client.delete(f"/api/v1/paths/{path['id']}", headers=admin_headers).status_code == 204
+    for table in ("learning_paths", "learning_path_courses", "path_assignments"):
+        assert _count(db, f"SELECT count(*) FROM {table}") == 0
+    assert _count(db, f"SELECT count(*) FROM enrollments WHERE course_id = {kept['id']}") == 1  # kept
+
+
+def _paused_before_commit(call, paused: threading.Event, release: threading.Event):
+    """`call`, with every statement run and only its commit left until `release`."""
+
+    def run(session):
+        real_commit = session.commit
+
+        def commit_later():
+            paused.set()
+            release.wait(5)
+            real_commit()
+
+        session.commit = commit_later
+        call(session)
+
+    return run
+
+
+@pytest.mark.parametrize("first", ["path", "person"])
+@pytest.mark.parametrize("change", ["publish", "link"])
+def test_changing_a_path_while_giving_its_profile_assigns_it(
+    client, db, session_factory, admin, collaborator, change, first
+):
+    """The path published, or linked to the profile, while someone gets that profile: whichever request commits last
+    waited for the other one, and reads what it did."""
+    from app.api.routes import paths as path_routes
+    from app.api.routes import users as user_routes
+    from app.schemas.paths import PathUpdate
+    from app.schemas.users import UserUpdate
+
+    admin_headers = auth_headers(client, admin.email)
+    course, _ = _course(client, admin_headers, collaborator, quiz=False)
+    profile = client.post("/api/v1/profiles", headers=admin_headers, json={"name": "Asesor"}).json()
+    if change == "publish":
+        path = _path_with(client, admin_headers, [course["id"]], profile_ids=[profile["id"]])  # a draft
+        update = PathUpdate(status="published")
+    else:
+        path = _path_with(client, admin_headers, [course["id"]], status="published")
+        update = PathUpdate(profile_ids=[profile["id"]])
+    paused, release = threading.Event(), threading.Event()
+
+    def change_path(session):
+        path_routes.update_path(path["id"], update, db=session, admin=session.get(User, admin.id))
+
+    def give_profile(session):
+        user_routes.update_user(collaborator.id, UserUpdate(profile_id=profile["id"]), db=session,
+                                admin=session.get(User, admin.id))
+
+    one, two = (change_path, give_profile) if first == "path" else (give_profile, change_path)
+    errors = _race(session_factory, _paused_before_commit(one, paused, release), two, paused=paused, release=release)
+
+    assert not errors, errors
+    assert _count(db, f"SELECT count(*) FROM path_assignments WHERE user_id = {collaborator.id}") == 1
+
+
+def test_two_courses_of_a_path_completed_at_once_complete_it(client, db, session_factory, admin, collaborator):
+    """Two tabs: the second completion waits for the first one's, then stores and reports the completed path."""
+    from app.api.routes import learn
+    from app.schemas.paths import PathRef
+
+    admin_headers = auth_headers(client, admin.email)
+    (one, (first,)), (two, (second,)) = (_course(client, admin_headers, collaborator, quiz=False) for _ in range(2))
+    path = _path_with(client, admin_headers, [one["id"], two["id"]], status="published", settings={"sequential": False})
+    client.post(f"/api/v1/paths/{path['id']}/people", headers=admin_headers, json={"user_ids": [collaborator.id]})
+    paused, release = threading.Event(), threading.Event()
+    results = {}
+
+    def complete(module_id: int):
+        def run(session):
+            results[module_id] = learn.complete_module(module_id, db=session, user=session.get(User, collaborator.id))
+
+        return run
+
+    errors = _race(session_factory, _paused_before_commit(complete(first), paused, release), complete(second),
+                   paused=paused, release=release)
+
+    assert not errors, errors
+    assert _count(db, "SELECT count(*) FROM path_assignments WHERE completed_at IS NOT NULL") == 1
+    assert results[second].path_completed == PathRef(id=path["id"], title="Ruta")
+
+
+@pytest.mark.parametrize("change", ["profile", "path"])
+def test_a_course_completed_during_a_sync_never_deadlocks(
+    client, db, session_factory, admin, collaborator, monkeypatch, change
+):
+    """A sync writes enrollments before it locks assignments, the order of a learner completing a course (its
+    enrollment, then their assignments): one of the two waits, never both. The path completed meanwhile stays."""
+    from app.api.routes import learn
+    from app.api.routes import paths as path_routes
+    from app.api.routes import users as user_routes
+    from app.schemas.paths import PathSettings, PathUpdate
+    from app.schemas.users import UserUpdate
+    from app.services import paths
+
+    admin_headers = auth_headers(client, admin.email)
+    course, (module_id,) = _course(client, admin_headers, collaborator, quiz=False)
+    advisor, manager = (
+        client.post("/api/v1/profiles", headers=admin_headers, json={"name": name}).json() for name in ("A", "B")
+    )
+    client.patch(f"/api/v1/users/{collaborator.id}", headers=admin_headers, json={"profile_id": advisor["id"]})
+    path = _path_with(client, admin_headers, [course["id"]], status="published", profile_ids=[advisor["id"]])
+    _path_with(client, admin_headers, [course["id"]], status="published", profile_ids=[manager["id"]])
+    if change == "profile":  # loses the path, gets the other one: the same course in both
+        update = UserUpdate(profile_id=manager["id"])
+        sync = lambda s: user_routes.update_user(collaborator.id, update, db=s, admin=s.get(User, admin.id))  # noqa: E731
+    else:  # one more profile and a deadline, saved at once
+        update = PathUpdate(profile_ids=[advisor["id"], manager["id"]], settings=PathSettings(due_days=10))
+        sync = lambda s: path_routes.update_path(path["id"], update, db=s, admin=s.get(User, admin.id))  # noqa: E731
+    paused, release = threading.Event(), threading.Event()
+    ensure_enrollments = paths.ensure_enrollments
+
+    def slow_ensure_enrollments(*args, **kwargs):
+        paused.set()
+        release.wait(5)
+        ensure_enrollments(*args, **kwargs)
+
+    monkeypatch.setattr(paths, "ensure_enrollments", slow_ensure_enrollments)
+
+    errors = _race(
+        session_factory,
+        sync,
+        lambda s: learn.complete_module(module_id, db=s, user=s.get(User, collaborator.id)),
+        paused=paused,
+        release=release,
+    )
+
+    assert not errors, errors  # DeadlockDetected, locking the assignment before the enrollment
+    assert _count(db, f"SELECT count(*) FROM path_assignments WHERE path_id = {path['id']} "
+                      "AND completed_at IS NOT NULL") == 1

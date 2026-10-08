@@ -5,6 +5,8 @@ Modules unlock sequentially: a module is available once every previous module is
 A module with an evaluation is completed by passing it; a module without one is completed
 explicitly by the learner (after watching or reading it). Either way, a module with interactive
 activities also needs each of them played to the end (any score). This is the only place that decides.
+A course locked by a learning path (`paths`) opens no module until it unlocks; completing a course
+completes the learner's paths that were waiting for it.
 """
 
 from dataclasses import dataclass, field
@@ -15,7 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, contains_eager, selectinload
 
 from app.db.models import Activity, ActivityAttempt, Course, Enrollment, Evaluation, Module, ModuleProgress
-from app.services import quiz
+from app.services import paths, quiz
 from app.services.metrics import percentage
 
 
@@ -100,9 +102,11 @@ def activity_best_scores(db: Session, enrollment: Enrollment) -> dict[int, int]:
 
 
 def module_states(
-    db: Session, enrollment: Enrollment, evaluations: dict[int, Evaluation] | None = None
+    db: Session, enrollment: Enrollment, evaluations: dict[int, Evaluation] | None = None,
+    course_unlocked: bool = True,
 ) -> list[ModuleState]:
-    """`evaluations` (by module id) can be preloaded for many enrollments at once."""
+    """`evaluations` (by module id) can be preloaded for many enrollments at once. A course its learning path still
+    keeps locked (`course_unlocked` False) opens none of its modules, except those already completed."""
     modules = ordered_modules(enrollment.course)
     records = {record.module_id: record for record in enrollment.module_progress}
     if evaluations is None:
@@ -110,7 +114,7 @@ def module_states(
     activities = ready_activities(db, modules)
     best = activity_best_scores(db, enrollment) if activities else {}
     states: list[ModuleState] = []
-    unlocked = True
+    unlocked = course_unlocked
     for module in modules:
         record = records.get(module.id)
         # What the learner already completed stays open, even if a reorder put it after a pending module.
@@ -207,10 +211,13 @@ def refresh_enrollment(db: Session, enrollment: Enrollment) -> None:
     """
     db.flush()
     db.refresh(enrollment, with_for_update=True)
+    was_completed = enrollment.status == "completed"
     db.expire(enrollment.course, ["modules"])
     states = module_states(db, enrollment)
     done = sum(1 for state in states if state.completed)
     _apply_progress(enrollment, done, len(states), any(state.progress for state in states))
+    if (enrollment.status == "completed") != was_completed:  # the paths with this course follow
+        paths.refresh_completion(db, user_ids=[enrollment.user_id], course_ids=[enrollment.course_id])
 
 
 def refresh_course_enrollments(db: Session, course: Course) -> None:
@@ -239,6 +246,11 @@ def refresh_course_enrollments(db: Session, course: Course) -> None:
             .group_by(ModuleProgress.enrollment_id)
         )
         stats = {enrollment_id: (int(done or 0), True) for enrollment_id, done in rows}
+    completions_changed = False
     for enrollment in enrollments:
         done, started = stats.get(enrollment.id, (0, False))
+        was_completed = enrollment.status == "completed"
         _apply_progress(enrollment, done, len(module_ids), started)
+        completions_changed |= (enrollment.status == "completed") != was_completed
+    if completions_changed:  # the paths with this course follow, for everyone at once
+        paths.refresh_completion(db, course_ids=[course.id])

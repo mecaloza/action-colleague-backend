@@ -23,6 +23,10 @@ class User(Base):
     is_active: Mapped[bool | None] = mapped_column(default=True, server_default=true())
     hire_date: Mapped[date | None] = mapped_column(Date)
     created_at: Mapped[datetime | None] = mapped_column(DateTime, server_default=func.now())
+    # The person's role in the company: brings the learning paths linked to it.
+    profile_id: Mapped[int | None] = mapped_column(
+        ForeignKey("job_profiles.id", ondelete="SET NULL", name="fk_users_profile_id"), index=True
+    )
 
     enrollments = relationship("Enrollment", back_populates="user", foreign_keys="Enrollment.user_id")
 

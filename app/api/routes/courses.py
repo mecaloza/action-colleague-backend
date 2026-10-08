@@ -36,7 +36,7 @@ from app.schemas.courses import (
 )
 from app.schemas.learn import LearnerCourseDetail
 from app.schemas.media import PURPOSES_NEEDING_MODULE
-from app.services import legacy_data, progress, quiz
+from app.services import legacy_data, paths, progress, quiz
 from app.services.course_views import ACTIVE_GENERATION, course_counts, course_detail, course_summary, module_admin
 from app.services.learner_views import course_player_detail
 from app.services.media import MediaResolver, discard_assets
@@ -192,12 +192,15 @@ def delete_course(course_id: int, db: Session = Depends(get_db)):
     media += [asset_id for (asset_id,) in db.execute(select(MediaAsset.id).where(MediaAsset.course_id == course_id))]
     enrollment_ids = [row[0] for row in db.execute(select(Enrollment.id).where(Enrollment.course_id == course_id))]
     legacy_data.delete_certificates(db, enrollment_ids)
+    path_ids = paths.forget_course(db, course_id)
     _purge_modules(db, select(Module.id).where(Module.course_id == course_id))
     db.execute(delete(EvaluationAttempt).where(EvaluationAttempt.enrollment_id.in_(enrollment_ids)), execution_options=no_sync)
     db.execute(delete(ModuleProgress).where(ModuleProgress.enrollment_id.in_(enrollment_ids)), execution_options=no_sync)
     db.execute(delete(Enrollment).where(Enrollment.course_id == course_id), execution_options=no_sync)
     db.execute(delete(Module).where(Module.course_id == course_id), execution_options=no_sync)
     db.execute(delete(Course).where(Course.id == course_id), execution_options=no_sync)
+    if path_ids:  # the course they were waiting for is gone: some may be completed now
+        paths.refresh_completion(db, path_ids=path_ids)
     uploads, files = _drop_pending_jobs(db, Job.course_id == course_id)
     db.commit()
     _discard_quietly(db, media + uploads)  # its videos, documents, cover and materials, in storage too
@@ -239,6 +242,7 @@ def publish_course(course_id: int, db: Session = Depends(get_db)):
         )
     course.status = "published"
     course.published_at = course.published_at or datetime.now(timezone.utc)
+    paths.refresh_completion(db, course_ids=[course.id])  # one more course to complete in its paths
     db.commit()
     return course_detail(db, course)
 
@@ -248,6 +252,7 @@ def unpublish_course(course_id: int, db: Session = Depends(get_db)):
     """Back to draft (also restores an archived course). Learners stop seeing it."""
     course = course_or_404(db, course_id)
     course.status = "draft"
+    paths.refresh_completion(db, course_ids=[course.id])  # one fewer course to complete in its paths
     db.commit()
     return course_detail(db, course)
 
@@ -257,6 +262,7 @@ def archive_course(course_id: int, db: Session = Depends(get_db)):
     """Hide a course from learners and the default library view, keeping every result."""
     course = course_or_404(db, course_id)
     course.status = "archived"
+    paths.refresh_completion(db, course_ids=[course.id])
     db.commit()
     return course_detail(db, course)
 

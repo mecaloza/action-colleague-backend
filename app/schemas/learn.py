@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field, StrictBool
 
 from app.schemas.common import UtcDatetime
 from app.schemas.courses import MediaRef
+from app.schemas.paths import CoursePath, CourseRef, PathRef
 
 
 class LearnerCourse(BaseModel):
@@ -20,6 +21,10 @@ class LearnerCourse(BaseModel):
     total_duration_seconds: float = 0
     enrolled_at: UtcDatetime | None = None
     completed_at: UtcDatetime | None = None
+    # Learning paths: a course of a sequential path opens once the earlier ones are completed.
+    locked: bool = False
+    locked_by: CourseRef | None = None  # the course to complete first
+    path: CoursePath | None = None  # the first of the learner's paths with this course
 
 
 class QuizSummary(BaseModel):
@@ -79,6 +84,9 @@ class LearnerCourseDetail(BaseModel):
     course: LearnerCourseInfo
     enrollment: LearnerEnrollment | None = None
     modules: list[LearnerModule]
+    locked: bool = False  # by a learning path: no module opens until `locked_by` is completed
+    locked_by: CourseRef | None = None
+    path: CoursePath | None = None
 
 
 class LearnerQuiz(BaseModel):
@@ -132,7 +140,14 @@ class QuestionResult(BaseModel):
     expected: Any = None
 
 
-class AttemptResult(BaseModel):
+class PathOutcome(BaseModel):
+    """What completing a course opened in the learner's paths (null until the course is completed)."""
+
+    next_course: CourseRef | None = None  # the next course of its path, now available
+    path_completed: PathRef | None = None  # the path this course completed
+
+
+class AttemptResult(PathOutcome):
     score: float
     passed: bool
     correct: int
@@ -145,7 +160,7 @@ class AttemptResult(BaseModel):
     course_completed: bool
 
 
-class CompletionResult(BaseModel):
+class CompletionResult(PathOutcome):
     module_completed: bool
     next_module_id: int | None = None
     course_completed: bool
@@ -174,7 +189,7 @@ class ActivityMoveIn(BaseModel):
     move: dict[str, Any] = Field(max_length=8)
 
 
-class ActivityMoveOut(BaseModel):
+class ActivityMoveOut(PathOutcome):
     result: dict[str, Any]
     done: bool
     narration: dict[str, str]
@@ -185,7 +200,7 @@ class ActivityMoveOut(BaseModel):
     course_completed: bool | None = None
 
 
-class ActivityFinishOut(BaseModel):
+class ActivityFinishOut(PathOutcome):
     score: int
     max_score: int
     module_completed: bool

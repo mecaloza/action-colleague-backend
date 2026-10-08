@@ -226,7 +226,8 @@ def test_the_last_move_records_the_play_and_tells_what_it_completed(client, db, 
         finished = client.post(f"{API}/activity-attempts/{play['attempt_id']}/finish", headers=learner)
         assert finished.status_code == 200
         assert finished.json() == {"score": 2, "max_score": 10, "module_completed": True,
-                                   "next_module_id": quizzed.id, "course_completed": False}
+                                   "next_module_id": quizzed.id, "course_completed": False,
+                                   "next_course": None, "path_completed": None}
     assert _plays(db, activity.id)[0].finished_at == finished_at  # finished once
     fresh = _start(client, learner, activity.id)
     assert not fresh["resumed"] and fresh["view"]["step"] == 1 and fresh["view"]["score"] == 0

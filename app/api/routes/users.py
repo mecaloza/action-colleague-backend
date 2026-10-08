@@ -1,4 +1,4 @@
-"""Admin: team members (collaborators and admins) and each person's courses."""
+"""Admin: team members (collaborators and admins), their profile and each person's courses."""
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_
@@ -7,10 +7,11 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db, require_admin
 from app.api.lookups import user_or_404
 from app.core.security import hash_password
-from app.db.models import Enrollment, RefreshToken, User
+from app.db.models import Enrollment, JobProfile, RefreshToken, User
 from app.schemas.learn import LearnerCourse
+from app.schemas.profiles import ProfileRef
 from app.schemas.users import Role, UserCreate, UserRow, UserUpdate
-from app.services import progress
+from app.services import paths, progress
 from app.services.learner_views import learner_course
 
 router = APIRouter(prefix="/users", tags=["users"], dependencies=[Depends(require_admin)])
@@ -40,8 +41,17 @@ def _enrollment_counts(db: Session, user_ids: list[int]) -> dict[int, tuple[int,
     return {user_id: (enrolled, int(completed or 0)) for user_id, enrolled, completed in rows}
 
 
+def _profiles(db: Session, users: list[User]) -> dict[int, ProfileRef]:
+    ids = {user.profile_id for user in users if user.profile_id}
+    if not ids:
+        return {}
+    return {profile.id: ProfileRef(id=profile.id, name=profile.name)
+            for profile in db.query(JobProfile).filter(JobProfile.id.in_(ids))}
+
+
 def _rows(db: Session, users: list[User]) -> list[UserRow]:
     counts = _enrollment_counts(db, [user.id for user in users])
+    profiles = _profiles(db, users)
     rows = []
     for user in users:
         enrolled, completed = counts.get(user.id, (0, 0))
@@ -53,6 +63,7 @@ def _rows(db: Session, users: list[User]) -> list[UserRow]:
                 role=user.role,
                 position=user.position or "",
                 department=user.department or "",
+                profile=profiles.get(user.profile_id),
                 is_active=bool(user.is_active),
                 created_at=user.created_at,
                 enrolled_count=enrolled,
@@ -62,10 +73,16 @@ def _rows(db: Session, users: list[User]) -> list[UserRow]:
     return rows
 
 
+def _check_profile(db: Session, profile_id: int | None) -> None:
+    if profile_id is not None and db.get(JobProfile, profile_id) is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "El perfil no existe")
+
+
 @router.get("", response_model=list[UserRow])
 def list_users(
     q: str | None = Query(None, max_length=200),
     role: Role | None = None,
+    profile_id: int | None = None,
     include_inactive: bool = True,
     db: Session = Depends(get_db),
 ):
@@ -75,25 +92,32 @@ def list_users(
         query = query.filter(or_(User.name.ilike(pattern), User.email.ilike(pattern), User.department.ilike(pattern)))
     if role:
         query = query.filter(User.role == role)
+    if profile_id is not None:
+        query = query.filter(User.profile_id == profile_id)
     if not include_inactive:
         query = query.filter(User.is_active.is_(True))
     return _rows(db, query.order_by(func.lower(User.name), User.id).all())
 
 
 @router.post("", response_model=UserRow, status_code=status.HTTP_201_CREATED)
-def create_user(payload: UserCreate, db: Session = Depends(get_db)):
+def create_user(payload: UserCreate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
     if _email_taken(db, payload.email):
         raise HTTPException(status.HTTP_409_CONFLICT, "Ya existe una persona con ese correo")
+    _check_profile(db, payload.profile_id)
     user = User(
         name=payload.name.strip(),
         email=payload.email,
         role=payload.role,
         position=payload.position.strip(),
         department=payload.department.strip(),
+        profile_id=payload.profile_id,
         password_hash=hash_password(payload.password),
         is_active=True,
     )
     db.add(user)
+    db.flush()
+    if user.profile_id:
+        paths.sync_user(db, user, assigned_by=admin.id)  # the learning paths of their profile
     db.commit()
     return _rows(db, [user])[0]
 
@@ -101,12 +125,17 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)):
 @router.patch("/{user_id}", response_model=UserRow)
 def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
     user = user_or_404(db, user_id)
-    # Explicit nulls mean "no change": name, email, role and is_active can't be empty.
-    data = payload.model_dump(exclude_unset=True, exclude_none=True)
+    # Explicit nulls mean "no change": name, email, role and is_active can't be empty. A null profile removes it.
+    data = payload.model_dump(exclude_unset=True, exclude_none=True, exclude={"profile_id"})
     if user.id == admin.id and _demotes_self(data):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "No puedes desactivarte ni quitarte el rol de administrador")
     if "email" in data and _email_taken(db, data["email"], exclude_id=user.id):
         raise HTTPException(status.HTTP_409_CONFLICT, "Ya existe una persona con ese correo")
+    if "profile_id" in payload.model_fields_set:
+        _check_profile(db, payload.profile_id)
+        data["profile_id"] = payload.profile_id
+    # What decides the paths a person gets by profile: compared before and after the changes.
+    membership = (user.profile_id, user.role, bool(user.is_active))
     password = data.pop("password", None)
     if password:
         user.password_hash = hash_password(password)
@@ -117,14 +146,24 @@ def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db)
         db.query(RefreshToken).filter(RefreshToken.user_id == user.id).update(
             {RefreshToken.revoked: True}, synchronize_session=False
         )
+    if (user.profile_id, user.role, bool(user.is_active)) != membership:
+        db.flush()
+        paths.sync_user(db, user, assigned_by=admin.id)
     db.commit()
     return _rows(db, [user])[0]
 
 
 @router.get("/{user_id}/courses", response_model=list[LearnerCourse])
 def user_courses(user_id: int, db: Session = Depends(get_db)):
-    """A person's assigned courses and progress (drafts included, for the admin's view)."""
+    """A person's assigned courses and progress (drafts included, for the admin's view), locks as they see them."""
     user_or_404(db, user_id)
     enrollments = progress.user_enrollments(db, user_id)
     evaluations = progress.evaluations_by_module(db, [m for e in enrollments for m in e.course.modules])
-    return [learner_course(e, progress.module_states(db, e, evaluations)) for e in enrollments]
+    journey = paths.journey(db, user_id)
+    return [
+        learner_course(
+            e, progress.module_states(db, e, evaluations, course_unlocked=e.course_id not in journey.locked_by),
+            journey=journey,
+        )
+        for e in enrollments
+    ]

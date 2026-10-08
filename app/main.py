@@ -16,6 +16,8 @@ from app.api.routes import (
     learn,
     media,
     participants,
+    paths,
+    profiles,
     studio,
     users,
 )
@@ -38,6 +40,8 @@ ROUTERS = (
     media,
     studio,
     activities,
+    paths,
+    profiles,
 )
 
 
