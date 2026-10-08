@@ -15,6 +15,7 @@ load_dotenv()
 _DEFAULT_ENVIRONMENT = os.getenv("RAILWAY_ENVIRONMENT_NAME") or "development"
 _DEV_JWT_SECRET = "dev-only-insecure-secret-change-me-0123456789"
 _MIN_JWT_SECRET_LENGTH = 32
+_DEV_PUBLIC_API_URL, _DEV_PUBLIC_APP_URL = "http://localhost:8001/api/v1", "http://localhost:3001"
 
 
 class Settings(BaseSettings):
@@ -56,8 +57,11 @@ class Settings(BaseSettings):
     storage_backend: Literal["auto", "supabase", "local"] = "auto"
     media_bucket: str = "course-media"
     local_storage_dir: str = "./.storage"
-    # Public URL of this API, used to build local-storage links (development only).
-    public_api_url: str = "http://localhost:8001/api/v1"
+    # Public URL of this API: the certificates' PDF links and, in development, local-storage links. Required when
+    # deployed; empty in development: the local API.
+    public_api_url: str = ""
+    # Public URL of the web app: the certificates' verification page. Empty: the first CORS origin.
+    public_app_url: str = ""
 
     # Background jobs run inside the API process unless disabled (e.g. a separate worker service).
     worker_enabled: bool = True
@@ -115,8 +119,20 @@ class Settings(BaseSettings):
                     f"JWT_SECRET (or SECRET_KEY) must be set to at least {_MIN_JWT_SECRET_LENGTH} "
                     "characters outside local development"
                 )
+            # Certificates link their PDF (this API) and their verification page (the web app) for good: never to a
+            # developer's machine, as the defaults below (and the default CORS origins) would.
+            if not self.public_api_url:
+                raise ValueError("PUBLIC_API_URL must be set to this API's public URL outside local development")
+            if not self.public_app_url and "cors_origins" not in self.model_fields_set:
+                raise ValueError("PUBLIC_APP_URL (or CORS_ORIGINS) must be set outside local development")
         elif not self.jwt_secret:
             self.jwt_secret = _DEV_JWT_SECRET
+        self.public_api_url = self.public_api_url or _DEV_PUBLIC_API_URL
+        self.public_app_url = self.public_app_url or next(iter(self.cors_origin_list), _DEV_PUBLIC_APP_URL)
+        if self.is_deployed:
+            for name, url in (("PUBLIC_API_URL", self.public_api_url), ("PUBLIC_APP_URL", self.public_app_url)):
+                if not url.startswith(("https://", "http://")):
+                    raise ValueError(f"{name} must be an absolute URL (https://...) outside local development")
         return self
 
 

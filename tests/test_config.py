@@ -9,8 +9,10 @@ from app.core.logging import configure_logging
 
 @pytest.fixture(autouse=True)
 def real_providers(monkeypatch):
-    # The test suite runs with fake providers; these tests build production settings.
+    # The test suite runs with fake providers; these tests build production settings (with their public URLs).
     monkeypatch.setenv("USE_FAKE_PROVIDERS", "false")
+    monkeypatch.setenv("PUBLIC_API_URL", "https://api.test/api/v1")
+    monkeypatch.setenv("PUBLIC_APP_URL", "https://app.test")
 
 
 def test_production_requires_a_real_database(monkeypatch):
@@ -104,3 +106,52 @@ def test_fake_providers_are_refused_outside_local_development(monkeypatch):
     monkeypatch.setenv("USE_FAKE_PROVIDERS", "true")
     with pytest.raises(ValidationError, match="USE_FAKE_PROVIDERS"):
         Settings(environment="production", _env_file=None)
+
+
+def test_the_web_apps_url_defaults_to_the_first_cors_origin(monkeypatch):
+    # Certificates link their verification page there.
+    monkeypatch.setenv("CORS_ORIGINS", "https://app.test, https://preview.test")
+    monkeypatch.delenv("PUBLIC_APP_URL", raising=False)
+    assert Settings(_env_file=None).public_app_url == "https://app.test"
+    monkeypatch.setenv("PUBLIC_APP_URL", "https://verificar.test")
+    assert Settings(_env_file=None).public_app_url == "https://verificar.test"
+
+
+def test_development_links_to_the_local_api_and_app(monkeypatch):
+    for name in ("PUBLIC_API_URL", "PUBLIC_APP_URL", "CORS_ORIGINS"):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings(environment="development", _env_file=None)
+    assert (settings.public_api_url, settings.public_app_url) == ("http://localhost:8001/api/v1",
+                                                                  "http://localhost:3001")
+
+
+@pytest.mark.parametrize(("variables", "missing"), [
+    ({"PUBLIC_API_URL": None}, "PUBLIC_API_URL"),
+    ({"PUBLIC_APP_URL": None}, "PUBLIC_APP_URL"),  # nor CORS_ORIGINS: the default origins start with localhost
+    ({"PUBLIC_APP_URL": None, "CORS_ORIGINS": "*"}, "PUBLIC_APP_URL"),
+    ({"PUBLIC_API_URL": "api.test/api/v1"}, "PUBLIC_API_URL"),
+])
+def test_certificate_links_need_the_public_urls_when_deployed(monkeypatch, variables, missing):
+    # Certificates keep their PDF and verification links for good: a deploy without them must not start.
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@h:5432/db")
+    monkeypatch.setenv("JWT_SECRET", "y" * 40)
+    monkeypatch.delenv("CORS_ORIGINS", raising=False)
+    for name, value in variables.items():
+        if value is None:
+            monkeypatch.delenv(name)
+        else:
+            monkeypatch.setenv(name, value)
+    with pytest.raises(ValidationError, match=missing):
+        Settings(environment="production", _env_file=None)
+
+
+def test_a_deploy_may_link_the_web_app_through_its_cors_origin(monkeypatch):
+    # As the local demo does against production data: its own API and app, on this machine.
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@h:5432/db")
+    monkeypatch.setenv("JWT_SECRET", "y" * 40)
+    monkeypatch.setenv("PUBLIC_API_URL", "http://localhost:8030/api/v1")
+    monkeypatch.setenv("CORS_ORIGINS", "http://localhost:3030")
+    monkeypatch.delenv("PUBLIC_APP_URL")
+    settings = Settings(environment="production", _env_file=None)
+    assert (settings.public_api_url, settings.public_app_url) == ("http://localhost:8030/api/v1",
+                                                                  "http://localhost:3030")

@@ -11,7 +11,7 @@ from app.db.models import Enrollment, JobProfile, RefreshToken, User
 from app.schemas.learn import LearnerCourse
 from app.schemas.profiles import ProfileRef
 from app.schemas.users import Role, UserCreate, UserRow, UserUpdate
-from app.services import paths, progress
+from app.services import certificates, paths, progress
 from app.services.learner_views import learner_course
 
 router = APIRouter(prefix="/users", tags=["users"], dependencies=[Depends(require_admin)])
@@ -155,15 +155,17 @@ def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db)
 
 @router.get("/{user_id}/courses", response_model=list[LearnerCourse])
 def user_courses(user_id: int, db: Session = Depends(get_db)):
-    """A person's assigned courses and progress (drafts included, for the admin's view), locks as they see them."""
+    """A person's assigned courses and progress (drafts included, for the admin's view), locks as they see them, and
+    the certificates they earned."""
     user_or_404(db, user_id)
     enrollments = progress.user_enrollments(db, user_id)
     evaluations = progress.evaluations_by_module(db, [m for e in enrollments for m in e.course.modules])
     journey = paths.journey(db, user_id)
+    earned = certificates.learner_refs(db, user_id, course_ids=[e.course_id for e in enrollments]).courses
     return [
         learner_course(
             e, progress.module_states(db, e, evaluations, course_unlocked=e.course_id not in journey.locked_by),
-            journey=journey,
+            journey=journey, certificate=earned.get(e.course_id),
         )
         for e in enrollments
     ]

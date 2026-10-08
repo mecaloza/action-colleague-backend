@@ -249,7 +249,8 @@ def test_a_new_profile_brings_its_paths_and_takes_the_old_ones_unless_completed(
     learner = auth_headers(client, ana.email)
     client.put(f"{API}/learn/modules/{_modules(db, pending_course)[0].id}/position", headers=learner,
                json={"seconds": 30})
-    assert _complete(client, learner, db, done_course)["path_completed"] == {"id": done["id"], "title": "Hecha"}
+    completed = _complete(client, learner, db, done_course)["path_completed"]
+    assert (completed["id"], completed["title"]) == (done["id"], "Hecha")
 
     client.patch(f"{API}/users/{ana.id}", headers=admin_headers, json={"profile_id": manager["id"]})
 
@@ -504,8 +505,9 @@ def test_a_sequential_path_opens_its_courses_in_order(client, db, admin, admin_h
     assert not _my_courses(client, learner)[second.id]["locked"]
 
     finished_second = _complete(client, learner, db, second)
-    assert finished_second == {**finished_second, "course_completed": True, "next_course": None,
-                               "path_completed": {"id": path["id"], "title": "Ruta de asesores"}}
+    assert finished_second == {**finished_second, "course_completed": True, "next_course": None}
+    completed = finished_second["path_completed"]
+    assert (completed["id"], completed["title"]) == (path["id"], "Ruta de asesores")
     assert _assignments(db, ana) == {path["id"]: ("manual", True)}
 
 

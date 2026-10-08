@@ -49,6 +49,8 @@ class CourseSettings(BaseModel):
     animation: Literal["", "high"] = ""
     presenter: bool = True
     theme: Literal["dark", "light"] = "dark"
+    # A certificate on completion: True or False whatever the platform's parameter, None follows it.
+    certificate: bool | None = None
 
 
 class CourseCreate(BaseModel):
@@ -150,5 +152,6 @@ class EvaluationAdmin(BaseModel):
 
 class EvaluationPut(BaseModel):
     questions: list[dict[str, Any]] = Field(min_length=1, max_length=30)
-    max_attempts: int = Field(default=3, ge=1, le=20)
-    passing_score: int = Field(default=70, ge=1, le=100)
+    # Left out (or null): a new evaluation takes the platform's defaults, an existing one keeps its own.
+    max_attempts: int | None = Field(default=None, ge=1, le=20)
+    passing_score: int | None = Field(default=None, ge=1, le=100)

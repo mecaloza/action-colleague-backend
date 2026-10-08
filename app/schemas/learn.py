@@ -2,6 +2,7 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, Field, StrictBool
 
+from app.schemas.certificates import CertificateRef
 from app.schemas.common import UtcDatetime
 from app.schemas.courses import MediaRef
 from app.schemas.paths import CoursePath, CourseRef, PathRef
@@ -25,6 +26,7 @@ class LearnerCourse(BaseModel):
     locked: bool = False
     locked_by: CourseRef | None = None  # the course to complete first
     path: CoursePath | None = None  # the first of the learner's paths with this course
+    certificate: CertificateRef | None = None  # earned by completing it (not revoked)
 
 
 class QuizSummary(BaseModel):
@@ -87,6 +89,7 @@ class LearnerCourseDetail(BaseModel):
     locked: bool = False  # by a learning path: no module opens until `locked_by` is completed
     locked_by: CourseRef | None = None
     path: CoursePath | None = None
+    certificate: CertificateRef | None = None
 
 
 class LearnerQuiz(BaseModel):
@@ -140,11 +143,16 @@ class QuestionResult(BaseModel):
     expected: Any = None
 
 
-class PathOutcome(BaseModel):
-    """What completing a course opened in the learner's paths (null until the course is completed)."""
+class CompletedPath(PathRef):
+    certificate: CertificateRef | None = None  # the path's, when it gives one
 
+
+class PathOutcome(BaseModel):
+    """What completing a course earned and opened in the learner's paths (null until the course is completed)."""
+
+    certificate: CertificateRef | None = None  # the course's (when one was issued, now or before)
     next_course: CourseRef | None = None  # the next course of its path, now available
-    path_completed: PathRef | None = None  # the path this course completed
+    path_completed: CompletedPath | None = None  # the path this course completed
 
 
 class AttemptResult(PathOutcome):

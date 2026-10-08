@@ -153,8 +153,10 @@ def apply_outline(course_id: int, outline: CourseOutlineIn, db: Session = Depend
     """Approve the outline: sets the course's title and description and creates its modules."""
     course = course_or_404(db, course_id)
     _check_outline(outline)
-    # Locked: a double submit must not create the modules twice (both requests would see none).
-    db.refresh(course, with_for_update=True)
+    # Locked: a double submit must not create the modules twice (both requests would see none). NO KEY UPDATE: a
+    # learner completing the course meanwhile writes its certificate (a foreign key check on this row) holding their
+    # progress, which this change then waits for; FOR UPDATE would make both wait forever.
+    db.refresh(course, with_for_update={"key_share": True})
     if any(not studio.is_untouched_ai_module(module) for module in course.modules):
         raise HTTPException(
             status.HTTP_409_CONFLICT,

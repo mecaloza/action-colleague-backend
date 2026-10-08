@@ -7,7 +7,7 @@ from tests.conftest import auth_headers
 REMOVED_PREFIXES = (
     "/api/v1/communications",
     "/api/v1/documents",
-    "/api/v1/certificates",
+    # (/api/v1/certificates is back on purpose: certificates for completed courses and paths, a new table.)
     "/api/v1/series",
     # Replaced by /courses, /learn, /dashboard and /users in the course studio API.
     "/api/v1/enrollments",

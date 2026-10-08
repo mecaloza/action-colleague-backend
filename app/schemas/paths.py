@@ -2,6 +2,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.schemas.certificates import CertificateRef
 from app.schemas.common import UtcDatetime, required_text
 from app.schemas.profiles import ProfileRef
 
@@ -155,3 +156,4 @@ class LearnerPath(BaseModel):
     completed_at: UtcDatetime | None = None
     current_course_id: int | None = None  # the course to go on with
     steps: list[LearnerPathStep]  # its published courses, in order
+    certificate: CertificateRef | None = None  # earned by completing it (not revoked)

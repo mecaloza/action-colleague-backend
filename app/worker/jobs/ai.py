@@ -17,6 +17,7 @@ from app.core.config import get_settings
 from app.db.models import Course, Evaluation, Job, Module
 from app.schemas.courses import MAX_AUDIENCE_CHARS
 from app.schemas.studio import OutlineGenerate, QuizGenerate
+from app.services import settings as platform
 from app.services import studio
 from app.services.ai import designer
 from app.services.ai.llm import LLMError, get_llm
@@ -141,7 +142,9 @@ def draft_module(ctx: JobContext) -> dict:
         # Ready to produce the video; the storyboard can be reviewed and edited first.
         module.generation_status, module.generation_error = "pending", None
         if questions and module.evaluation is None:  # a quiz the admin already has is never overwritten
-            db.add(Evaluation(module_id=module.id, spec=questions))
+            defaults = platform.get_settings(db).evaluations
+            db.add(Evaluation(module_id=module.id, spec=questions, max_attempts=defaults.max_attempts,
+                              passing_score=defaults.passing_score))
         studio.queue_visuals(db, module)  # its infographics, ready to review with the script
         studio.queue_activities(db, module)  # then its activities, played on those infographics
         db.commit()

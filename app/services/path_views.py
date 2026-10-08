@@ -25,8 +25,9 @@ from app.schemas.paths import (
     PathRow,
     PersonStep,
 )
+from app.schemas.certificates import CertificateRef
 from app.schemas.profiles import ProfileRef
-from app.services import paths
+from app.services import certificates, paths
 from app.services.media import MediaResolver
 from app.services.metrics import percentage
 
@@ -189,7 +190,8 @@ def path_people(db: Session, path: LearningPath, user_ids: list[int] | None = No
     return people
 
 
-def _learner_path(path: paths.AssignedPath, journey: paths.Journey, media: MediaResolver, now: datetime) -> LearnerPath:
+def _learner_path(path: paths.AssignedPath, journey: paths.Journey, media: MediaResolver, now: datetime,
+                  certificate: CertificateRef | None) -> LearnerPath:
     steps = []
     for step in path.steps:
         done, total, pct = journey.module_progress(step.course_id)
@@ -218,14 +220,16 @@ def _learner_path(path: paths.AssignedPath, journey: paths.Journey, media: Media
         completed_at=journey.completed_at(path),
         current_course_id=current.course_id if current else None,
         steps=steps,
+        certificate=certificate,
     )
 
 
 def learner_paths(db: Session, user_id: int) -> list[LearnerPath]:
-    """The published paths assigned to the learner, oldest first."""
+    """The published paths assigned to the learner, oldest first, with the certificates they earned."""
     journey = paths.journey(db, user_id, modules=True)
     media = MediaResolver(db).prepare(
         extra_asset_ids=[step.cover_asset_id for path in journey.paths for step in path.steps]
     )
+    earned = certificates.learner_refs(db, user_id, path_ids=[path.id for path in journey.paths]).paths
     now = paths.utcnow()
-    return [_learner_path(path, journey, media, now) for path in journey.paths]
+    return [_learner_path(path, journey, media, now, earned.get(path.id)) for path in journey.paths]
