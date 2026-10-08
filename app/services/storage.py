@@ -54,6 +54,7 @@ class Storage(Protocol):
 
 
 LIST_PAGE_SIZE = 1000
+DELETE_BATCH = 1000  # Supabase's limit of objects deleted in one request
 
 
 class StorageError(RuntimeError):
@@ -197,10 +198,12 @@ class SupabaseStorage:
         }
 
     def delete(self, paths: list[str]) -> None:
-        if paths:  # a timeout must reach callers as StorageError too: they log it after committing
+        # Supabase deletes at most DELETE_BATCH objects per request (more fail the whole request). A timeout must
+        # reach callers as StorageError too: they log it after committing.
+        for start in range(0, len(paths), DELETE_BATCH):
             self._send(
                 "DELETE", f"{self.base}/object/{self.bucket}", "borrar archivos",
-                headers=self.headers, json={"prefixes": paths},
+                headers=self.headers, json={"prefixes": paths[start:start + DELETE_BATCH]},
             )
 
     def list_folder(self, folder: str) -> list[str]:

@@ -102,11 +102,13 @@ class ActivityChange(BaseModel):
 
 
 class RevisionImpact(BaseModel):
-    """What producing the video again takes after the change."""
+    """What producing the video again takes after the change: only what will be paid, what the module's earlier videos
+    didn't leave (a scene that says the same in the same voice keeps its speech; a take whose scenes all keep theirs is
+    kept whole). A module whose video was made before speech was kept narrates every scene once more."""
 
-    narration_scenes: list[str] = Field(default_factory=list)  # scenes narrated again
+    narration_scenes: list[str] = Field(default_factory=list)  # scenes narrated anew (their speech isn't kept)
     narration_chars: int = 0  # their characters
-    presenter_takes: int = 0  # presenter takes recorded again
+    presenter_takes: int = 0  # presenter takes recorded anew (not kept from an earlier video)
     reassigns_presenters: bool = False  # a scene added or removed swaps the presenters of the ones after it
     visuals_to_make: int = 0  # infographics, images or clips to make
     needs_render: bool = False  # the module has a video and its scenes changed

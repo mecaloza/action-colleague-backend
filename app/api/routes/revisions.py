@@ -89,12 +89,26 @@ def _learners(db: Session, revision: ModuleRevision) -> RevisionLearners | None:
                             mid_play=activity_revisions.learners_mid_play(db, activity))
 
 
+def _changes_now(db: Session, revision: ModuleRevision) -> dict | None:
+    """The revision's changes; while a script's is proposed, with what producing the video again takes told as of now:
+    the module's video, what its videos keep and the course's voice and presenter can change after it was proposed
+    (its video produced meanwhile keeps every scene's speech)."""
+    changes = revision.changes
+    if revision.target != "script" or revision.status != "proposed" or not changes or not revision.after:
+        return changes
+    module = db.get(Module, revision.module_id)
+    if module is None:
+        return changes
+    return {**changes, "impact": revisions.impact(revision.before, revision.after, revisions.Production.of(module))}
+
+
 def _revision_out(db: Session, revision: ModuleRevision) -> Revision:
     author = db.get(User, revision.created_by) if revision.created_by else None
     return Revision(
         **_summary_fields(revision, author.name if author else None),
         scope=RevisionScope.model_validate(revision.scope or {}), unresolved=revision.unresolved or "",
-        changes=revision.changes, error=revision.error, job_id=revision.job_id, learners=_learners(db, revision),
+        changes=_changes_now(db, revision), error=revision.error, job_id=revision.job_id,
+        learners=_learners(db, revision),
     )
 
 

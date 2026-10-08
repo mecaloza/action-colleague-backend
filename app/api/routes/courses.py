@@ -49,6 +49,7 @@ from app.services.course_views import (
 from app.services.learner_views import course_player_detail
 from app.services.media import MediaResolver, discard_assets
 from app.services.storage import StorageError, get_storage
+from app.services.video import cache as video_cache
 from app.worker.jobs import render as render_jobs
 from app.worker.jobs.recording import LEGACY_VIDEO_JOB
 
@@ -215,17 +216,21 @@ def delete_course(course_id: int, db: Session = Depends(get_db)):
     uploads, files = _drop_pending_jobs(db, Job.course_id == course_id)
     db.commit()
     _discard_quietly(db, media + uploads)  # its videos, documents, cover and materials, in storage too
-    _delete_files_quietly(files + _cached_visuals(course_id))
+    _delete_files_quietly(files + _kept_for_videos(course_id))
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-def _cached_visuals(course_id: int) -> list[str]:
-    """The stock videos, images and clips its videos were made with (made from its content: they go too)."""
-    try:
-        return get_storage().list_folder(f"courses/{course_id}/visuals")
-    except StorageError as exc:
-        logger.warning("visuals_listing_failed", extra={"course_id": course_id, "error": str(exc)[:300]})
-        return []
+def _kept_for_videos(course_id: int) -> list[str]:
+    """What its videos were made with and kept for the next ones: the stock videos, images and clips, each scene's
+    speech and the presenter's takes (made from its content: they go too)."""
+    files = []
+    for folder in video_cache.course_folders(course_id):
+        try:
+            files += get_storage().list_folder(folder)
+        except StorageError as exc:
+            logger.warning("video_cache_listing_failed",
+                           extra={"course_id": course_id, "folder": folder, "error": str(exc)[:300]})
+    return files
 
 
 def _publish_problems(db: Session, course: Course) -> list[dict]:

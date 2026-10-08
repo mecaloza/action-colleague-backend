@@ -11,6 +11,7 @@ import pytest
 from pydantic import Field
 
 from app.api.routes import studio as studio_routes
+from app.core.config import get_settings
 from app.db.models import Course, Evaluation, Job, MediaAsset, Module, ModuleRevision
 from app.schemas.studio import StoryboardScene
 from app.services import revisions
@@ -19,6 +20,7 @@ from app.services.ai.fake import FakeLLM
 from app.services.ai.llm import LLMError, OpenAILLM
 from app.services.revisions import Production
 from app.services.slides.spec import SceneVisual, Slide
+from app.services.video import cache as video_cache
 from app.worker import queue
 from tests.conftest import auth_headers
 
@@ -38,7 +40,25 @@ SCENES = [
 READING = "### Presión\n\n- Mide en frío"
 OUTLINE = {"title": "Presión", "summary": "Medir la presión", "objectives": ["Medir bien"], "key_points": ["En frío"],
            "estimated_minutes": 3, "include_quiz": True}
-RENDER = {"job_id": "render-anterior", "voice_id": "fake-voice-es", "avatar_id": "", "warning": None}
+
+
+def _video_cache(scenes: list[dict], production: Production) -> dict:
+    """What a video of `scenes` leaves for the next one (`storyboard.render.cache`): each scene's speech and the
+    presenter's takes over it."""
+    keys = production.narration_keys(scenes)
+    digests = [f"clip-{key}" for key in keys]
+    return video_cache.record(None, dict(zip(keys, digests)), list(filter(None, production.take_keys(scenes, digests))))
+
+
+def _after_video(production: Production, scenes: list[dict]) -> Production:
+    """The same production once a video of `scenes` was made."""
+    return Production(production.presenters, production.has_video, production.voices, production.avatars,
+                      production.engine, video_cache.Kept(_video_cache(scenes, production)))
+
+
+# The course's voice (none chosen: the server's), without a presenter: as the module's last video was made.
+RENDER = {"job_id": "render-anterior", "voice_id": "fake-voice-es", "avatar_id": "", "warning": None,
+          "cache": _video_cache(SCENES, Production(0, False, (get_settings().elevenlabs_voice_id,)))}
 EMPTY_IMPACT = {"narration_scenes": [], "narration_chars": 0, "presenter_takes": 0, "reassigns_presenters": False,
                 "visuals_to_make": 0, "needs_render": False}
 
@@ -694,7 +714,7 @@ def test_visuals_change_only_as_asked_and_within_the_clip_budget():
 
 
 def test_scenes_added_and_removed_and_who_presents_them():
-    two = Production(presenters=2, has_video=True)
+    two = _after_video(Production(presenters=2, has_video=True), SCENES)
     proposal = _propose(_change(action="insert_after", scene_id="s1", fields=[], title="Nueva", narration="Hola."),
                         _change(action="delete", scene_id="s4", fields=[]), production=two)
 
