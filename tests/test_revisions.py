@@ -449,7 +449,8 @@ def test_what_can_be_revised(client, db, admin, admin_headers, module):
     assert client.post(url, headers=admin_headers, json={"observation": "   "}).status_code == 422
     unknown = client.post(url, headers=admin_headers, json={"observation": "Más claro", "scene_ids": ["s9"]})
     assert unknown.status_code == 422
-    assert client.post(url, headers=admin_headers, json={"observation": "x", "target": "quiz"}).status_code == 422
+    without_quiz = client.post(url, headers=admin_headers, json={"observation": "x", "target": "quiz"})
+    assert without_quiz.status_code == 422 and without_quiz.json()["detail"] == "«Presión» no tiene evaluación todavía"
     queue.enqueue(db, "ai.module_draft", {"module_id": module.id}, module_id=module.id, dedupe_key=f"draft:{module.id}")
     assert client.post(url, headers=admin_headers, json={"observation": "Más claro"}).status_code == 409
 
@@ -773,7 +774,7 @@ def test_three_way_rebases_by_scene_and_names_what_conflicts():
     current["scenes"][2]["narration"] = "Editada"  # now otherwise
     with pytest.raises(revisions.Conflict) as conflict:
         revisions.three_way(current, base, {**target, "reading": "Lectura nueva"})
-    assert conflict.value.scene_ids == ["s2"] and conflict.value.reading is True
+    assert conflict.value.ids == ["s2"] and conflict.value.reading is True
 
     moved = {**base, "scenes": [base["scenes"][3], *base["scenes"][:3]]}  # the closing moved first
     assert [s["id"] for s in revisions.three_way(current, base, moved)["scenes"]] == ["s4", "s8", "s1", "s2", "s3"]

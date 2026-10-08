@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from app.db.models import Activity, MediaAsset, Module
 from app.core.config import get_settings
 from app.services import activities as engine
-from app.services import studio
+from app.services import revisions, studio
 from app.services.ai import designer
 from app.services.ai.llm import get_llm
 from app.services.media import discard_assets
@@ -61,8 +61,16 @@ def draft_activities(ctx: JobContext) -> dict:
         module = db.get(Module, ctx.module_id)
         if module is None:
             return {"skipped": "module deleted"}
-        replaced = [a for a in module.activities if a.source == "ai" and a.status == "draft"]  # untouched proposals
+        # The untouched proposals, held before their changes go (as applying one holds the activity first) and read
+        # again: one the admin took over meanwhile (edited or published) stays.
+        untouched = [a.id for a in module.activities if a.source == "ai" and a.status == "draft"]
+        held = (
+            db.query(Activity).filter(Activity.id.in_(untouched)).order_by(Activity.id)
+            .populate_existing().with_for_update().all() if untouched else []
+        )
+        replaced = [a for a in held if a.source == "ai" and a.status == "draft"]
         clips = [clip.get("asset_id") for activity in replaced for clip in (activity.narration or {}).values()]
+        revisions.forget_activities(db, [activity.id for activity in replaced])
         for activity in replaced:
             db.delete(activity)
         db.flush()

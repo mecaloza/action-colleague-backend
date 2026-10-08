@@ -37,8 +37,7 @@ from app.schemas.courses import (
 )
 from app.schemas.learn import LearnerCourseDetail
 from app.schemas.media import PURPOSES_NEEDING_MODULE
-from app.services import certificates, legacy_data, paths, progress, quiz, revisions
-from app.services import settings as platform
+from app.services import certificates, legacy_data, paths, progress, quiz, quiz_revisions, revisions
 from app.services.course_views import (
     ACTIVE_GENERATION,
     course_counts,
@@ -392,25 +391,27 @@ def get_evaluation(module_id: int, db: Session = Depends(get_db)):
 
 
 @router.put("/modules/{module_id}/evaluation", response_model=EvaluationAdmin)
-def put_evaluation(module_id: int, payload: EvaluationPut, db: Session = Depends(get_db)):
+def put_evaluation(
+    module_id: int, payload: EvaluationPut, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+):
     module = module_or_404(db, module_id)
     try:
         questions = quiz.validate_questions(payload.questions)
     except quiz.InvalidQuestions as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
-    evaluation = module.evaluation
-    if evaluation is None:  # a new one starts with the platform's defaults; an existing one keeps what it had
-        defaults = platform.get_settings(db).evaluations
-        evaluation = Evaluation(
-            module_id=module.id, max_attempts=defaults.max_attempts, passing_score=defaults.passing_score
-        )
-    evaluation.spec = quiz.dump_questions(questions)
-    evaluation.questions_json = "[]"  # the previous format is superseded by the spec
+    # One change to the quiz at a time: each is kept as a change of its own (nothing when the save changed nothing),
+    # so it can be undone. NO KEY UPDATE: learners' progress and quiz attempts still reference the module.
+    db.refresh(module, with_for_update={"key_share": True})
+    before = quiz_revisions.content(module)
+    # A new quiz starts with the platform's defaults; an existing one keeps what it had (its previous format, if the
+    # old app's, is superseded by the spec).
+    evaluation = quiz_revisions.write(db, module, questions)
     if payload.max_attempts is not None:
         evaluation.max_attempts = payload.max_attempts
     if payload.passing_score is not None:
         evaluation.passing_score = payload.passing_score
-    db.add(evaluation)
+    quiz_revisions.record(db, module, source="manual", before=before,
+                          after={"questions": quiz.dump_questions(questions)}, user_id=admin.id)
     db.commit()
     return _evaluation_admin(evaluation)
 
@@ -419,6 +420,8 @@ def put_evaluation(module_id: int, payload: EvaluationPut, db: Session = Depends
 def delete_evaluation(module_id: int, db: Session = Depends(get_db)):
     """Removes the quiz and its attempts; learners then complete the module by viewing it."""
     module = module_or_404(db, module_id)
+    # As every change to the quiz (a save, applying or undoing one): one at a time, never deleting it under another.
+    db.refresh(module, with_for_update={"key_share": True})
     if module.evaluation:
         db.delete(module.evaluation)
         # Its attempts are gone: a future quiz must not start "exhausted" or "already passed".
@@ -426,5 +429,6 @@ def delete_evaluation(module_id: int, db: Session = Depends(get_db)):
             update(ModuleProgress).where(ModuleProgress.module_id == module.id).values(attempts=0, passed=False, score=None),
             execution_options={"synchronize_session": False},
         )
+        revisions.supersede(db, module.id, target="quiz")  # the changes proposed to it have nothing to apply to
         db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

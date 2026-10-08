@@ -409,12 +409,20 @@ def close(attempt: ActivityAttempt, now: datetime | None = None) -> None:
 
 
 def resumable(activity: Activity, attempt: ActivityAttempt, now: datetime | None = None) -> bool:
-    """Whether an open play can go on: started on the current version, not over yet and, a quick challenge with a
-    clock, still on it. The deadline is the one `finish` goes by, without the grace a late move gets: a game whose
-    time is up never comes back already lost. Any other open play is stale."""
-    if attempt.finished_at is not None or attempt.version != activity.version or attempt.state["done"]:
+    """Whether an open play can go on: started on the current version and its game still on (`going_on`). Any other
+    open play is stale."""
+    if attempt.finished_at is not None or attempt.version != activity.version:
         return False
-    deadline = _deadline(attempt.state)
+    return going_on(attempt.state, now)
+
+
+def going_on(state: dict, now: datetime | None = None) -> bool:
+    """Whether a play's game is still on: not over yet and, a quick challenge with a clock, still on it. The deadline
+    is the one `finish` goes by, without the grace a late move gets: a game whose time is up never comes back already
+    lost."""
+    if state["done"]:
+        return False
+    deadline = _deadline(state)
     return deadline is None or (now or utcnow()) <= deadline
 
 
