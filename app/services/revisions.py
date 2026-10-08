@@ -20,7 +20,7 @@ import re
 import uuid
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -28,11 +28,13 @@ from pydantic import ValidationError
 from sqlalchemy import delete, update
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.db.models import Job, Module, ModuleRevision
 from app.schemas.studio import Storyboard, StoryboardScene
 from app.services.ai import designer
 from app.services.ai.designer import MAX_NARRATION_CHARS, MAX_STORYBOARD_SCENES, SceneChangeDraft, StoryboardPatchDraft
 from app.services.slides.spec import SceneVisual
+from app.services.video import cache as video_cache
 from app.services.video.avatar import get_avatar_provider
 from app.services.video.visuals import scene_request
 
@@ -340,29 +342,56 @@ def scene_changes(before: list[dict], after: list[dict], reasons: dict[str, str]
 
 @dataclass(frozen=True)
 class Production:
-    """How the module's next video is made, as far as what a change costs."""
+    """How the module's next video is made, as far as what a change costs: who says and who presents each scene (as
+    the render assigns them, from the course's choices) and what the module's earlier videos left for the next one."""
 
     presenters: int  # 0 (none), 1, or 2 taking turns scene by scene (see render.scene_speakers)
     has_video: bool
+    voices: tuple[str, ...] = ("",)  # the voice of each who speaks: one, or two taking turns scene by scene
+    avatars: tuple[str, ...] = ()  # each presenter's avatar
+    engine: str = ""  # HeyGen's
+    kept: video_cache.Kept = field(default_factory=video_cache.Kept)  # nothing, unless a video left it
 
     @classmethod
     def of(cls, module: Module) -> "Production":
-        settings = module.course.settings or {}
+        settings = module.course.settings or {}  # what its next render is asked with (studio._render_choices)
+        presenter, avatar = settings.get("presenter", True), settings.get("avatar_id") or ""
+        co_avatar = settings.get("co_avatar_id") or ""
+        voice = settings.get("voice_id") or get_settings().elevenlabs_voice_id
+        # Two presenters chosen take turns in the voices even when none can be recorded, as the render does.
+        voices = (voice, settings.get("co_voice_id") or voice) if presenter and avatar and co_avatar else (voice,)
         presenters = 0
-        if settings.get("presenter", True) and settings.get("avatar_id") and get_avatar_provider() is not None:
-            presenters = 2 if settings.get("co_avatar_id") else 1
-        return cls(presenters, bool(module.video_asset_id or module.video_url))
+        if presenter and avatar and get_avatar_provider() is not None:
+            presenters = 2 if co_avatar else 1
+        return cls(
+            presenters, bool(module.video_asset_id or module.video_url), voices, (avatar, co_avatar)[:presenters],
+            settings.get("avatar_engine") or get_settings().heygen_engine,
+            video_cache.Kept(((module.storyboard or {}).get("render") or {}).get("cache")),
+        )
 
+    def narration_keys(self, scenes: list[dict]) -> list[str]:
+        """Each scene's speech as it is kept (video.cache.narration_key), in the voice that says it."""
+        speakers = video_cache.scene_speakers(len(scenes), len(self.voices) == 2)
+        return [
+            video_cache.narration_key(self.voices[speaker], scene.get("narration") or "")
+            for scene, speaker in zip(scenes, speakers)
+        ]
 
-def _takes(scenes: list[dict], production: Production) -> list[tuple[str, ...]]:
-    """Each presenter's take as it is recorded: the narration of the scenes it presents, in order."""
-    if not production.presenters:
-        return []
-    speakers = [index % 2 if production.presenters == 2 else 0 for index in range(len(scenes))]
-    return [
-        tuple(scene.get("narration") or "" for scene, speaker in zip(scenes, speakers) if speaker == take)
-        for take in sorted(set(speakers))
-    ]
+    def take_keys(self, scenes: list[dict], digests: list[str | None]) -> list[str | None]:
+        """Each presenter's take of a video of `scenes` (video.cache.take_key), from the speech clip of each scene (its
+        digest); None for a take with a scene narrated anew (no clip yet: a new take, whatever it holds)."""
+        speakers = video_cache.scene_speakers(len(scenes), self.presenters == 2)
+        roles = video_cache.scene_roles(len(scenes))
+        keys: list[str | None] = []
+        for presenter in sorted(set(speakers)) if self.presenters else []:
+            indexes = [index for index, speaker in enumerate(speakers) if speaker == presenter]
+            clips = [digests[index] for index in indexes]
+            if not all(clips):
+                keys.append(None)
+                continue
+            avatar = self.avatars[presenter] if presenter < len(self.avatars) else ""
+            keys.append(video_cache.take_key(avatar, self.engine, zip(clips, (roles[index] for index in indexes))))
+        return keys
 
 
 def _reassigns(before: list[dict], after: list[dict], production: Production) -> bool:
@@ -386,19 +415,19 @@ def _reordered_or_changed(before: list[dict], after: list[dict]) -> bool:
 
 
 def impact(before: dict, after: dict, production: Production) -> dict:
-    """What producing the video again takes after the change: the scenes narrated again (and their characters), the
-    presenter's takes recorded again, whether scenes go to the other presenter, the pictures to make, and whether
-    the video must be produced again at all (it has one, and its scenes changed)."""
+    """What producing the video again takes after the change, and only what will be paid: the scenes narrated anew
+    (and their characters) and the presenter's takes recorded anew, those the module's earlier videos didn't leave
+    (video.cache: a scene that says the same in the same voice keeps its speech, a take whose scenes all keep theirs
+    is kept whole); then whether scenes go to the other presenter, the pictures to make, and whether the video must be
+    produced again at all (it has one, and its scenes changed)."""
     old, new = before["scenes"], after["scenes"]
-    narrations = {scene.get("id"): scene.get("narration") or "" for scene in old}
-    narrated = [scene for scene in new if narrations.get(scene.get("id")) != (scene.get("narration") or "")]
-    old_takes, new_takes = _takes(old, production), _takes(new, production)
+    digests = [production.kept.clip(key) for key in production.narration_keys(new)]
+    narrated = [scene for scene, digest in zip(new, digests) if digest is None]
+    takes = production.take_keys(new, digests)
     return {
         "narration_scenes": [scene.get("id") for scene in narrated],
         "narration_chars": sum(len(scene.get("narration") or "") for scene in narrated),
-        "presenter_takes": sum(
-            1 for index, take in enumerate(new_takes) if index >= len(old_takes) or old_takes[index] != take
-        ),
+        "presenter_takes": sum(1 for key in takes if key is None or key not in production.kept.takes),
         "reassigns_presenters": _reassigns(old, new, production),
         "visuals_to_make": len(_made_visuals(new) - _made_visuals(old)),
         "needs_render": production.has_video and _reordered_or_changed(old, new),

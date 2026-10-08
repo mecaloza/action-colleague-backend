@@ -281,7 +281,7 @@ def test_a_storage_failure_after_heygen_finished_keeps_the_presenter(
     upload_file, failed = type(storage).upload_file, []
 
     def flaky_upload(self, path, file_path, content_type):
-        if path.endswith("/heygen.mp4") and not failed:  # the presenter HeyGen made
+        if "/presenter/" in path and not failed:  # the presenter HeyGen made, kept for the next videos
             failed.append(path)
             raise StorageError("Storage no pudo subir el archivo (sin conexión)")
         return upload_file(self, path, file_path, content_type)
@@ -409,6 +409,9 @@ def test_a_presenter_clip_ffmpeg_cannot_use_drops_only_the_bubble(
     render = _module_render(db, ai_module.id)
     assert db.get(Module, ai_module.id).generation_status == "completed"
     assert render["avatar_id"] == "" and "sin presentador" in render["warning"]
+    # A take FFmpeg can't use is not kept for the next video: that one asks HeyGen again.
+    assert render["cache"]["takes"] == [] and not list((storage.root / storage.bucket).rglob("presenter/*"))
+    assert len(render["cache"]["clips"]) == len(THREE_SCENES)  # the speech is fine: kept
 
 
 def test_a_copy_left_by_a_failed_publish_is_deleted_by_the_next_run(

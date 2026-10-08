@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 API = "https://api.heygen.com"
 MAX_ASSET_BYTES = 32 * 1024 * 1024  # HeyGen's upload limit; bigger narrations go by URL
+PRESENTER_BACKGROUND = "#1D1D1D"  # behind the avatar, inside the bubble the composer crops
 CHUNK_BYTES = 1024 * 1024  # when downloading a file
 REQUEST_TIMEOUT_SECONDS = 60
 TRANSFER_TIMEOUT_SECONDS = 600  # uploading the narration, downloading the finished video

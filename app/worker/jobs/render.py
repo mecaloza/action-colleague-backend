@@ -11,6 +11,11 @@ Phases (the state is saved between them, so a restart or a wait resumes where it
                  presenter large on the cover and the closing and in a bubble in between -> MP4,
                  poster and WebVTT; attached to the module, replacing its previous video.
 
+Producing a video again pays only for what changed (see `video.cache`): a scene's speech is kept by
+what it says and in which voice, and a presenter's take by the speech it lip-syncs, so a change to
+the slides or the visuals only recomposes, and a scene narrated anew records only its presenter's
+take again. Both stay after publishing; only this job's own intermediate files are deleted.
+
 The first run freezes what it renders (scenes, voice, presenter and look) in the state, so a retry
 or a wait never mixes two voices or pairs slides with another script's audio. Only the worker that
 still holds the job publishes, into a folder of its own, and only while the module is still an AI
@@ -19,6 +24,7 @@ module: a video the admin uploads meanwhile wins.
 Progress goes 5-48% while narrating, 50-70% with the presenter and 75-95% composing.
 """
 
+import json
 import logging
 import tempfile
 import time
@@ -41,10 +47,17 @@ from app.services.slides.render import beat_count, is_hero
 from app.services.slides.render import render as render_slide
 from app.services.slides.spec import Slide, SlideContext
 from app.services.storage import StorageError, get_storage
+from app.services.video import cache as video_cache
 from app.services.video import captions, compose, motion
-from app.services.video.avatar import MAX_ASSET_BYTES, AvatarError, AvatarProvider, get_avatar_provider
+from app.services.video.avatar import (
+    MAX_ASSET_BYTES,
+    PRESENTER_BACKGROUND,
+    AvatarError,
+    AvatarProvider,
+    get_avatar_provider,
+)
 from app.services.video.visuals import VisualError, VisualRequest, cache_path, get_visuals, scene_prompt
-from app.services.video.voice import VoiceError, get_voice_provider
+from app.services.video.voice import Speech, VoiceError, get_voice_provider
 from app.worker import queue
 from app.worker.runner import JobCancelled, JobContext, JobError, Reschedule, handler, holds_job, open_session
 
@@ -57,7 +70,6 @@ VISUAL_MIME = {".mp4": "video/mp4", ".png": "image/png"}
 MAX_PRESENTER_WAIT_SECONDS = 45 * 60  # at least: a long narration gets PRESENTER_WAIT_FACTOR times its length
 PRESENTER_WAIT_FACTOR = 3
 MAX_PRESENTER_ERRORS = 5
-PRESENTER_BACKGROUND = "#1D1D1D"
 MAX_LOG_ERROR_CHARS = 800  # of an FFmpeg error kept in the log line
 MEDIA_ERROR = "No pudimos procesar el audio o el video. Intenta de nuevo; si sigue fallando, revisa el guion."
 FRAMES_PER_PROGRESS = 100  # animation frames drawn between two progress reports
@@ -98,11 +110,13 @@ def _delete_files(paths: list[str], module_id: int | None) -> None:
 
 
 def intermediate_paths(state: dict | None) -> list[str]:
-    """The files a render's phases hand to each other, as its job state records them."""
+    """The files a render's phases hand to each other, as its job state records them. Never those kept for the next
+    videos, which the state names too (each scene's speech, the presenter's takes: see `video.cache`)."""
     state = state or {}
     paths = [scene["path"] for scene in (state.get("narration") or {}).values() if scene.get("path")]
     paths += [state[key] for key in INTERMEDIATE_KEYS if state.get(key)] + list(state.get("take_paths") or [])
-    return list(dict.fromkeys(paths))  # each once (a lone presenter's clip is also the video's presenter)
+    # Each once (a lone presenter's clip is also the video's presenter).
+    return [path for path in dict.fromkeys(paths) if not video_cache.is_kept(path)]
 
 
 def leftover_paths(state: dict | None) -> list[str]:
@@ -198,7 +212,7 @@ def _local_copy(work: Path, name: str, storage_path: str) -> Path:
 def scene_speakers(render: RenderInput) -> list[int]:
     """Who presents each scene: 0, or with a second presenter 0 and 1 taking turns (the first opens)."""
     two = render.presenter and bool(render.avatar_id and render.co_avatar_id)
-    return [index % 2 if two else 0 for index in range(len(render.scenes))]
+    return video_cache.scene_speakers(len(render.scenes), two)
 
 
 def _scene_voices(render: RenderInput) -> list[str]:
@@ -211,9 +225,14 @@ def _scene_file(index: int) -> str:
     return f"scene_{index:02d}.mp3"
 
 
+def _timings_file(index: int) -> str:
+    return f"scene_{index:02d}.json"
+
+
 def _speak_scenes(ctx: JobContext, render: RenderInput, work: Path) -> None:
-    """Narrate the scenes not done yet; the state remembers the finished ones across restarts."""
-    storage, voice = get_storage(), get_voice_provider()
+    """Have every scene's speech in storage: the one an earlier video kept when the scene says the same in the same
+    voice, else narrated now (and kept for the next videos). The state remembers the finished ones across restarts."""
+    storage, voice = get_storage(), None
     done = ctx.state.setdefault("narration", {})
     narrations = [scene["narration"] for scene in render.scenes]
     voices = _scene_voices(render)
@@ -224,16 +243,52 @@ def _speak_scenes(ctx: JobContext, render: RenderInput, work: Path) -> None:
     for index, text in enumerate(narrations):
         if str(index) in done:
             continue
+        key = video_cache.narration_key(voices[index], text)
+        clip, timings = video_cache.narration_paths(render.course_id, key)
+        entry = {"path": clip, "timings": timings, "key": key}
+        if storage.size(timings) and storage.size(clip):  # kept by an earlier video: never paid twice
+            done[str(index)] = entry
+            continue
         ctx.progress(5 + int(40 * index / len(narrations)), f"Narrando la escena {index + 1} de {len(narrations)}")
         try:
+            voice = voice or get_voice_provider()
             speech = voice.speak(text, voices[index], previous_text=same_voice(index - 1), next_text=same_voice(index + 1))
         except VoiceError as exc:
             raise JobError(str(exc), permanent=exc.permanent) from exc
         local = work / _scene_file(index)
         local.write_bytes(speech.audio)
-        path = f"{_intermediate_prefix(render, ctx)}/{_scene_file(index)}"
-        storage.upload_file(path, local, "audio/mpeg")
-        done[str(index)] = {"path": path, "alignment": asdict(speech.alignment) if speech.alignment else None}
+        _check_speech(local, work, index)
+        sidecar = work / _timings_file(index)
+        sidecar.write_text(json.dumps(_timings(voices[index], text, speech)), encoding="utf-8")
+        storage.upload_file(clip, local, "audio/mpeg")
+        storage.upload_file(timings, sidecar, "application/json")  # last: a clip is kept once its timings are
+        done[str(index)] = {**entry, "paid": True}
+
+
+def _check_speech(clip: Path, work: Path, index: int) -> None:
+    """A new speech clip FFmpeg can read. One it can't is never kept (every later video would stumble on it): the job
+    tries again, and asking again can bring a good one."""
+    check = work / f"check_{index:02d}.wav"
+    try:
+        compose.to_wav(clip, check)
+    except compose.ComposeError as exc:
+        logger.warning("narration_unreadable", extra={"scene": index, "error": str(exc)[:MAX_LOG_ERROR_CHARS]})
+        raise JobError(f"La narración de la escena {index + 1} llegó dañada; vuelve a intentarlo.") from exc
+    check.unlink(missing_ok=True)
+
+
+def _timings(voice_id: str, text: str, speech: Speech) -> dict:
+    """What is kept beside a speech clip: what it says and how, its digest, and when each character and each word is
+    said (seconds from the clip's start; the words, for whoever needs them without grouping the characters)."""
+    alignment = asdict(speech.alignment) if speech.alignment else None
+    words = []
+    if alignment:
+        grouped = captions.words_from_alignment(alignment["characters"], alignment["starts"], alignment["ends"], 0.0)
+        words = [asdict(word) for word in grouped]
+    return {
+        "voice_id": voice_id, "model": get_settings().elevenlabs_model, "text": text,
+        "digest": video_cache.digest(speech.audio), "alignment": alignment, "words": words,
+    }
 
 
 def _caption_words(scene: dict, alignment: dict | None, start: float, length: float) -> list[captions.TimedWord]:
@@ -248,6 +303,18 @@ def _beats(scene: dict, words: list[captions.TimedWord], start: float, length: f
     return motion.beat_times(Slide.model_validate(scene["slide"]), words, start, length)
 
 
+def _alignment(work: Path, index: int, entry: dict) -> dict | None:
+    """A scene's character timings: in the timings kept beside its speech, or in the state (a scene narrated by the
+    previous release, before speech was kept)."""
+    if "timings" not in entry:
+        return entry.get("alignment")
+    kept = json.loads(_local_copy(work, _timings_file(index), entry["timings"]).read_text(encoding="utf-8"))
+    if kept.get("digest") != entry["digest"]:  # two videos narrated the same at once: those timings are the other's
+        logger.warning("narration_timings_mismatch", extra={"scene": index, "key": entry.get("key")})
+        return None  # its words are spread over the scene instead
+    return kept.get("alignment")
+
+
 def _narrate(ctx: JobContext, render: RenderInput, work: Path) -> None:
     _speak_scenes(ctx, render, work)
 
@@ -260,7 +327,9 @@ def _narrate(ctx: JobContext, render: RenderInput, work: Path) -> None:
 
     words, beats = [], []
     for index, scene in enumerate(render.scenes):
-        alignment = done[str(index)]["alignment"]
+        entry = done[str(index)]
+        entry["digest"] = video_cache.digest(scene_audio[index].read_bytes())  # the presenter's takes are kept by it
+        alignment = _alignment(work, index, entry)
         scene_words = _caption_words(scene, alignment, narration.starts[index], narration.lengths[index])
         words += scene_words
         beats.append(_beats(scene, scene_words, narration.starts[index], narration.lengths[index]))
@@ -522,6 +591,32 @@ def _start_take(ctx: JobContext, render: RenderInput, work: Path, provider: Avat
     ctx.progress(55, "El presentador se está grabando")
 
 
+def _take_key(ctx: JobContext, render: RenderInput, take: dict) -> str | None:
+    """The take's key among those kept: its avatar, the engine and the speech it lip-syncs, scene by scene. None for a
+    render narrated by the previous release (its state has no digests): its takes are made as before, and not kept."""
+    narration = ctx.state.get("narration") or {}
+    digests = [(narration.get(str(index)) or {}).get("digest") for index in take["scenes"]]
+    if not all(digests):
+        return None
+    roles = video_cache.scene_roles(len(render.scenes))
+    engine = render.avatar_engine or get_settings().heygen_engine
+    return video_cache.take_key(take["avatar_id"], engine, zip(digests, (roles[index] for index in take["scenes"])))
+
+
+def _kept_take(ctx: JobContext, render: RenderInput, take: dict) -> bool:
+    """Whether an earlier video left this very take (then HeyGen isn't asked for it); notes where a new one is kept."""
+    heygen = ctx.state[take["key"]]
+    key = heygen.get("take") or _take_key(ctx, render, take)
+    if key is None:
+        return False
+    heygen["take"] = key
+    path = video_cache.take_path(render.course_id, key)
+    if not get_storage().size(path):
+        return False
+    heygen["path"] = path
+    return True
+
+
 def _poll_take(ctx: JobContext, render: RenderInput, work: Path, provider: AvatarProvider, take: dict) -> bool | None:
     """Check on one presenter's video: True when downloaded, False while HeyGen works, None if it gave up."""
     heygen = ctx.state[take["key"]]
@@ -538,10 +633,17 @@ def _poll_take(ctx: JobContext, render: RenderInput, work: Path, provider: Avata
         return False
     local = work / f"{take['key']}.mp4"
     provider.download(status.video_url, local)
-    path = f"{_intermediate_prefix(render, ctx)}/{take['key']}.mp4"
+    if not compose.clip_seconds(local) > 0:  # never kept unreadable: the next check brings a fresh link
+        raise AvatarError(f"El video de {_who(take)} llegó dañado.", retryable=True)
+    key = heygen.get("take")  # kept for the next videos (a render narrated by the previous release: its own)
+    path = (
+        video_cache.take_path(render.course_id, key) if key
+        else f"{_intermediate_prefix(render, ctx)}/{take['key']}.mp4"
+    )
     get_storage().upload_file(path, local, "video/mp4")
     heygen["path"] = path
-    ctx.state.setdefault("take_paths", []).append(path)
+    if not key:
+        ctx.state.setdefault("take_paths", []).append(path)
     return True
 
 
@@ -567,6 +669,8 @@ def _presenter(ctx: JobContext, render: RenderInput, work: Path) -> Reschedule |
             if heygen.get("path"):
                 continue
             if not heygen.get("video_id"):
+                if _kept_take(ctx, render, take):
+                    continue
                 _start_take(ctx, render, work, provider, take)
                 waiting = True
                 continue
@@ -775,6 +879,10 @@ def _publish(ctx: JobContext, render: RenderInput, made: _Composition) -> dict:
         module.captions_asset_id, module.duration_seconds = captions_asset.id, seconds
         module.video_url = ""
         module.generation_status, module.generation_error = "completed", None
+        takes = _kept_takes(ctx, render)
+        # FFmpeg couldn't use the presenter's clip (the video came out without it): its takes are kept no longer.
+        unusable = takes if not made.presenter and ctx.state.get("avatar_path") else {}
+        earlier = (module.storyboard or {}).get("render") or {}
         module.storyboard = {
             **(module.storyboard or {}),
             "render": {
@@ -785,6 +893,8 @@ def _publish(ctx: JobContext, render: RenderInput, made: _Composition) -> dict:
                 "duration_seconds": seconds,
                 # What the video shows: the script is compared with it (the scenes edited since it was made).
                 "scene_hashes": revisions.video_scenes(render.scenes),
+                # What it used and left for the next one: a change's cost is told from it (revisions.impact).
+                "cache": video_cache.record(earlier.get("cache"), _kept_speech(ctx), list(takes), dropped=unusable),
             },
         }
         db.commit()
@@ -795,8 +905,33 @@ def _publish(ctx: JobContext, render: RenderInput, made: _Composition) -> dict:
             db.rollback()
             logger.exception("render_replaced_cleanup_failed", extra={"module_id": ctx.module_id})
 
-    _delete_files(intermediate_paths(ctx.state), ctx.module_id)
+    _delete_files(intermediate_paths(ctx.state) + list(unusable.values()), ctx.module_id)
+    narration = (ctx.state.get("narration") or {}).values()
+    logger.info("render_paid", extra={
+        "module_id": ctx.module_id, "scenes": len(render.scenes),
+        "scenes_narrated": sum(1 for entry in narration if entry.get("paid") or not entry.get("key")),
+        "takes": len(_takes(render)) if made.presenter else 0,
+        "takes_asked": sum(1 for take in _takes(render) if (ctx.state.get(take["key"]) or {}).get("video_id")),
+    })
     return {"duration_seconds": seconds, "presenter": made.presenter, "warning": ctx.state.get("warning")}
+
+
+def _kept_speech(ctx: JobContext) -> dict[str, str]:
+    """The speech kept for the next videos this render used: {narration key: digest}."""
+    return {
+        entry["key"]: entry["digest"]
+        for entry in (ctx.state.get("narration") or {}).values() if entry.get("key") and entry.get("digest")
+    }
+
+
+def _kept_takes(ctx: JobContext, render: RenderInput) -> dict[str, str]:
+    """The presenter's takes kept for the next videos this render used or made: {key: path}."""
+    takes = {}
+    for take in _takes(render):
+        heygen = ctx.state.get(take["key"]) or {}
+        if heygen.get("take") and video_cache.is_kept(heygen.get("path") or ""):
+            takes[heygen["take"]] = heygen["path"]
+    return takes
 
 
 @handler("video.render", on_failure=_render_failed)
