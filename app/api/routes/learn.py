@@ -24,7 +24,7 @@ from app.schemas.learn import (
     PositionUpdate,
     QuestionResult,
 )
-from app.schemas.paths import CourseRef, LearnerPath, PathRef
+from app.schemas.paths import LearnerPath, PathRef
 from app.services import activities as engine
 from app.services import paths, progress, quiz
 from app.services.learner_views import course_player_detail, learner_course
@@ -94,7 +94,7 @@ def _path_outcome(db: Session, enrollment: Enrollment) -> dict:
     journey = paths.journey(db, enrollment.user_id)
     step, path = journey.next_course(enrollment.course_id), journey.completed_path(enrollment.course_id)
     return {
-        "next_course": CourseRef(course_id=step.course_id, title=step.title) if step else None,
+        "next_course": step.ref() if step else None,
         "path_completed": PathRef(id=path.id, title=path.title) if path else None,
     }
 

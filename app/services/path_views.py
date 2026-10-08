@@ -16,7 +16,6 @@ from app.db.models import (
     User,
 )
 from app.schemas.paths import (
-    CourseRef,
     LearnerPath,
     LearnerPathStep,
     PathCourse,
@@ -133,10 +132,6 @@ def path_detail(db: Session, path: LearningPath) -> PathDetail:
     )
 
 
-def _profile_ref(profile: JobProfile | None) -> ProfileRef | None:
-    return ProfileRef(id=profile.id, name=profile.name) if profile else None
-
-
 def path_people(db: Session, path: LearningPath, user_ids: list[int] | None = None) -> list[PathPerson]:
     """Who takes the path and how far each one got, course by course (a handful of reads for any number)."""
     query = (
@@ -153,7 +148,9 @@ def path_people(db: Session, path: LearningPath, user_ids: list[int] | None = No
     steps = paths.path_steps(db, [path.id])[path.id]
     journeys = paths.journeys(db, [user.id for _, user in rows], course_ids=[s.course_id for s in steps], modules=True)
     profile_ids = {user.profile_id for _, user in rows if user.profile_id}
-    profiles = {p.id: p for p in db.query(JobProfile).filter(JobProfile.id.in_(profile_ids))} if profile_ids else {}
+    profiles = {
+        p.id: ProfileRef(id=p.id, name=p.name) for p in db.query(JobProfile).filter(JobProfile.id.in_(profile_ids))
+    } if profile_ids else {}
     now = paths.utcnow()
     people = []
     for assignment, user in rows:
@@ -168,7 +165,7 @@ def path_people(db: Session, path: LearningPath, user_ids: list[int] | None = No
                     email=user.email,
                     position=user.position or "",
                     department=user.department or "",
-                    profile=_profile_ref(profiles.get(user.profile_id)),
+                    profile=profiles.get(user.profile_id),
                 ),
                 source=assignment.source,
                 assigned_at=assignment.assigned_at,
@@ -204,7 +201,7 @@ def _learner_path(path: paths.AssignedPath, journey: paths.Journey, media: Media
                 progress_pct=pct,
                 total_modules=total,
                 completed_modules=done,
-                locked_by=CourseRef(course_id=lock.course_id, title=lock.title) if lock else None,
+                locked_by=lock.ref() if lock else None,
             )
         )
     current = journey.current(path)

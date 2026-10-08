@@ -36,7 +36,7 @@ from app.db.models import (
     PathAssignment,
     User,
 )
-from app.schemas.paths import PathSettings
+from app.schemas.paths import CourseRef, PathSettings
 from app.services.metrics import percentage
 
 NO_SYNC = {"synchronize_session": False}
@@ -127,7 +127,7 @@ def refresh_completion(db: Session, *, path_ids=None, user_ids=None, course_ids=
         update(PathAssignment).where(*scope, PathAssignment.completed_at.isnot(None), ~done).values(completed_at=None),
         execution_options=NO_SYNC,
     )
-    return list(completed)
+    return completed
 
 
 # ── Assignments and enrollments ───────────────────────────────────────
@@ -290,7 +290,7 @@ def backing_profile(db: Session, path_id: int, user_id: int) -> JobProfile | Non
 
 def drop_profile(db: Session, profile_id: int) -> None:
     """Before a profile is deleted: its people keep their courses and completed paths, and lose the rest it gave."""
-    user_ids = [user_id for (user_id,) in db.execute(select(User.id).where(User.profile_id == profile_id))]
+    user_ids = db.execute(select(User.id).where(User.profile_id == profile_id)).scalars().all()
     if user_ids:
         refresh_completion(db, user_ids=user_ids)
     db.execute(update(User).where(User.profile_id == profile_id).values(profile_id=None), execution_options=NO_SYNC)
@@ -303,9 +303,9 @@ def drop_profile(db: Session, profile_id: int) -> None:
 
 def forget_course(db: Session, course_id: int) -> list[int]:
     """A course is being deleted: out of every path. Returns those paths (their completion is refreshed after)."""
-    path_ids = [path_id for (path_id,) in db.execute(
+    path_ids = db.execute(
         select(LearningPathCourse.path_id).where(LearningPathCourse.course_id == course_id)
-    )]
+    ).scalars().all()
     db.execute(delete(LearningPathCourse).where(LearningPathCourse.course_id == course_id), execution_options=NO_SYNC)
     return path_ids
 
@@ -318,6 +318,9 @@ class PathStep:
     course_id: int
     title: str
     cover_asset_id: str | None = None
+
+    def ref(self) -> CourseRef:
+        return CourseRef(course_id=self.course_id, title=self.title)
 
 
 @dataclass

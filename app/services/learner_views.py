@@ -12,7 +12,7 @@ from app.schemas.learn import (
     LearnerModule,
     QuizSummary,
 )
-from app.schemas.paths import CoursePath, CourseRef
+from app.schemas.paths import CoursePath
 from app.services import activities as activity_engine
 from app.services import quiz
 from app.services.media import MediaResolver
@@ -27,7 +27,7 @@ def path_fields(course_id: int, journey: Journey | None) -> dict:
     place = journey.place(course_id) if journey else None
     return {
         "locked": lock is not None,
-        "locked_by": CourseRef(course_id=lock.course_id, title=lock.title) if lock else None,
+        "locked_by": lock.ref() if lock else None,
         "path": CoursePath(id=place[0].id, title=place[0].title, step=place[1], steps=len(place[0].steps))
         if place else None,
     }
