@@ -187,8 +187,17 @@ def _valid_activity(activity: Activity, wanted: dict) -> dict:
         raise HTTPException(status.HTTP_409_CONFLICT, f"La actividad quedaría con un error: {exc}") from exc
 
 
+def _held_activity(db: Session, activity_id: int | None) -> Activity | None:
+    """The activity held as a save of it holds it (NO KEY UPDATE: plays starting meanwhile go on), and read as it is
+    then: None when it is gone (deleted, or replaced by a new AI draft, while this waited for it). It is held before
+    its changes, as everything that deletes it does."""
+    if activity_id is None:
+        return None
+    return db.get(Activity, activity_id, with_for_update={"key_share": True}, populate_existing=True)
+
+
 def _activity_of(db: Session, revision: ModuleRevision) -> Activity:
-    activity = db.get(Activity, revision.activity_id) if revision.activity_id else None
+    activity = _held_activity(db, revision.activity_id)
     if activity is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "La actividad de este cambio ya no existe")
     return activity
@@ -283,10 +292,9 @@ def _propose_quiz(db: Session, module: Module, payload: RevisionCreate, admin: U
 def _propose_activity(db: Session, module: Module, payload: RevisionCreate, admin: User) -> RevisionProposal:
     if payload.activity_id is None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Elige la actividad que quieres cambiar")
-    activity = db.get(Activity, payload.activity_id)
+    activity = _held_activity(db, payload.activity_id)  # as a save of the activity: one waits for the other
     if activity is None or activity.module_id != module.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Actividad no encontrada")
-    db.refresh(activity, with_for_update={"key_share": True})  # as a save of the activity: one waits for the other
     _require_kept(db, activity, "pide el cambio")
     scope = {**revisions.empty_scope(), "qa_issue_id": payload.qa_issue_id}
     return _queue_proposal(db, module, admin, payload, activity_revisions.content(activity), scope,
@@ -430,8 +438,7 @@ def _apply_quiz(db: Session, revision: ModuleRevision, module: Module, admin: Us
 
 
 def _apply_activity(db: Session, revision: ModuleRevision, admin: User) -> RevisionApplied:
-    activity = _activity_of(db, revision)
-    db.refresh(activity, with_for_update={"key_share": True})  # as a save of the activity, and before the revision
+    activity = _activity_of(db, revision)  # held as a save of the activity holds it, and before the revision
     db.refresh(revision, with_for_update=True)
     if not _appliable(revision):
         return _applied_out(db, revision, None)
@@ -565,8 +572,7 @@ def _revert_quiz(db: Session, revision: ModuleRevision, module: Module, admin: U
 
 
 def _revert_activity(db: Session, revision: ModuleRevision, admin: User) -> Revision:
-    activity = _activity_of(db, revision)
-    db.refresh(activity, with_for_update={"key_share": True})
+    activity = _activity_of(db, revision)  # held, then the revision
     db.refresh(revision, with_for_update=True)
     _check_revertible(revision)
     current = activity_revisions.content(activity)

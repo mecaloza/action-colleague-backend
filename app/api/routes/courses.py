@@ -420,6 +420,8 @@ def put_evaluation(
 def delete_evaluation(module_id: int, db: Session = Depends(get_db)):
     """Removes the quiz and its attempts; learners then complete the module by viewing it."""
     module = module_or_404(db, module_id)
+    # As every change to the quiz (a save, applying or undoing one): one at a time, never deleting it under another.
+    db.refresh(module, with_for_update={"key_share": True})
     if module.evaluation:
         db.delete(module.evaluation)
         # Its attempts are gone: a future quiz must not start "exhausted" or "already passed".

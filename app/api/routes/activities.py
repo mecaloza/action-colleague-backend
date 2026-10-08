@@ -27,8 +27,9 @@ def _secret() -> str:
     return engine.activity_secret(get_settings().jwt_secret)
 
 
-def _activity_or_404(db: Session, activity_id: int) -> Activity:
-    activity = db.get(Activity, activity_id)
+def _activity_or_404(db: Session, activity_id: int, lock: bool = False) -> Activity:
+    """`lock`: held until the commit (FOR UPDATE), and 404 when deleted while this waited for it."""
+    activity = db.get(Activity, activity_id, with_for_update=True if lock else None)
     if activity is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Actividad no encontrada")
     return activity
@@ -149,7 +150,9 @@ def voice_activity(activity_id: int, db: Session = Depends(get_db)):
 @router.delete("/activities/{activity_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_activity(activity_id: int, db: Session = Depends(get_db)):
     """Its plays and voice clips go with it; learners who only waited for it complete the module."""
-    activity = _activity_or_404(db, activity_id)
+    # Held before its changes go, as applying or undoing one holds the activity before the change: one waits for the
+    # other instead of each holding what the other needs.
+    activity = _activity_or_404(db, activity_id, lock=True)
     module, clips = activity.module, [clip.get("asset_id") for clip in (activity.narration or {}).values()]
     revisions.forget_activities(db, [activity.id])
     db.delete(activity)

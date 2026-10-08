@@ -1,12 +1,13 @@
 """
 Revisions of an interactive activity (what every target shares is in `revisions`). An activity revision's content is
 `{"title", "intro", "spec"}`: what is played (a change to it is a new version of the activity; its type never
-changes).
+changes), its spec as a save in the editor leaves it.
 
 The model writes the whole activity back: the server validates it as a save in the editor does (`parse_spec`) and
 compares it with the stored one part by part. A part is each element of a list of its own (a conversation's
 situations and their choices, an inspection's decisions and items, a simulator's controls) and every other field of
-the spec whole; the admin also sees how many spoken lines would be voiced again.
+the spec whole; the admin also sees how many spoken lines would be voiced again. A change is applied (or undone) over
+later edits part by part too: it is refused only when the parts it changes changed since.
 """
 
 import json
@@ -57,8 +58,14 @@ ELEMENT_NAMES = {
 
 
 def content(activity: Activity) -> dict:
-    """What an activity revision changes: what is played."""
-    return {"title": activity.title, "intro": activity.intro or "", "spec": activity.spec}
+    """What an activity revision changes: what is played, its spec as a save in the editor leaves it (every default
+    written down). A spec stored before one of its fields existed is the same activity: the AI's answer, saved the
+    same way, only differs from it where it really changes it."""
+    try:
+        spec = parse_spec(activity.type, activity.spec).model_dump()
+    except SpecError:  # edited by hand into something the editor doesn't save: as it is
+        spec = activity.spec
+    return {"title": activity.title, "intro": activity.intro or "", "spec": spec}
 
 
 def validated(activity_type: str, wanted: dict) -> dict:
@@ -82,13 +89,15 @@ def write(activity: Activity, wanted: dict) -> bool:
 
 
 def learners_mid_play(db: Session, activity: Activity) -> int:
-    """The learners with a play of the activity open that can go on: a change makes them start it again."""
+    """The learners with a play of the activity open that can go on: a change makes them start it again. Only plays on
+    its current version can (those left on an older one never come back): only theirs are read, and only their
+    state."""
     now = engine.utcnow()
-    plays = db.query(ActivityAttempt).filter(
-        ActivityAttempt.activity_id == activity.id, ActivityAttempt.enrollment_id.isnot(None),
-        ActivityAttempt.finished_at.is_(None),
+    plays = db.query(ActivityAttempt.enrollment_id, ActivityAttempt.state).filter(
+        ActivityAttempt.activity_id == activity.id, ActivityAttempt.version == activity.version,
+        ActivityAttempt.enrollment_id.isnot(None), ActivityAttempt.finished_at.is_(None),
     )
-    return len({play.enrollment_id for play in plays if engine.resumable(activity, play, now)})
+    return len({enrollment_id for enrollment_id, state in plays if engine.going_on(state, now)})
 
 
 # ── Its parts ─────────────────────────────────────────────────────────
@@ -269,49 +278,92 @@ def propose(activity_type: str, before: dict, patch: ActivityPatchDraft) -> revi
 # ── Applying and undoing ──────────────────────────────────────────────
 
 
-def _fields(wanted: dict) -> dict[str, Any]:
-    """An activity field by field: its title, its intro and each field of its spec."""
-    return {"title": wanted["title"], "intro": wanted["intro"],
-            **{f"spec/{key}": value for key, value in wanted["spec"].items()}}
+def _element_of(path: str) -> str | None:
+    """The element a part is in ("nodes/inicio" for "nodes/inicio/choices/precio"); None for the spec's own fields
+    and the elements of its lists."""
+    segments = path.split("/")
+    return "/".join(segments[:-2]) if len(segments) > 2 else None
+
+
+def _placed(current: list[str], base: list[str], target: list[str]) -> list[str]:
+    """A list's elements (paths) after the change, placed as a script's scenes are: where `current` has them, and
+    those the change adds or moves where the target has them (the parts themselves are merged apart)."""
+
+    def items(paths: list[str]) -> list[dict]:
+        return [{"id": path} for path in paths]
+
+    return [item["id"] for item in revisions.merge_items(items(current), items(base), items(target), lambda *_: True)]
+
+
+def _merged_spec(current: dict, base: dict, target: dict) -> dict:
+    """The change from `base` to `target` (specs) made over `current`, part by part (see `Parts`): the parts it
+    changes, adds, removes or moves; every other part stays as `current` has it, and where.
+
+    Raises Conflict with the parts it changes that changed since: neither as it found them nor as it leaves them,
+    added since to an element it removes, or an element removed since that it adds to."""
+    now, old, new = Parts.of(current), Parts.of(base), Parts.of(target)
+    values, conflicts = dict(now.values), []
+    for path in dict.fromkeys([*old.values, *new.values]):
+        was, will = old.values.get(path, _MISSING), new.values.get(path, _MISSING)
+        if was == will:
+            continue  # the change leaves it as it was
+        if now.values.get(path, _MISSING) not in (was, will):
+            conflicts.append(path)
+        elif will is _MISSING:
+            values.pop(path, None)
+        else:
+            values[path] = will
+    for path in list(values):
+        element = _element_of(path)
+        if element is not None and element not in values:  # left without the element it was in
+            conflicts.append(path if path in now.values else element)
+    if conflicts:
+        raise revisions.Conflict(list(dict.fromkeys(conflicts)))
+    lists = {
+        path: [each for each in _placed(now.lists.get(path, []), old.lists.get(path, []), new.lists.get(path, []))
+               if each in values]
+        for path in dict.fromkeys([*now.lists, *new.lists])
+    }
+
+    def build(element: str | None) -> dict:
+        """An element (None: the spec) with its own parts and its lists' elements, in their order."""
+        prefix = f"{element}/" if element else ""
+        built = dict(values[element]) if element else {path: value for path, value in values.items() if "/" not in path}
+        for path, elements in lists.items():
+            if path.startswith(prefix) and "/" not in path[len(prefix):]:
+                built[path[len(prefix):]] = [build(each) for each in elements]
+        return built
+
+    return build(None)
 
 
 def three_way(current: dict, base: dict, target: dict) -> dict:
     """
-    The change from `base` to `target` made over `current`, field by field: the title, the intro and each field of
-    the spec (all of a conversation's situations go together, all of an inspection's items...). Every other field
-    stays as `current` has it. The result is validated by whoever writes it.
+    The change from `base` to `target` made over `current` (a proposal applied after other edits: base = what it was
+    made from; an undo: base = what the change left, target = what was there before it), part by part: the title,
+    the intro and the parts of the spec it changes, adds, removes or moves (a situation, one of its choices, an
+    inspection's item, a simulator's control, any other field of the spec whole). Every other part stays as `current`
+    has it, and where. The result is validated by whoever writes it.
 
-    Raises Conflict with the parts (paths) that changed since in the fields it changes.
+    Raises Conflict with the parts (paths) it changes that changed since.
     """
     if revisions.content_hash(current) == revisions.content_hash(base):
         return target
-    now, old, new = _fields(current), _fields(base), _fields(target)
-    merged, conflicts = dict(now), []
-    for key in dict.fromkeys([*old, *new]):
-        was, will = old.get(key, _MISSING), new.get(key, _MISSING)
-        if was == will:
-            continue  # the change leaves it as it was
-        if now.get(key, _MISSING) not in (was, will):
-            conflicts.append(key)
-        elif will is _MISSING:
-            merged.pop(key, None)
+    merged, conflicts = {}, []
+    for name in ("title", "intro"):
+        if base[name] == target[name]:
+            merged[name] = current[name]
+        elif current[name] in (base[name], target[name]):
+            merged[name] = target[name]
         else:
-            merged[key] = will
+            conflicts.append(name)
+    try:
+        merged["spec"] = _merged_spec(current["spec"], base["spec"], target["spec"])
+    except revisions.Conflict as conflict:
+        raise revisions.Conflict([*conflicts, *conflict.ids]) from None
     if conflicts:
-        raise revisions.Conflict(_changed_since(base, current, conflicts))
-    spec = {key.removeprefix("spec/"): value for key, value in merged.items() if key.startswith("spec/")}
-    return {"title": merged["title"], "intro": merged["intro"], "spec": spec}
-
-
-def _changed_since(base: dict, current: dict, fields: list[str]) -> list[str]:
-    """The parts of these fields that changed from `base` to `current` (the field itself when it has no parts)."""
-    changed = [change["path"] for change in entity_changes(base["spec"], current["spec"])]
-    paths = []
-    for name in fields:
-        key = name.removeprefix("spec/")
-        inside = [path for path in changed if path == key or path.startswith(f"{key}/")] if name != key else []
-        paths += inside or [key]
-    return paths
+        raise revisions.Conflict(conflicts)
+    return merged
 
 
 def record(

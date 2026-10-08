@@ -5,10 +5,12 @@ the AI proposes, the server keeps what it doesn't touch as stored, the admin app
 import copy
 import json
 import os
+from datetime import timedelta
 
 import pytest
 
-from app.db.models import Activity, Course, Enrollment, Evaluation, Job, Module, ModuleRevision
+from app.db.models import Activity, ActivityAttempt, Course, Enrollment, Evaluation, Job, Module, ModuleRevision, User
+from app.services import activities as engine
 from app.services import activity_revisions, quiz_revisions, revisions
 from app.services.ai import designer
 from app.services.ai.fake import FakeLLM, FakeVoice
@@ -511,6 +513,111 @@ def test_undoing_an_activity_change(client, db, admin_headers, module, activity,
     }
 
 
+def test_an_activity_change_is_applied_and_undone_over_edits_to_its_other_parts(
+    client, db, admin_headers, module, activity, worker
+):
+    """A conversation's situations and choices (an inspection's items...) are parts of their own: a change to one goes
+    over edits made since to the others, and so does undoing it."""
+    revision = _proposed(client, admin_headers, worker, module.id, "Más claro", target="activity",
+                         activity_id=activity.id)  # the intro and the first choice's feedback
+    _edit_activity(client, admin_headers, activity, lambda spec: spec["nodes"][1].update(situation="Carretera."))
+
+    applied = _apply(client, admin_headers, revision["id"])
+
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["revision"]["changes"]["rebased"] is True
+    assert [entity["path"] for entity in applied.json()["revision"]["changes"]["activity"]["entities"]] == [
+        "nodes/inicio/choices/precio",
+    ]
+    stored = _stored(db, activity)
+    assert stored.spec["nodes"][0]["choices"][0]["feedback"] == f"{PRICE['feedback']} Revisado."
+    assert (stored.spec["nodes"][1]["situation"], stored.intro) == ("Carretera.", f"Revisado: {INTRO}")
+
+    _edit_activity(client, admin_headers, activity,
+                   lambda spec: spec["nodes"][0]["choices"][1].update(text="¿Qué ruta manejan?"))
+    undone = _revert(client, admin_headers, revision["id"])
+
+    assert undone.status_code == 200, undone.text
+    stored = _stored(db, activity)
+    assert (stored.intro, stored.spec["nodes"][0]["choices"][0]) == (INTRO, PRICE)  # what the change touched, back
+    assert stored.spec["nodes"][0]["choices"][1]["text"] == "¿Qué ruta manejan?"  # the edits since stay
+    assert stored.spec["nodes"][1]["situation"] == "Carretera."
+
+
+def test_an_activity_saved_before_some_of_its_fields_existed_changes_only_where_it_really_does(
+    client, db, admin_headers, module, activity, worker, monkeypatch
+):
+    """The defaults it lacks (a situation's speaker, an inspection's lives) are no change: not in what the AI proposes,
+    and not in a save that only writes them down (the plays open go on)."""
+    legacy = copy.deepcopy(DECISION)
+    for node in legacy["nodes"]:
+        del node["speaker"]  # stored before situations had one
+    activity.spec = legacy
+    db.commit()
+
+    proposed = _proposed(client, admin_headers, worker, module.id, target="activity", activity_id=activity.id)
+    assert [entity["path"] for entity in proposed["changes"]["activity"]["entities"]] == [
+        "nodes/inicio/choices/precio",
+    ]
+
+    monkeypatch.setattr(FakeLLM, "_activity_patch", lambda self, prompt: designer.ActivityPatchDraft(
+        summary="Sin cambios", title=TITLE, intro=INTRO, spec_json=json.dumps(legacy), unresolved="Ya está clara.",
+    ))
+    asked = _ask(client, admin_headers, module.id, "Revísala", target="activity", activity_id=activity.id)
+    worker()
+    failed = _revision(client, admin_headers, asked["revision"]["id"])
+    assert (failed["status"], failed["error"]) == ("failed", "La IA no propuso cambios: Ya está clara.")
+
+    saved = client.put(f"/api/v1/activities/{activity.id}", headers=admin_headers, json={"spec": DECISION})
+    assert saved.status_code == 200 and _stored(db, activity).version == 1
+    assert "manual" not in [item["source"] for item in _history(client, admin_headers, module.id)]
+
+    inspection = Activity(type="inspection", title=TITLE, intro=INTRO, spec=copy.deepcopy(INSPECTION))  # no lives
+    same = designer.ActivityPatchDraft(summary="Igual", title=TITLE, intro=INTRO, spec_json=json.dumps(INSPECTION),
+                                       unresolved="")
+    with pytest.raises(revisions.ProposalError, match="no propuso"):
+        activity_revisions.propose("inspection", activity_revisions.content(inspection), same)
+
+
+def test_who_is_mid_play_is_who_can_go_on_with_a_play_of_the_current_version(db, admin, module, activity):
+    """Only plays on the activity's current version, not over and (a quick challenge with a clock) still on it count,
+    once per learner; an admin's preview never does."""
+    learners = {}
+    for name in ("ana", "beto", "carla", "dario", "eva", "fer", "gabi"):
+        user = User(name=name, email=f"{name}@test.dev", role="collaborator")
+        db.add(user)
+        db.flush()
+        learners[name] = Enrollment(user_id=user.id, course_id=module.course_id, status="assigned", progress_pct=0)
+        db.add(learners[name])
+    db.flush()
+
+    def play(game, name, *, version=None, finished=False, done=False, **start):
+        state = {**engine.start(game, **start), "done": done}
+        enrollment = learners[name] if name else None
+        db.add(ActivityAttempt(activity_id=game.id, user_id=enrollment.user_id if enrollment else admin.id,
+                               enrollment_id=enrollment.id if enrollment else None, version=version or game.version,
+                               state=state, finished_at=engine.utcnow() if finished else None))
+
+    activity.version = 2
+    play(activity, "ana")
+    play(activity, "ana", version=1)  # the same learner, a play left on the older version
+    play(activity, "beto", version=1)  # only on the older version: never comes back
+    play(activity, "carla", finished=True)
+    play(activity, "dario", done=True)  # over, without being closed
+    play(activity, None)  # the admin's preview
+    quick = Activity(module_id=module.id, order=2, type="quick", title="Ordena", intro="",
+                     spec=copy.deepcopy(QUICK_ORDER), status="ready")
+    db.add(quick)
+    db.flush()
+    play(quick, "eva", now=engine.utcnow() - timedelta(minutes=5))  # its time ran out
+    play(quick, "fer", untimed=True)
+    play(quick, "gabi")
+    db.commit()
+
+    assert activity_revisions.learners_mid_play(db, activity) == 1
+    assert activity_revisions.learners_mid_play(db, quick) == 2
+
+
 def test_saving_an_activity_by_hand_is_kept_and_can_be_undone(client, db, admin_headers, module, activity):
     _edit_activity(client, admin_headers, activity, lambda spec: spec["nodes"][1].update(situation="Carretera."))
     for unchanged in ({"status": "draft"}, {"title": TITLE}):  # not what is played, or the same: nothing new
@@ -685,23 +792,63 @@ def test_an_activity_is_compared_part_by_part_with_names_for_the_admin():
     assert changes[1]["before"] == removed and changes[1]["label"] == "Situación 2"
 
 
-def test_the_activity_three_way_merges_field_by_field():
+def test_the_activity_three_way_merges_part_by_part():
     base = {"title": TITLE, "intro": INTRO, "spec": copy.deepcopy(DECISION)}
     target = copy.deepcopy(base)
-    target["spec"]["nodes"][1]["situation"] = "Otra situación."
-    current = {**copy.deepcopy(base), "title": "Otro título"}
+    target["spec"]["nodes"][1]["situation"] = "Otra situación."  # the change: the second situation
+    edited = copy.deepcopy(base)
+    edited["title"] = "Otro título"
+    edited["spec"]["nodes"][0]["choices"][0]["feedback"] = "Editada."  # since: another part of the same list
 
-    merged = activity_revisions.three_way(current, base, target)
+    merged = activity_revisions.three_way(edited, base, target)
 
-    assert merged["title"] == "Otro título" and merged["spec"] == target["spec"]
-    current["spec"]["nodes"][0]["choices"][0]["feedback"] = "Editada."
+    assert merged["title"] == "Otro título"
+    assert merged["spec"] == {"nodes": [edited["spec"]["nodes"][0], target["spec"]["nodes"][1]]}
+    # Undone over a later edit to another part: only what the change touched goes back.
+    later = copy.deepcopy(merged)
+    later["spec"]["nodes"][0]["choices"][1]["text"] = "¿Qué ruta manejan?"
+    undone = activity_revisions.three_way(later, merged, edited)
+    assert undone["spec"]["nodes"][1] == DECISION["nodes"][1]
+    assert undone["spec"]["nodes"][0] == later["spec"]["nodes"][0] and undone["title"] == "Otro título"
+
+    # The same part changed since: refused, named as the admin knows it.
+    edited["spec"]["nodes"][1]["situation"] = "Editada a mano."
+    retitled = {**target, "title": "Revisado"}
     with pytest.raises(revisions.Conflict) as conflict:
-        activity_revisions.three_way(current, base, target)
-    assert conflict.value.ids == ["nodes/inicio/choices/precio"]  # all its situations go together
-    assert activity_revisions.places(conflict.value.ids, current) == "la opción 1 de la situación 1"
+        activity_revisions.three_way(edited, base, retitled)
+    assert conflict.value.ids == ["title", "nodes/ruta"]
+    assert activity_revisions.places(conflict.value.ids, edited) == "el título y la situación 2"
     assert activity_revisions.places(["title", "variables/km"], {**base, "spec": SIMULATOR}) == (
         "el título y el control «Kilómetros de vida»"
     )
+
+    # A situation the change removes, given a choice since; and the other way around.
+    removed = copy.deepcopy(base)
+    removed["spec"]["nodes"].pop(1)
+    removed["spec"]["nodes"][0]["choices"][1]["next"] = ""
+    grown = copy.deepcopy(base)
+    grown["spec"]["nodes"][1]["choices"].append({"id": "flota", "text": "¿Cuántas unidades tiene?", "points": 3,
+                                                 "feedback": "Conoces su flota.", "next": ""})
+    with pytest.raises(revisions.Conflict) as conflict:
+        activity_revisions.three_way(grown, base, removed)
+    assert conflict.value.ids == ["nodes/ruta/choices/flota"]
+    with pytest.raises(revisions.Conflict) as conflict:
+        activity_revisions.three_way(removed, base, grown)
+    assert conflict.value.ids == ["nodes/ruta"]
+
+    # An element the change moves goes where it puts it, with the edits made to it since; one added since stays.
+    inspection = {"title": TITLE, "intro": INTRO, "spec": copy.deepcopy(INSPECTION)}
+    moved = copy.deepcopy(inspection)
+    moved["spec"]["items"].insert(0, moved["spec"]["items"].pop(3))  # the fourth tire first
+    since = copy.deepcopy(inspection)
+    since["spec"]["items"][3]["explanation"] = "Editada a mano."
+    since["spec"]["verdicts"].insert(1, {"id": "revisar", "label": "Revisar"})
+
+    merged = activity_revisions.three_way(since, inspection, moved)
+
+    assert [item["id"] for item in merged["spec"]["items"]] == ["l4", "l1", "l2", "l3"]
+    assert merged["spec"]["items"][0]["explanation"] == "Editada a mano."
+    assert [verdict["id"] for verdict in merged["spec"]["verdicts"]] == ["rodar", "revisar", "reencauchar", "retirar"]
 
 
 def test_the_revision_prompts_put_what_repeats_first_and_the_observation_last():

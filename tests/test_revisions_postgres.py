@@ -170,6 +170,115 @@ def test_a_quiz_or_activity_change_applied_twice_at_once_is_applied_once(client,
     assert db.query(Job).filter(Job.type == "activities.voice").count() == 1
 
 
+def _propose(client, headers, worker, module_id, body: dict) -> int:
+    response = client.post(f"/api/v1/modules/{module_id}/revisions", headers=headers,
+                           json={"observation": "Más claro", **body})
+    assert response.status_code == 202, response.text
+    worker()
+    return response.json()["revision"]["id"]
+
+
+def _paused(monkeypatch, owner, name: str) -> tuple[threading.Event, threading.Event]:
+    """`owner.name` runs, then waits (holding the locks its caller took) until released: (paused, release)."""
+    paused, release = threading.Event(), threading.Event()
+    original = getattr(owner, name)
+
+    def run_and_wait(*args, **kwargs):
+        result = original(*args, **kwargs)
+        paused.set()
+        release.wait(5)
+        return result
+
+    monkeypatch.setattr(owner, name, run_and_wait)
+    return paused, release
+
+
+def _while_paused(paused: threading.Event, release: threading.Event, first, second) -> tuple:
+    """`first` runs until it pauses, then `second` starts and reaches the lock it waits on before `first` goes on."""
+    with ThreadPoolExecutor(2) as pool:
+        holding = pool.submit(first)
+        assert paused.wait(5)
+        waiting = pool.submit(second)
+        time.sleep(0.5)
+        release.set()
+        return holding.result(15), waiting.result(15)
+
+
+@pytest.mark.parametrize("change", ["apply", "undo", "save"])
+def test_deleting_the_quiz_while_it_changes(client, db, admin, worker, monkeypatch, change):
+    """Every change to the quiz holds the module first, and so does deleting it: the delete waits for the change and
+    then deletes the quiz it left (it used to delete the quiz under an undo or a save, which then failed writing it)."""
+    headers = auth_headers(client, admin.email)
+    module, _ = _content_module(db, admin)
+    if change == "save":
+        edited = [{**question, "explanation": "Editada."} for question in QUESTIONS]
+        paused, release = _paused(monkeypatch, quiz_revisions, "write")  # the module held, the quiz written
+
+        def changing():
+            return client.put(f"/api/v1/modules/{module.id}/evaluation", headers=headers, json={"questions": edited})
+    else:
+        revision_id = _propose(client, headers, worker, module.id, {"target": "quiz", "question_ids": ["q2"]})
+        if change == "undo":
+            assert client.post(f"/api/v1/revisions/{revision_id}/apply", headers=headers, json={}).status_code == 200
+        paused, release = _paused(monkeypatch, quiz_revisions, "three_way")  # the module and the change held
+
+        def changing():
+            action = "revert" if change == "undo" else "apply"
+            return client.post(f"/api/v1/revisions/{revision_id}/{action}", headers=headers, json={})
+
+    changed, deleted = _while_paused(
+        paused, release, changing, lambda: client.delete(f"/api/v1/modules/{module.id}/evaluation", headers=headers),
+    )
+
+    assert (changed.status_code, deleted.status_code) == (200, 204)
+    db.expire_all()
+    assert db.query(Evaluation).filter(Evaluation.module_id == module.id).count() == 0
+
+
+def test_deleting_an_activity_while_a_change_to_it_is_applied(client, db, admin, worker, monkeypatch):
+    """The delete holds the activity before its changes go, as applying one does: the apply waits for it (instead of
+    each holding what the other needs) and then finds the activity gone."""
+    headers = auth_headers(client, admin.email)
+    module, activity = _content_module(db, admin)
+    revision_id = _propose(client, headers, worker, module.id, {"target": "activity", "activity_id": activity.id})
+    paused, release = _paused(monkeypatch, revisions, "forget_activities")  # its changes deleted, not it yet
+
+    deleted, applied = _while_paused(
+        paused, release, lambda: client.delete(f"/api/v1/activities/{activity.id}", headers=headers),
+        lambda: client.post(f"/api/v1/revisions/{revision_id}/apply", headers=headers, json={}),
+    )
+
+    assert deleted.status_code == 204
+    assert applied.status_code == 409 and applied.json()["detail"] == "La actividad de este cambio ya no existe"
+    assert db.query(Activity).filter(Activity.id == activity.id).count() == 0
+    assert db.query(ModuleRevision).filter(ModuleRevision.activity_id == activity.id).count() == 0
+
+
+def test_drafting_activities_again_while_a_change_to_a_draft_is_applied(client, db, admin, worker, monkeypatch):
+    """Drafting the module's activities again replaces the AI drafts nobody touched: it holds them before their
+    changes go, as applying one does, so the apply waits for it and then finds the draft gone."""
+    headers = auth_headers(client, admin.email)
+    module, _ = _content_module(db, admin)
+    module.content_text = "Usa siempre el casco, los guantes y las gafas: el equipo de protección es obligatorio."
+    draft = Activity(module_id=module.id, order=2, type="decision", title="Borrador", intro="Escucha.",
+                     spec=copy.deepcopy(DECISION), status="draft", source="ai")
+    db.add(draft)
+    db.commit()
+    revision_id = _propose(client, headers, worker, module.id, {"target": "activity", "activity_id": draft.id})
+    assert client.post(f"/api/v1/modules/{module.id}/activities/generate", headers=headers).status_code == 202
+    paused, release = _paused(monkeypatch, revisions, "forget_activities")
+
+    drafted, applied = _while_paused(
+        paused, release, worker,
+        lambda: client.post(f"/api/v1/revisions/{revision_id}/apply", headers=headers, json={}),
+    )
+
+    assert drafted == 1
+    assert applied.status_code == 409 and applied.json()["detail"] == "La actividad de este cambio ya no existe"
+    assert db.query(Activity).filter(Activity.id == draft.id).count() == 0
+    assert db.query(Job).filter(Job.type == "ai.activities", Job.status == "succeeded").count() == 1
+
+
 def test_two_saves_of_an_activity_at_once_are_both_kept(client, db, admin, monkeypatch):
     headers = auth_headers(client, admin.email)
     _, activity = _content_module(db, admin)
