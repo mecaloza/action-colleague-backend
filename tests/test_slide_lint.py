@@ -42,12 +42,14 @@ ONE_URL = "https://intranet.empresa.com/seguridad/procedimientos/uso-obligatorio
 
 @pytest.fixture(autouse=True)
 def fresh_caches():
-    """The lint keeps what it found per slide, and the preview the pictures it decoded: every test starts clean
-    (one swaps a layout, and every test's course has the same id, so the same picture paths)."""
+    """The lint keeps what it found per slide, and the preview the pictures it decoded and what the bubble covers of
+    them: every test starts clean (one swaps a layout, and every test's course has the same id, so the same picture
+    paths)."""
     from app.api.routes import studio as studio_routes
 
     lint._slide_findings.cache_clear()
     studio_routes._PICTURES.clear()
+    studio_routes._SHARES.clear()
     yield
     lint._slide_findings.cache_clear()
 
@@ -189,6 +191,10 @@ def test_a_text_that_does_not_fit_is_reported_on_the_field_the_admin_edits():
     assert [(f.field, f.message) for f in lint.check_slide(case, PRESENTER)] == [
         ("points.2", "La solución no cabe y se corta. Usa un texto más corto.")
     ]
+    figure = Slide(layout="stat", stat_value="87 %", title=LONG)  # without its meaning, the title takes its place
+    assert [(f.field, f.message) for f in lint.check_slide(figure, PRESENTER)] == [
+        ("stat_label", "Lo que significa el dato no cabe y se corta. Usa un texto más corto.")  # a figure has no title
+    ]
 
 
 def test_a_word_too_long_for_its_box_is_only_a_warning():
@@ -233,6 +239,20 @@ def test_the_lint_catches_what_a_layout_draws_where_it_must_not(monkeypatch, con
     ]
 
 
+def test_a_scene_added_or_moved_does_not_draw_the_rest_of_the_script_again():
+    slides = [Slide(layout="bullets", title=f"Regla {number}", points=["Casco", LONG]) for number in range(1, 4)]
+
+    def check(script: list[Slide]) -> list[list[lint.Finding]]:
+        return [lint.check_slide(slide, replace(PRESENTER, index=index, total=len(script)))
+                for index, slide in enumerate(script, start=1)]
+
+    before = check(slides)
+    drawn = lint._slide_findings.cache_info().misses
+    after = check([Slide(layout="statement", title="Una escena nueva")] + slides[::-1])  # every number changed
+    assert lint._slide_findings.cache_info().misses == drawn + 1  # only the new slide is drawn
+    assert after[1:] == before[::-1]
+
+
 def _infographic(covered: bool) -> Image.Image:
     picture = Image.new("RGB", (1536, 1024), (17, 17, 17))
     draw = ImageDraw.Draw(picture)
@@ -242,15 +262,19 @@ def _infographic(covered: bool) -> Image.Image:
     return picture
 
 
+COVERED_WARNING = {
+    "scene_id": "s2", "code": "visual_under_presenter", "severity": "warning", "field": "visual",
+    "message": "El presentador tapa parte de la infografía. Usa «Otra versión» de la infografía.",
+}
+
+
 def test_an_infographic_the_presenter_would_cover_gets_a_warning():
     slide = Slide(layout="visual", title="Presión y desgaste")
     context = replace(PRESENTER, backdrop=True)
-    assert lint.scene_warnings("s2", slide, context, _infographic(covered=False)) == []
-    assert lint.scene_warnings("s2", slide, context, _infographic(covered=True)) == [{
-        "scene_id": "s2", "code": "visual_under_presenter", "severity": "warning", "field": "visual",
-        "message": "El presentador tapa parte de la infografía. Usa «Otra versión» de la infografía.",
-    }]
-    assert lint.scene_warnings("s2", slide, replace(context, presenter=False), _infographic(covered=True)) == []
+    clear, covered = (lint.presenter_share(_infographic(covered=flag)) for flag in (False, True))
+    assert lint.scene_warnings("s2", slide, context, clear) == []
+    assert lint.scene_warnings("s2", slide, context, covered) == [COVERED_WARNING]
+    assert lint.scene_warnings("s2", slide, replace(context, presenter=False), covered) == []
     preview_copy = _infographic(covered=True)
     preview_copy.thumbnail((960, 960))  # the editor's preview keeps a smaller copy
     assert lint.presenter_share(preview_copy) > lint.MAX_PRESENTER_SHARE
@@ -324,11 +348,55 @@ def test_a_lint_that_fails_never_keeps_the_admin_from_the_script(client, admin_h
     assert saved.status_code == 200 and saved.json()["warnings"] == []
     opened = client.get(url, headers=admin_headers)
     assert opened.status_code == 200 and opened.json()["scenes"][1]["slide"]["points"][1] == LONG
+    checked = client.post(f"{url}/lint", headers=admin_headers, json={"scenes": [SCENES[0], TOO_LONG]})
+    assert checked.status_code == 200 and checked.json() == {"warnings": []}  # not an error at every pause in typing
 
 
-def test_an_infographic_already_made_is_checked_under_the_course_s_presenter(
-    client, db, admin_headers, module, storage, worker, monkeypatch
+def test_a_slide_the_lint_cannot_check_never_hides_the_warnings_of_the_others(
+    client, admin_headers, module, monkeypatch
 ):
+    checked = lint.scene_warnings
+
+    def broken_on_the_cover(scene_id, *args):
+        if scene_id == "s1":
+            raise RuntimeError("lint bug")
+        return checked(scene_id, *args)
+
+    monkeypatch.setattr(lint, "scene_warnings", broken_on_the_cover)
+    url = f"/api/v1/modules/{module.id}/storyboard"
+    script = {"scenes": [SCENES[0], TOO_LONG]}
+    assert client.put(url, headers=admin_headers, json=script).json()["warnings"] == [TOO_LONG_WARNING]
+    assert client.get(url, headers=admin_headers).json()["warnings"] == [TOO_LONG_WARNING]
+    assert client.post(f"{url}/lint", headers=admin_headers, json=script).json() == {"warnings": [TOO_LONG_WARNING]}
+
+
+def test_with_every_drawing_slot_busy_a_draft_waits_and_the_script_still_opens(
+    client, admin_headers, module, monkeypatch
+):
+    from app.api.routes import studio as studio_routes
+
+    monkeypatch.setattr(studio_routes, "PREVIEW_WAIT_SECONDS", 0)
+    url = f"/api/v1/modules/{module.id}/storyboard"
+    script = {"scenes": [SCENES[0], TOO_LONG]}
+    busy = [studio_routes._PREVIEW_SLOTS.acquire(timeout=1) for _ in range(2)]  # two previews being drawn
+    try:
+        assert all(busy)
+        checked = client.post(f"{url}/lint", headers=admin_headers, json=script)
+        assert checked.status_code == 429  # the editor asks again in a while
+        assert checked.json()["detail"] == "Hay muchas revisiones en curso; intenta de nuevo."
+        saved = client.put(url, headers=admin_headers, json=script)
+        assert saved.status_code == 200 and saved.json()["warnings"] == []  # saved all the same, checked later
+        opened = client.get(url, headers=admin_headers)
+        assert opened.status_code == 200 and opened.json()["scenes"][1]["slide"]["points"][1] == LONG
+    finally:
+        for taken in busy:
+            if taken:
+                studio_routes._PREVIEW_SLOTS.release()
+    assert client.get(url, headers=admin_headers).json()["warnings"] == [TOO_LONG_WARNING]
+
+
+def _covering_infographics(monkeypatch) -> list[str]:
+    """Fake infographics drawn where the presenter's bubble goes; returns the prompts each was made from."""
     made = []
 
     def covered(self, prompt, dest):
@@ -338,15 +406,38 @@ def test_an_infographic_already_made_is_checked_under_the_course_s_presenter(
         return dest
 
     monkeypatch.setattr(FakeVisuals, "infographic", covered)
-    url = f"/api/v1/modules/{module.id}/storyboard"
-    saved = client.put(url, headers=admin_headers, json={"scenes": [SCENES[0], INFOGRAPHIC_SCENE]}).json()
-    assert saved["warnings"] == [] and made == []  # not made yet: nothing to check, and the lint never makes it
+    return made
 
+
+def test_an_infographic_is_checked_once_its_preview_shows_it_and_the_lint_never_reads_the_storage(
+    client, db, admin_headers, module, storage, worker, monkeypatch
+):
+    made = _covering_infographics(monkeypatch)
+    url = f"/api/v1/modules/{module.id}/storyboard"
+    script = {"scenes": [SCENES[0], INFOGRAPHIC_SCENE]}
+    saved = client.put(url, headers=admin_headers, json=script).json()
+    assert saved["warnings"] == [] and made == []  # not made yet: nothing to check, and the lint never makes it
     worker()  # the visuals.prepare job the save queued
-    [warning] = client.get(url, headers=admin_headers).json()["warnings"]
-    assert (warning["scene_id"], warning["code"], warning["field"]) == ("s2", "visual_under_presenter", "visual")
-    lint_response = client.post(f"{url}/lint", headers=admin_headers, json={"scenes": [SCENES[0], INFOGRAPHIC_SCENE]})
-    assert lint_response.json()["warnings"] == [warning] and len(made) == 1
+
+    reads = []
+    for method in ("size", "download_file"):
+        real = getattr(storage, method)
+        monkeypatch.setattr(storage, method, lambda *args, real=real, method=method: reads.append(method) or real(*args))
+    # Made, but no preview has shown it yet: opening, saving or checking the script never waits on the storage.
+    assert client.get(url, headers=admin_headers).json()["warnings"] == []
+    assert client.put(url, headers=admin_headers, json=script).json()["warnings"] == []
+    assert client.post(f"{url}/lint", headers=admin_headers, json=script).json()["warnings"] == []
+    assert reads == []
+
+    preview = {"slide": INFOGRAPHIC_SCENE["slide"], "visual": INFOGRAPHIC_SCENE["visual"],
+               "course_id": module.course_id, "context": {"index": 2, "total": 2, "presenter": True, "backdrop": True}}
+    shown = client.post("/api/v1/slides/preview", headers=admin_headers, json=preview)
+    assert shown.status_code == 200 and "x-visual-pending" not in shown.headers
+    assert "download_file" in reads  # the editor's preview reads the picture, and measures it
+    reads.clear()
+    assert client.get(url, headers=admin_headers).json()["warnings"] == [COVERED_WARNING]
+    assert client.post(f"{url}/lint", headers=admin_headers, json=script).json()["warnings"] == [COVERED_WARNING]
+    assert reads == [] and len(made) == 1
 
     course = db.get(Course, module.course_id)
     course.settings = {"presenter": False}  # the course's videos have no bubble to cover it
@@ -354,9 +445,9 @@ def test_an_infographic_already_made_is_checked_under_the_course_s_presenter(
     assert client.get(url, headers=admin_headers).json()["warnings"] == []
 
 
-def _render(client, db, headers, module, worker) -> Job:
+def _render(client, db, headers, module, worker, **choices) -> Job:
     response = client.post(f"/api/v1/courses/{module.course_id}/render", headers=headers,
-                           json={"voice_id": "fake-voice-es", "presenter": False})
+                           json={"voice_id": "fake-voice-es", "presenter": False, **choices})
     assert response.status_code == 202, response.text
     for _ in range(6):
         db.query(Job).filter(Job.status == "queued").update(
@@ -377,6 +468,18 @@ def test_the_render_keeps_its_slides_lint_for_the_video_review(client, db, admin
     job = _render(client, db, admin_headers, module, worker)
     assert db.get(Module, module.id).generation_status == "completed"
     assert job.state["lint"] == {"warnings": [TOO_LONG_WARNING]}
+
+
+@ffmpeg
+def test_the_render_checks_its_infographics_under_the_presenter(
+    client, db, admin_headers, module, storage, worker, monkeypatch
+):
+    _covering_infographics(monkeypatch)
+    module.storyboard = {"scenes": [SCENES[0], INFOGRAPHIC_SCENE]}
+    db.commit()
+    job = _render(client, db, admin_headers, module, worker, presenter=True, avatar_id="fake-avatar")
+    assert db.get(Module, module.id).generation_status == "completed"
+    assert job.state["lint"] == {"warnings": [COVERED_WARNING]}
 
 
 @ffmpeg

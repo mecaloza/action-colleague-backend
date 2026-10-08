@@ -9,6 +9,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from PIL import Image
@@ -255,31 +256,36 @@ def draft_modules(
     return [job_out(job) for job in jobs]
 
 
-def _storyboard_out(module: Module) -> StoryboardOut:
-    """The module's script, with what doesn't fit or overlaps on its slides."""
+def _storyboard_out(db: Session, module: Module) -> StoryboardOut:
+    """The module's script, with what doesn't fit or overlaps on its slides. The lint never keeps the admin from the
+    script: with every drawing slot busy for too long, it comes without warnings (the next check has them)."""
     scenes = Storyboard(scenes=studio.scenes_of(module)).scenes
+    look = _ScriptLook.of(module)
+    db.close()  # everything is read: the connection goes back to the pool before waiting to draw
+    if not _PREVIEW_SLOTS.acquire(timeout=PREVIEW_WAIT_SECONDS):  # drawing, like the previews: one budget
+        logger.warning("storyboard_lint_skipped", extra={"module_id": look.module_id})
+        return StoryboardOut(scenes=scenes)
     try:
-        warnings = _layout_warnings(module, scenes)
-    except Exception:  # advice only: it never keeps the admin from opening (or having saved) the script
-        logger.exception("storyboard_lint_failed", extra={"module_id": module.id})
-        warnings = []
-    return StoryboardOut(scenes=scenes, warnings=warnings)
+        return StoryboardOut(scenes=scenes, warnings=_layout_warnings(look, scenes))
+    finally:
+        _PREVIEW_SLOTS.release()
 
 
 @router.get("/modules/{module_id}/storyboard", response_model=StoryboardOut)
 def get_storyboard(module_id: int, db: Session = Depends(get_db)):
-    return _storyboard_out(module_or_404(db, module_id))
+    return _storyboard_out(db, module_or_404(db, module_id))
 
 
 @router.post("/modules/{module_id}/storyboard/lint", response_model=StoryboardLint)
 def lint_storyboard(module_id: int, payload: StoryboardDraft, db: Session = Depends(get_db)):
     """What doesn't fit or overlaps on the slides of a script being edited (not saved), checked as the admin types:
-    the slides only, over the infographics already made; nothing is asked of a provider."""
-    module = module_or_404(db, module_id)
-    if not _PREVIEW_SLOTS.acquire(timeout=PREVIEW_WAIT_SECONDS):  # drawing, like the previews: one budget
+    the slides only, over the infographics already measured; neither the storage nor a provider is asked."""
+    look = _ScriptLook.of(module_or_404(db, module_id))
+    db.close()  # as `_storyboard_out`: no connection held while waiting to draw
+    if not _PREVIEW_SLOTS.acquire(timeout=PREVIEW_WAIT_SECONDS):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Hay muchas revisiones en curso; intenta de nuevo.")
     try:
-        return StoryboardLint(warnings=_layout_warnings(module, payload.scenes))
+        return StoryboardLint(warnings=_layout_warnings(look, payload.scenes))
     finally:
         _PREVIEW_SLOTS.release()
 
@@ -301,7 +307,7 @@ def save_storyboard(module_id: int, payload: Storyboard, db: Session = Depends(g
     module.storyboard = {**(module.storyboard or {}), "scenes": [scene.model_dump() for scene in payload.scenes]}
     studio.queue_visuals(db, module)  # a new or changed infographic is made now, for the preview
     db.commit()
-    return _storyboard_out(module)
+    return _storyboard_out(db, module)
 
 
 @router.post("/modules/{module_id}/storyboard/regenerate", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
@@ -338,7 +344,8 @@ def suggest_quiz(
 
 
 # Rendering is CPU work in the API process: a few at a time, the rest wait their turn (an editor opening a
-# long script asks for every scene at once) instead of piling up on the server's threads.
+# long script asks for every scene at once) instead of piling up on the server's threads. The layout lint draws
+# too (a script opened, saved or checked as the admin types): one budget.
 _PREVIEW_SLOTS = threading.BoundedSemaphore(2)
 PREVIEW_WAIT_SECONDS = 15
 
@@ -367,6 +374,12 @@ _PICTURES: OrderedDict[str, Image.Image] = OrderedDict()
 _PICTURES_LOCK = threading.Lock()
 MAX_CACHED_PICTURES = 16
 PICTURE_SIZE = (960, 960)  # enough to fill (or fit in) the 960x540 preview
+# How much of the presenter's bubble lies over each infographic (`lint.presenter_share`), by its file: measured when
+# a preview first shows it, and kept (a file never changes: its path is a hash of what it was made from). The layout
+# lint reads only this, so checking a script never waits on the storage.
+_SHARES: OrderedDict[str, float] = OrderedDict()
+_SHARES_LOCK = threading.Lock()
+MAX_CACHED_SHARES = 4096
 
 
 def _visual_request(slide: Slide, visual: SceneVisual) -> VisualRequest:
@@ -405,37 +418,81 @@ def _prepared_picture(db: Session, payload: SlidePreview) -> tuple[Image.Image |
     if visual is None or payload.course_id is None or visual.kind not in studio.PREPARED_VISUALS:
         return None, False
     request = _visual_request(payload.slide, visual)
+    path = cache_path(payload.course_id, request)
     try:
-        picture = _stored_picture(cache_path(payload.course_id, request))
+        picture = _stored_picture(path)
     except (StorageError, OSError):
         return None, False  # the preview still shows the slide over the sample
     if picture is None:
         return None, _preparing(db, payload.course_id, request)
+    if visual.kind == "infographic":
+        _measure(path, picture)
     return picture, False
 
 
-def _layout_warnings(module: Module, scenes: list[StoryboardScene]) -> list[dict]:
+def _measure(path: str, picture: Image.Image) -> None:
+    """Note how much of the presenter's bubble lies over the infographic at `path` (see `_SHARES`)."""
+    with _SHARES_LOCK:
+        if path in _SHARES:
+            _SHARES.move_to_end(path)
+            return
+    share = lint.presenter_share(picture)
+    with _SHARES_LOCK:
+        _SHARES[path] = share
+        while len(_SHARES) > MAX_CACHED_SHARES:
+            _SHARES.popitem(last=False)
+
+
+def _measured(path: str) -> float | None:
+    """The share of the infographic at `path` (None until a preview has shown it)."""
+    with _SHARES_LOCK:
+        share = _SHARES.get(path)
+        if share is not None:
+            _SHARES.move_to_end(path)
+        return share
+
+
+@dataclass(frozen=True)
+class _ScriptLook:
+    """How a module's slides are drawn: its course's look and presenter (read before the database is let go)."""
+
+    module_id: int
+    course_id: int
+    course_title: str
+    module_label: str
+    theme: str
+    presenter: bool
+
+    @classmethod
+    def of(cls, module: Module) -> "_ScriptLook":
+        course = module.course
+        settings = course.settings or {}
+        return cls(
+            module_id=module.id, course_id=course.id, course_title=course.title, module_label=f"Módulo {module.order}",
+            theme=settings.get("theme") or "dark", presenter=bool(settings.get("presenter", True)),
+        )
+
+
+def _layout_warnings(look: _ScriptLook, scenes: list[StoryboardScene]) -> list[dict]:
     """What doesn't fit or overlaps on the scenes' slides as the editor previews them, which is how the video draws
     them: the course's look and presenter, the text over a picture when the scene has a visual, and the bubble over
-    each infographic already made (one not made yet is checked once it is)."""
-    course = module.course
-    settings = course.settings or {}
-    presenter = bool(settings.get("presenter", True))
+    each infographic its preview has shown (one not made or not shown yet is checked once it is). Advice only: a
+    slide the lint can't check is left out, never the others' warnings."""
     warnings = []
     for index, scene in enumerate(scenes, start=1):
-        hero = is_hero(scene.slide, index, len(scenes), presenter)
-        context = SlideContext(
-            course_title=course.title, module_label=f"Módulo {module.order}", index=index, total=len(scenes),
-            theme=settings.get("theme") or "dark", presenter=presenter and not hero, hero=hero,
-            backdrop=scene.visual.kind != "none",
-        )
-        infographic = None
-        if scene.visual.kind == "infographic" and context.presenter:
-            try:
-                infographic = _stored_picture(cache_path(course.id, _visual_request(scene.slide, scene.visual)))
-            except (StorageError, OSError):
-                pass  # checked on the next lint
-        warnings += lint.scene_warnings(scene.id, scene.slide, context, infographic)
+        try:
+            hero = is_hero(scene.slide, index, len(scenes), look.presenter)
+            context = SlideContext(
+                course_title=look.course_title, module_label=look.module_label, index=index, total=len(scenes),
+                theme=look.theme, presenter=look.presenter and not hero, hero=hero,
+                backdrop=scene.visual.kind != "none",
+            )
+            covered = None
+            if scene.visual.kind == "infographic" and context.presenter:
+                covered = _measured(cache_path(look.course_id, _visual_request(scene.slide, scene.visual)))
+            warnings += lint.scene_warnings(scene.id, scene.slide, context, covered)
+        except Exception:
+            logger.exception("storyboard_lint_failed", extra={"module_id": look.module_id, "scene_id": scene.id})
     return warnings
 
 

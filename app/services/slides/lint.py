@@ -1,9 +1,9 @@
 """
 Layout lint: what doesn't fit or overlaps on a slide, told to the admin before a video is paid for.
 
-The slide is drawn exactly as the video draws it, with a drawing handle (`Recorder`) that notes the box of every
-text and shape and the part of the slide it belongs to (`render.part`); `fit` says when a text had to be cut.
-What is reported, per field of the slide:
+The slide is drawn as the video draws it (with the widest header and page counter: `LINT_FRAME`), with a drawing
+handle (`Recorder`) that notes the box of every text and shape and the part of the slide it belongs to
+(`render.part`); `fit` says when a text had to be cut. What is reported, per field of the slide:
 
   text_truncated          error    a text doesn't fit even at its smallest size: its end is cut
   word_broken             warning  a word wider than its box is split across lines
@@ -65,6 +65,9 @@ PRESENTER_CLEARANCE = 8  # around the presenter's circle (its ring is inside it)
 MIN_TEXT_OVERLAP = 3  # px both ways: ink boxes that only touch are not two texts on top of each other
 MAX_PRESENTER_SHARE = 0.02  # of the bubble over an infographic's drawings: more hides part of what it explains
 CONTENT_CONTRAST = 48  # how far (0-255, in any channel) a pixel is from the background to be part of a drawing
+# The header and the page counter only change the frame, and the content never goes where they are: every slide is
+# checked with the widest of them, so a scene moved, added or removed doesn't draw the rest of the script again.
+LINT_FRAME = {"course_title": "W" * 70, "module_label": "", "index": 99, "total": 99}
 
 
 @dataclass(frozen=True)
@@ -232,7 +235,8 @@ def _check(slide: Slide, ctx: SlideContext, recorder: Recorder) -> list[Finding]
 
 @lru_cache(maxsize=1024)
 def _slide_findings(slide_json: str, ctx: SlideContext) -> tuple[Finding, ...]:
-    """(Kept: the editor checks its whole draft after every change, and most of its slides didn't change.)"""
+    """(Kept: the editor checks its whole draft after every change, and most of its slides didn't change, wherever
+    they are in it now.)"""
     slide = Slide.model_validate_json(slide_json)
     recorder = Recorder()
     render(slide, ctx, draw_with=recorder)
@@ -241,7 +245,7 @@ def _slide_findings(slide_json: str, ctx: SlideContext) -> tuple[Finding, ...]:
 
 def check_slide(slide: Slide, ctx: SlideContext) -> list[Finding]:
     """What doesn't fit or overlaps on the slide, drawn whole (every beat on screen) as the video draws it."""
-    return list(_slide_findings(slide.model_dump_json(), replace(ctx, reveal=None)))
+    return list(_slide_findings(slide.model_dump_json(), replace(ctx, reveal=None, **LINT_FRAME)))
 
 
 def presenter_share(picture: Image.Image) -> float:
@@ -270,22 +274,20 @@ def presenter_share(picture: Image.Image) -> float:
     return drawn.histogram()[255] / (pi * radius**2)
 
 
-def check_infographic(picture: Image.Image) -> list[Finding]:
-    """Whether the presenter's bubble hides part of the scene's infographic."""
-    if presenter_share(picture) <= MAX_PRESENTER_SHARE:
+def check_infographic(covered: float) -> list[Finding]:
+    """Whether the presenter's bubble hides part of the scene's infographic (`covered`: its `presenter_share`)."""
+    if covered <= MAX_PRESENTER_SHARE:
         return []
     code: LintCode = "visual_under_presenter"
     return [Finding(code, SEVERITY[code], "visual", _message(code, "visual", "visual"))]
 
 
-def scene_warnings(
-    scene_id: str, slide: Slide, ctx: SlideContext, infographic: Image.Image | None = None
-) -> list[dict]:
-    """A scene's findings as the API reports them. `infographic`: the scene's picture, already made, when it is
-    shown with the presenter's bubble over it."""
+def scene_warnings(scene_id: str, slide: Slide, ctx: SlideContext, covered: float | None = None) -> list[dict]:
+    """A scene's findings as the API reports them. `covered`: the `presenter_share` of the scene's infographic,
+    already made, when it is shown with the presenter's bubble over it."""
     findings = check_slide(slide, ctx)
-    if infographic is not None and ctx.presenter and not ctx.hero:
-        findings += check_infographic(infographic)
+    if covered is not None and ctx.presenter and not ctx.hero:
+        findings += check_infographic(covered)
     return [{"scene_id": scene_id, **asdict(finding)} for finding in findings]
 
 
@@ -295,7 +297,7 @@ POINT_NOUNS = {"bullets": "la viñeta {n}", "steps": "el paso {n}", "calculation
 CASE_NOUNS = ("la situación", "el diagnóstico", "la solución", "el resultado")  # its CASE_PARTS
 FIELD_NOUNS = {  # the editor's names for each field, per layout ("*": any other)
     "title": {"statement": "la frase", "case": "el título del caso", "chart": "el título de la gráfica",
-              "visual": "el tema de la infografía", "stat": "lo que significa el dato", "*": "el título"},
+              "visual": "el tema de la infografía", "*": "el título"},
     "subtitle": {"stat": "el contexto", "*": "el subtítulo"},
     "stat_value": {"calculation": "el resultado", "*": "el dato"},
     "stat_label": {"calculation": "lo que significa el resultado", "*": "lo que significa el dato"},

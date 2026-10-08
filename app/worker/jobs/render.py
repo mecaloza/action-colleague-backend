@@ -683,11 +683,11 @@ def _layout_warnings(
 ) -> list[dict]:
     """The layout lint of a scene as this video draws it. Only advice: a failure here never costs the video."""
     try:
-        picture = None
+        covered = None
         if infographic is not None and infographic.suffix == ".png":
             with Image.open(infographic) as opened:
-                picture = opened.convert("RGB")
-        return lint.scene_warnings(str(scene.get("id", "")), slide, context, picture)
+                covered = lint.presenter_share(opened)
+        return lint.scene_warnings(str(scene.get("id", "")), slide, context, covered)
     except Exception:
         logger.exception("render_lint_failed", extra={"module_id": ctx.module_id, "scene": scene.get("id")})
         return []

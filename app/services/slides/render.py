@@ -538,7 +538,9 @@ def _stat(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageDr
     label = fit(draw, slide.stat_label or slide.title, DISPLAY_FONT, 600, label_right - left, 170, 72, 44, max_lines=2)
     if not shown(ctx, 2):
         return
-    with part(draw, "stat_label" if slide.stat_label else "title", label):
+    # Without its meaning the title takes its place, and the admin fixes it by writing the meaning (a figure's editor
+    # has no title).
+    with part(draw, "stat_label", label):
         y = draw_lines(draw, label, left, y, theme.text) + 20
     if slide.subtitle:
         sub_right = _text_right_limit(ctx, bottom, right)
