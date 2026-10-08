@@ -23,12 +23,9 @@ from app.schemas.paths import PathRef
 from app.schemas.profiles import ProfileRef
 from app.schemas.ranking import LearnerRanking, LearnerRankingItem, Ranking, RankingItem, RankingMe, RankingUser
 from app.services import settings as platform
+from app.services.certificates import utcnow
 
 LEARNER_TOP = 10
-
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def period_start(period: str, zone: str, now: datetime | None = None) -> datetime | None:

@@ -14,7 +14,6 @@ Points ("puntos"): what learners earn for learning, kept as a ledger (`learner_p
 
 import logging
 from collections.abc import Iterable
-from datetime import datetime, timezone
 from math import floor
 
 from sqlalchemy import DateTime, Integer, String, cast, exists, func, insert, literal, null, select
@@ -23,20 +22,12 @@ from sqlalchemy.orm import Session
 
 from app.db.models import ActivityAttempt, Enrollment, EvaluationAttempt, ModuleProgress, PathAssignment, PointsEntry
 from app.services import settings as platform
+from app.services.certificates import aware, utcnow
 
 logger = logging.getLogger(__name__)
 
 _COLUMNS = ["user_id", "course_id", "path_id", "source", "source_key", "points", "earned_at"]
 _BATCH = 500  # rows per insert: far below the database's limit of parameters per statement
-
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def aware(value: datetime | None) -> datetime | None:
-    """Naive columns (and SQLite) hold UTC: comparable again."""
-    return value.replace(tzinfo=timezone.utc) if value is not None and value.tzinfo is None else value
 
 
 def percent(score: int, max_score: int) -> int:

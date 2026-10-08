@@ -34,11 +34,11 @@ from app.schemas.people import (
 )
 from app.schemas.profiles import ProfileRef
 from app.services import certificates, paths, points, progress
+from app.services.certificates import aware
 from app.services.learner_views import max_score, quiz_summary
 from app.services.media import MediaResolver
 from app.services.metrics import percentage
 from app.services.path_views import learner_path
-from app.services.points import aware
 
 RECENT_LIMIT = 25
 
@@ -195,14 +195,14 @@ def overview(db: Session, user: User) -> PersonOverview:
     media = MediaResolver(db).prepare(
         extra_asset_ids=[step.cover_asset_id for path in journey.paths for step in path.steps]
     )
-    earned = db.execute(select(func.coalesce(func.sum(PointsEntry.points), 0)).where(PointsEntry.user_id == user.id))
+    earned = db.execute(select(func.sum(PointsEntry.points)).where(PointsEntry.user_id == user.id)).scalar()
     return PersonOverview(
         user=_person(db, user),
         kpis=PersonKpis(
             courses_assigned=len(enrollments),
             courses_completed=sum(1 for enrollment in enrollments if enrollment.status == "completed"),
             average_score=round(sum(scores) / len(scores), 1) if scores else None,
-            points=int(earned.scalar() or 0),
+            points=int(earned or 0),
             certificates=sum(1 for c in certificate_rows if certificates.status_of(c, now) == "valid"),
             activities_played=len(plays.stats),
         ),
