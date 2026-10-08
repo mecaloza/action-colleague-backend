@@ -591,7 +591,7 @@ def _closing(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.Imag
     _numbered_list(slide, ctx, theme, draw, top)
 
 
-def _number(value: float) -> str:
+def chart_number(value: float) -> str:
     """A chart value as people read it in Spanish: 120000 -> 120 000, 0.054 -> 0,054."""
     text = f"{value:,.3f}".rstrip("0").rstrip(".") if value % 1 else f"{value:,.0f}"
     return text.replace(",", " ").replace(".", ",")
@@ -615,7 +615,7 @@ def _chart(slide: Slide, ctx: SlideContext, theme: Theme, draw: ImageDraw.ImageD
     # The values share one size and always leave the bars MIN_BAR_ROOM: a long unit wraps or shrinks (cut as a last
     # resort), never past the right edge, and the largest bar never collapses.
     value_room = right - bar_left - VALUE_GAP - MIN_BAR_ROOM
-    values = fit_all(draw, [_number(value) + unit for _, value in bars], DISPLAY_FONT, 700, value_room, row,
+    values = fit_all(draw, [chart_number(value) + unit for _, value in bars], DISPLAY_FONT, 700, value_room, row,
                      max(24, min(52, row - 30)), 24, max_lines=2)
     room = right - bar_left - VALUE_GAP - max(lines_width(draw, text) for text in values)  # one scale for all
     fields = chart_bar_indexes(slide)
