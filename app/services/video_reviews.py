@@ -11,7 +11,7 @@ beside the video (`review/` in its folder) and go with it: its asset names them 
 
 import logging
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.db.models import Job, MediaAsset, Module, VideoReview
@@ -94,28 +94,62 @@ def current(db: Session, module: Module) -> VideoReview | None:
     )
 
 
+def _still_open(issues: list[dict] | None) -> list[dict]:
+    return [issue for issue in issues or [] if issue.get("status", OPEN) == OPEN]
+
+
+def _critical(issues: list[dict]) -> int:
+    return sum(1 for issue in issues if issue.get("severity") == "critical")
+
+
 def badge(status: str, verdict: str | None, issues: list[dict] | None) -> ReviewBadge:
-    still_open = [issue for issue in issues or [] if issue.get("status", OPEN) == OPEN]
-    critical = sum(1 for issue in still_open if issue.get("severity") == "critical")
-    return ReviewBadge(status=status, verdict=verdict, open_issues=len(still_open), critical=critical)
+    still_open = _still_open(issues)
+    return ReviewBadge(status=status, verdict=verdict, open_issues=len(still_open), critical=_critical(still_open))
+
+
+def _ai_videos(modules: list[Module]) -> dict[str, int]:
+    """{video asset id: module id} of the modules with an AI video."""
+    return {module.video_asset_id: module.id for module in modules if module.source == "ai" and module.video_asset_id}
+
+
+def _newest(videos: dict[str, int], *conditions):
+    """The id of the newest review of each of these videos (among those that meet `conditions`)."""
+    return (
+        select(func.max(VideoReview.id)).where(VideoReview.video_asset_id.in_(list(videos)), *conditions)
+        .group_by(VideoReview.video_asset_id)
+    )
 
 
 def badges(db: Session, modules: list[Module]) -> dict[int, ReviewBadge]:
     """The newest review of each module's AI video, at a glance, in one query."""
-    videos = {module.video_asset_id: module.id for module in modules if module.source == "ai" and module.video_asset_id}
+    videos = _ai_videos(modules)
     if not videos:
         return {}
-    newest = (
-        select(func.max(VideoReview.id)).where(VideoReview.video_asset_id.in_(list(videos)))
-        .group_by(VideoReview.video_asset_id)
-    )
     rows = db.query(
         VideoReview.module_id, VideoReview.video_asset_id, VideoReview.status, VideoReview.verdict, VideoReview.issues
-    ).filter(VideoReview.id.in_(newest))
+    ).filter(VideoReview.id.in_(_newest(videos)))
     return {
         module_id: badge(status, verdict, issues)
         for module_id, video, status, verdict, issues in rows if videos.get(video) == module_id
     }
+
+
+def blocking(db: Session, modules: list[Module]) -> dict[int, int]:
+    """The open critical findings that keep each module from being published (with `qa.block_publish`), in one query:
+    those of the newest review of its AI video and, while that one isn't done (waiting, running or failed), those of
+    the newest one that is too. Asking for a review again, or one that fails, never lets them through: only a review
+    that is done stands for the video."""
+    videos = _ai_videos(modules)
+    if not videos:
+        return {}
+    rows = db.query(VideoReview.module_id, VideoReview.video_asset_id, VideoReview.issues).filter(
+        or_(VideoReview.id.in_(_newest(videos)), VideoReview.id.in_(_newest(videos, VideoReview.status == "done")))
+    )
+    found: dict[int, int] = {}
+    for module_id, video, issues in rows:
+        if videos.get(video) == module_id:
+            found[module_id] = found.get(module_id, 0) + _critical(_still_open(issues))
+    return {module_id: count for module_id, count in found.items() if count}
 
 
 def review_out(review: VideoReview) -> VideoReviewOut:

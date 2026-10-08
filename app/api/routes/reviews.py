@@ -59,21 +59,28 @@ def _review_or_404(db: Session, review_id: int) -> VideoReview:
     return review
 
 
-def _set_issue(db: Session, review_id: int, issue_id: str, wanted: str) -> VideoReviewOut:
+def _set_issue(db: Session, review_id: int, issue_id: str, wanted: str, admin: User) -> VideoReviewOut:
     review = _review_or_404(db, review_id)
     if not video_reviews.set_issue_status(review, issue_id, wanted):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Hallazgo no encontrado")
     db.commit()
+    # Who did it: ignoring a critical finding is what lets a course be published with `qa.block_publish`.
+    logger.info("review_issue_set", extra={"review_id": review.id, "module_id": review.module_id, "issue_id": issue_id,
+                                           "status": wanted, "admin_id": admin.id})
     return video_reviews.review_out(review)
 
 
 @router.post("/reviews/{review_id}/issues/{issue_id}/dismiss", response_model=VideoReviewOut)
-def dismiss_issue(review_id: int, issue_id: str, db: Session = Depends(get_db)):
+def dismiss_issue(
+    review_id: int, issue_id: str, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+):
     """Ignore a finding: it no longer counts as open (nor blocks publishing)."""
-    return _set_issue(db, review_id, issue_id, video_reviews.DISMISSED)
+    return _set_issue(db, review_id, issue_id, video_reviews.DISMISSED, admin)
 
 
 @router.post("/reviews/{review_id}/issues/{issue_id}/reopen", response_model=VideoReviewOut)
-def reopen_issue(review_id: int, issue_id: str, db: Session = Depends(get_db)):
+def reopen_issue(
+    review_id: int, issue_id: str, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+):
     """Count a finding as open again (one dismissed, or fixed by a change that didn't fix it after all)."""
-    return _set_issue(db, review_id, issue_id, video_reviews.OPEN)
+    return _set_issue(db, review_id, issue_id, video_reviews.OPEN, admin)

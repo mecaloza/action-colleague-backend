@@ -917,6 +917,20 @@ def _new_asset(db: Session, render: RenderInput, kind: str, upload: _Upload, **f
     return asset
 
 
+def _store_frames(ctx: JobContext, frames: list[_Upload]) -> bool:
+    """Store the review's frames beside the video. Only advice: when one can't be stored, none stays (False) and the
+    video is published all the same."""
+    try:
+        for frame in frames:
+            get_storage().upload_file(frame.path, frame.local, frame.mime)
+    except (StorageError, OSError) as exc:
+        logger.warning("review_frames_upload_failed",
+                       extra={"module_id": ctx.module_id, "error": str(exc)[:MAX_LOG_ERROR_CHARS]})
+        _delete_files([frame.path for frame in frames], ctx.module_id)
+        return False
+    return True
+
+
 def _publish(ctx: JobContext, render: RenderInput, made: _Composition) -> dict:
     """Store the files, make them the module's video (replacing the previous one) and clean up."""
     # A folder per run: a worker that lost the job only ever deletes its own copies.
@@ -928,16 +942,17 @@ def _publish(ctx: JobContext, render: RenderInput, made: _Composition) -> dict:
         _Upload(f"{folder}/review/{video_review.frame_name(frame['index'])}", "image/jpeg", file)
         for frame, file in zip(made.review.frames, made.review.files)
     ] if made.review else []
-    uploads = (video, poster, vtt, *frames)
-    published = [upload.path for upload in uploads]
+    published = [upload.path for upload in (video, poster, vtt, *frames)]
     # Saved before uploading: if this process dies meanwhile, whoever comes next deletes the copy.
     abandoned = ctx.state.get("uploading") or []  # an earlier run's copy: that run never published it
     ctx.state["uploading"] = published
     ctx.progress(95, "Guardando el video")
     _delete_files(abandoned, ctx.module_id)
     storage = get_storage()
-    for upload in uploads:
+    for upload in (video, poster, vtt):
         storage.upload_file(upload.path, upload.local, upload.mime)
+    if frames and not _store_frames(ctx, frames):  # its review takes its own from the published video
+        made.review, frames = _Review(), []
 
     seconds = round(made.duration, 2)
     with open_session() as db:

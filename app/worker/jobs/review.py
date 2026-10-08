@@ -4,8 +4,9 @@ render took (or, for a video reviewed again or made before reviews, frames taken
 read against what each scene should show, with what the video's own checks found; then the AI reads the script against
 the quiz and the course's materials.
 
-It never changes the module, its video or its generation status. A review that can't be done says why (status
-"error") and keeps what the checks found; a model that doesn't answer is asked again later (the job retries).
+It never changes the module, its video or its generation status. A review whose frames can't be taken or looked at
+says why (status "error") and keeps what the checks found, and the script is read all the same (that needs no
+pictures); a model that doesn't answer is asked again later (the job retries).
 """
 
 import logging
@@ -28,7 +29,10 @@ from app.worker.runner import JobContext, JobError, handler, open_session
 
 logger = logging.getLogger(__name__)
 
-REPLACED = "El video cambió antes de revisarlo: se revisa el nuevo."
+REPLACED = "El video cambió antes de revisarlo; esta revisión ya no aplica."
+# A video whose render isn't known (made before its render kept its script): the module's script now may not be the
+# one it was made from, and an empty one would make every question of the quiz look unanswerable.
+NO_SCRIPT = "No se sabe con qué guion se produjo este video."
 
 
 def _now() -> datetime:
@@ -182,6 +186,8 @@ def review_video(ctx: JobContext) -> dict:
         db.commit()
 
     ctx.progress(5, "Preparando la revisión")
+    error = None  # why the frames can't be looked at (what the checks find and the script's reading still count)
+    images: list[bytes] = []
     with tempfile.TemporaryDirectory(prefix="review-") as tmp:
         work = Path(tmp)
         local: dict[int, Path] = {}
@@ -191,47 +197,58 @@ def review_video(ctx: JobContext) -> dict:
                 local = _sample(ctx, ask, work)
             except video_review.ReviewError as exc:  # the video can't be read: trying again won't help
                 logger.warning("review_sampling_failed", extra={"review_id": review_id, "error": str(exc)[:300]})
-                _finish(review_id, [], error=str(exc))
-                return {"review_id": review_id, "error": str(exc)}
+                error, ask.checks = str(exc), {"lint": ask.lint}  # the render's lint is known without the video
             except _Replaced:
                 _finish(review_id, [], error=REPLACED)
                 return {"skipped": "video replaced"}
-        images = _images(ask.frames, local, work)
+        if error is None:
+            images = _images(ask.frames, local, work)
 
     issues = video_reviews.check_issues(ask.video, ask.frames, ask.checks)
     _keep(review_id, issues)  # what the checks found shows while the AI looks
-    ctx.progress(40, "Revisando los fotogramas con IA")
-    looking, reading = {}, {}  # the tokens each call takes
     try:
         llm = get_llm()
-        seen = designer.review_frames(
-            llm, course_title=ask.course_title, module_title=ask.module_title,
-            frames=[ask.video.context(frame) for frame in video_reviews.frames_of(ask.video, ask.frames)],
-            known=[issue["description"] for issue in issues], images=images, usage=looking,
-        )
-    except LLMError as exc:
-        if not exc.permanent:
-            raise JobError(str(exc)) from exc
-        logger.warning("review_vision_failed", extra={"review_id": review_id, "error": str(exc)[:300]})
-        _finish(review_id, issues, error=str(exc), usage=_usage(looking))
-        return {"review_id": review_id, "error": str(exc)}
-    issues += video_reviews.vision_issues(seen, ask.frames, ask.video)
+    except LLMError as exc:  # no AI here now: maybe later
+        raise JobError(str(exc)) from exc
+    looking, reading, summaries = {}, {}, []  # the tokens each call takes; what each one says
+    if error is None:
+        ctx.progress(40, "Revisando los fotogramas con IA")
+        try:
+            seen = designer.review_frames(
+                llm, course_title=ask.course_title, module_title=ask.module_title,
+                frames=[ask.video.context(frame) for frame in video_reviews.frames_of(ask.video, ask.frames)],
+                known=[issue["description"] for issue in issues], images=images, usage=looking,
+            )
+        except LLMError as exc:
+            if not exc.permanent:
+                raise JobError(str(exc)) from exc
+            logger.warning("review_vision_failed", extra={"review_id": review_id, "error": str(exc)[:300]})
+            error = str(exc)  # e.g. a model that takes no pictures: it can still read the script
+        else:
+            issues += video_reviews.vision_issues(seen, ask.frames, ask.video)
+            summaries.append(seen.summary)
 
     ctx.progress(80, "Revisando el contenido")
-    checks, summaries = dict(ask.checks or {}), [seen.summary]
-    try:
-        content = designer.review_content(
-            llm, course_title=ask.course_title, module_title=ask.module_title, scenes=ask.video.scenes,
-            questions=ask.questions, materials=ask.materials, usage=reading,
-        )
-        issues += video_reviews.content_issues(content, ask.video)
-        summaries.append(content.summary)
-    except LLMError as exc:  # the frames' review stands on its own
-        logger.warning("review_content_failed", extra={"review_id": review_id, "error": str(exc)[:300]})
-        checks["content_error"] = str(exc)
+    checks = dict(ask.checks or {})
+    if not ask.video.scenes:
+        checks["content_error"] = NO_SCRIPT
+    else:
+        try:
+            content = designer.review_content(
+                llm, course_title=ask.course_title, module_title=ask.module_title, scenes=ask.video.scenes,
+                questions=ask.questions, materials=ask.materials, usage=reading,
+            )
+        except LLMError as exc:  # the frames' review stands on its own
+            logger.warning("review_content_failed", extra={"review_id": review_id, "error": str(exc)[:300]})
+            checks["content_error"] = str(exc)
+        else:
+            issues += video_reviews.content_issues(content, ask.video)
+            summaries.append(content.summary)
     summary = " ".join(text.strip() for text in summaries if text.strip())
-    _finish(review_id, issues, summary=summary, checks=checks, usage=_usage(looking, reading),
+    _finish(review_id, issues, error=error, summary=summary, checks=checks, usage=_usage(looking, reading),
             model=getattr(llm, "model", None))
     logger.info("video_reviewed", extra={"review_id": review_id, "module_id": ctx.module_id, "issues": len(issues),
-                                         "frames": len(ask.frames)})
+                                         "frames": len(ask.frames), "failed": error is not None})
+    if error is not None:
+        return {"review_id": review_id, "error": error, "issues": len(issues)}
     return {"review_id": review_id, "verdict": video_reviews.verdict(issues), "issues": len(issues)}

@@ -37,7 +37,7 @@ from app.schemas.courses import (
 )
 from app.schemas.learn import LearnerCourseDetail
 from app.schemas.media import PURPOSES_NEEDING_MODULE
-from app.services import certificates, legacy_data, paths, progress, quiz, quiz_revisions, revisions
+from app.services import certificates, legacy_data, paths, progress, quiz, quiz_revisions, revisions, video_reviews
 from app.services import settings as platform
 from app.services.course_views import (
     ACTIVE_GENERATION,
@@ -241,14 +241,15 @@ def _publish_problems(db: Session, course: Course) -> list[dict]:
     problems = []
     if not detail.modules:
         problems.append({"module_id": None, "message": "Agrega al menos un módulo"})
-    blocking = platform.get_settings(db).qa.block_publish
+    # Not the badge's count: while a newer review waits (or once it fails), the newest one done still stands.
+    critical = video_reviews.blocking(db, list(course.modules)) if platform.get_settings(db).qa.block_publish else {}
     for module in detail.modules:
         if module.generation_status in ACTIVE_GENERATION:
             problems.append({"module_id": module.id, "message": f"«{module.title}» todavía se está generando"})
         elif not (module.video or module.document or module.content_text.strip()):
             problems.append({"module_id": module.id, "message": f"«{module.title}» no tiene contenido"})
-        elif blocking and module.review and module.review.critical:
-            count = module.review.critical
+        elif critical.get(module.id):
+            count = critical[module.id]
             found, fix = (("1 problema crítico", "corrígelo o ignóralo") if count == 1
                           else (f"{count} problemas críticos", "corrígelos o ignóralos"))
             problems.append({"module_id": module.id, "message": (

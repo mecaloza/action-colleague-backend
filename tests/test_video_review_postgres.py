@@ -1,5 +1,5 @@
-"""The videos' reviews on a real PostgreSQL: findings in JSONB, the newest review of each video, two asks at once and a
-module's deletion."""
+"""The videos' reviews on a real PostgreSQL: findings in JSONB, the newest review of each video, two asks at once, what
+keeps a course unpublished meanwhile and a module's deletion."""
 
 from concurrent.futures import ThreadPoolExecutor
 
@@ -30,7 +30,7 @@ def test_the_newest_review_of_each_video_shows_and_goes_with_its_module(client, 
     db.add(video)
     db.flush()
     module = Module(course_id=course.id, title="Casco", order=1, source="ai", video_asset_id=video.id,
-                    storyboard={"scenes": []})
+                    content_text="Resumen", storyboard={"scenes": []})
     db.add(module)
     db.flush()
     older = VideoReview(module_id=module.id, video_asset_id=video.id, status="done", verdict="ok", issues=[])
@@ -56,6 +56,14 @@ def test_the_newest_review_of_each_video_shows_and_goes_with_its_module(client, 
     assert [response.status_code for response in responses] == [202, 202]
     assert len({response.json()["review"]["id"] for response in responses}) == 1
     assert db.query(Job).filter(Job.type == "video.review").count() == 1
+
+    # While that one waits, the newest one done still keeps the course unpublished (with the parameter).
+    assert client.post(f"/api/v1/reviews/{newer.id}/issues/{newer.id}-1/reopen", headers=headers).status_code == 200
+    assert client.patch("/api/v1/settings", headers=headers, json={"qa": {"block_publish": True}}).status_code == 200
+    blocked = client.post(f"/api/v1/courses/{course.id}/publish", headers=headers)
+    assert blocked.status_code == 409 and blocked.json()["detail"]["problems"] == [{"module_id": module.id, "message": (
+        "La revisión del video de «Casco» encontró 1 problema crítico: corrígelo o ignóralo para publicar")}]
+    assert badge() == {"status": "queued", "verdict": None, "open_issues": 0, "critical": 0}
 
     assert client.delete(f"/api/v1/modules/{module.id}", headers=headers).status_code == 204
     assert db.query(VideoReview).count() == 0  # its reviews go with it

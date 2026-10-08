@@ -4,6 +4,8 @@ the AI sees in the frames and reads in the script; and what the admin does with 
 
 import base64
 import copy
+import logging
+import re
 import shutil
 import subprocess
 from io import BytesIO
@@ -19,6 +21,7 @@ from app.db.models import Course, Job, MediaAsset, Module, VideoReview
 from app.services import video_reviews
 from app.services.ai import designer
 from app.services.ai.llm import LLMError, OpenAILLM
+from app.services.storage import StorageError
 from app.services.video import motion
 from app.services.video import review as video_review
 from app.worker.jobs import review as review_job
@@ -156,7 +159,7 @@ def test_what_the_ai_finds_in_the_frames_and_the_script_is_told_where_it_shows(
 
 
 def test_open_critical_findings_keep_the_course_unpublished_only_when_the_parameters_say_so(
-    client, db, admin, admin_headers, storage, worker
+    client, db, admin, admin_headers, storage, worker, caplog
 ):
     scripted = _scenes(title="Reglas [qa:empty:critical]")
     module = _produce(client, admin_headers, db, worker, _module(db, admin, scripted))
@@ -164,12 +167,16 @@ def test_open_critical_findings_keep_the_course_unpublished_only_when_the_parame
     issue = review["issues"][0]["id"]
     url = f"/api/v1/reviews/{review['id']}/issues"
 
-    dismissed = client.post(f"{url}/{issue}/dismiss", headers=admin_headers)
-    assert dismissed.status_code == 200 and dismissed.json()["issues"][0]["status"] == "dismissed"
-    assert _badge(client, admin_headers, module) == {"status": "done", "verdict": "problems", "open_issues": 0,
-                                                     "critical": 0}
-    reopened = client.post(f"{url}/{issue}/reopen", headers=admin_headers)
+    with caplog.at_level(logging.INFO, logger="app.api.routes.reviews"):
+        dismissed = client.post(f"{url}/{issue}/dismiss", headers=admin_headers)
+        assert dismissed.status_code == 200 and dismissed.json()["issues"][0]["status"] == "dismissed"
+        assert _badge(client, admin_headers, module) == {"status": "done", "verdict": "problems", "open_issues": 0,
+                                                         "critical": 0}
+        reopened = client.post(f"{url}/{issue}/reopen", headers=admin_headers)
     assert reopened.json()["issues"][0]["status"] == "open" and _badge(client, admin_headers, module)["critical"] == 1
+    # Who ignored a finding (what lets a course through with block_publish) is on record.
+    assert [(record.issue_id, record.status, record.admin_id) for record in caplog.records
+            if record.getMessage() == "review_issue_set"] == [(issue, "dismissed", admin.id), (issue, "open", admin.id)]
     assert client.post(f"{url}/9-9/dismiss", headers=admin_headers).status_code == 404
     assert client.post(f"/api/v1/reviews/999/issues/{issue}/dismiss", headers=admin_headers).status_code == 404
 
@@ -182,10 +189,42 @@ def test_open_critical_findings_keep_the_course_unpublished_only_when_the_parame
     assert client.post(f"/api/v1/courses/{module.course_id}/publish", headers=admin_headers).status_code == 200
 
 
+def test_asking_for_a_review_again_or_one_that_fails_never_lets_a_critical_finding_through(
+    client, db, admin, admin_headers, storage, worker, monkeypatch
+):
+    module = _produce(client, admin_headers, db, worker,
+                      _module(db, admin, _scenes(title="Reglas [qa:empty:critical]")))
+    _settings(client, admin_headers, block_publish=True)
+
+    def publish():
+        return client.post(f"/api/v1/courses/{module.course_id}/publish", headers=admin_headers)
+
+    # Asked again: while the new one waits (the badge shows it), the last one done stands for the video.
+    assert client.post(f"/api/v1/modules/{module.id}/review", headers=admin_headers).status_code == 202
+    assert _badge(client, admin_headers, module)["critical"] == 0 and publish().status_code == 409
+
+    def refused(llm, **request):
+        raise LLMError("El servicio de IA rechazó las imágenes.", permanent=True)
+
+    monkeypatch.setattr(designer, "review_frames", refused)
+    worker()
+    assert _review(client, admin_headers, module.id)["status"] == "error"  # nor when it fails
+    blocked = publish()
+    assert blocked.status_code == 409 and blocked.json()["detail"]["problems"] == [{"module_id": module.id, "message": (
+        "La revisión del video de «Casco» encontró 1 problema crítico: corrígelo o ignóralo para publicar")}]
+
+    # A review done that no longer finds it stands for the video now.
+    monkeypatch.setattr(designer, "review_frames",
+                        lambda llm, **request: designer.FrameReview(verdict="ok", summary="", issues=[]))
+    assert client.post(f"/api/v1/modules/{module.id}/review", headers=admin_headers).status_code == 202
+    worker()
+    assert _review(client, admin_headers, module.id)["verdict"] == "ok" and publish().status_code == 200
+
+
 def test_a_review_the_ai_cannot_make_says_why_and_keeps_what_the_checks_found(
     client, db, admin, admin_headers, storage, worker
 ):
-    scripted = _scenes(title="Reglas [qa:error]", points=[LONG_POINT, "Revisarlo"])
+    scripted = _scenes(title="Reglas [qa:error]", narration=" [qa:content]", points=[LONG_POINT, "Revisarlo"])
     module = _produce(client, admin_headers, db, worker, _module(db, admin, scripted))
 
     review = _review(client, admin_headers, module.id)
@@ -193,16 +232,97 @@ def test_a_review_the_ai_cannot_make_says_why_and_keeps_what_the_checks_found(
     assert (review["status"], review["verdict"], review["error"]) == (
         "error", None, "El servicio de IA rechazó las imágenes.")
     message = "En la escena 2: La viñeta 1 no cabe y se corta. Usa un texto más corto."
+    # The script is read all the same: that needs no pictures.
     assert review["issues"] == [{
         "id": f"{review['id']}-1", "source": "lint", "scene_id": "s2", "at_seconds": settled["at_seconds"],
         "frame_index": settled["index"], "category": "cut_text", "severity": "major", "description": message,
         "suggested_observation": message, "box": None, "status": "open",
+    }, {
+        "id": f"{review['id']}-2", "source": "content", "scene_id": "s2",
+        "at_seconds": round(_job(db, "video.render").state["starts"][1], 2), "frame_index": None,
+        "category": "content", "severity": "major",
+        "description": "Revisión de prueba: la narración de la escena 2 no dice lo mismo que su diapositiva.",
+        "suggested_observation": "En la escena 2, haz que la narración diga lo mismo que la diapositiva.",
+        "box": None, "status": "open",
     }]
+    assert review["summary"] == "1 problema(s) de contenido." and "content_error" not in review["checks"]
     # The video is never touched: produced, published and attached as always.
     assert module.video_asset_id == review["video_asset_id"] and module.generation_status == "completed"
     assert _job(db, "video.render").status == "succeeded" and _job(db, "video.review").status == "succeeded"
-    assert _badge(client, admin_headers, module) == {"status": "error", "verdict": None, "open_issues": 1,
+    assert _badge(client, admin_headers, module) == {"status": "error", "verdict": None, "open_issues": 2,
                                                      "critical": 0}
+
+
+@pytest.mark.parametrize("failing", ["taken", "stored"])
+def test_frames_the_render_cannot_take_or_store_never_cost_the_video(
+    failing, client, db, admin, admin_headers, storage, worker, monkeypatch
+):
+    if failing == "taken":  # FFmpeg fails on the render's frames, not on those its review takes
+        extract, calls = video_review.extract_frames, []
+
+        def extract_frames(video, frames, folder):
+            calls.append(folder)
+            if len(calls) == 1:
+                raise video_review.ReviewError("No pudimos tomar el fotograma del segundo 1.0 del video.")
+            return extract(video, frames, folder)
+
+        monkeypatch.setattr(video_review, "extract_frames", extract_frames)
+    else:  # the storage fails on the render's third frame (the first two are stored)
+        upload = storage.upload_file
+
+        def upload_file(path, file, content_type):
+            if path.endswith("/review/02.jpg"):
+                raise StorageError("Storage no pudo subir el archivo (503)")
+            upload(path, file, content_type)
+
+        monkeypatch.setattr(storage, "upload_file", upload_file)
+
+    module = _produce(client, admin_headers, db, worker, _module(db, admin, _scenes()))
+
+    render = _job(db, "video.render")
+    assert (render.status, render.attempts) == ("succeeded", 0)  # published at once, as always
+    review = _review(client, admin_headers, module.id)
+    assert (review["status"], review["verdict"]) == ("done", "ok")
+    # Its review took its own frames from the published video; none of the render's stays.
+    video = db.get(MediaAsset, module.video_asset_id)
+    folder = f"{video.path.rsplit('/', 1)[0]}/review"
+    assert video.meta["review_frames"] == [
+        f"{folder}/{review['id']}/{index:02d}.jpg" for index in range(len(review["frames"]))]
+    assert _files(storage, folder) == video.meta["review_frames"]
+
+
+def test_a_video_that_cannot_be_read_says_why_and_keeps_its_lint(client, db, admin, admin_headers, storage, worker):
+    _settings(client, admin_headers, auto_review=False)
+    module = _produce(client, admin_headers, db, worker,
+                      _module(db, admin, _scenes(points=[LONG_POINT, "Revisarlo"])))
+    storage.file_path(db.get(MediaAsset, module.video_asset_id).path).write_bytes(b"no es un video")  # damaged
+
+    assert client.post(f"/api/v1/modules/{module.id}/review", headers=admin_headers).status_code == 202
+    worker()
+
+    review = _review(client, admin_headers, module.id)
+    assert (review["status"], review["verdict"], review["frames"]) == ("error", None, [])
+    assert re.fullmatch(r"No pudimos tomar el fotograma del segundo \d+\.\d del video\.", review["error"])
+    assert review["checks"] == {"lint": _job(db, "video.render").state["lint"]}  # known without the video
+    assert [(issue["source"], issue["description"]) for issue in review["issues"]] == [
+        ("lint", "En la escena 2: La viñeta 1 no cabe y se corta. Usa un texto más corto.")]
+    assert _job(db, "video.review").status == "succeeded"  # trying again wouldn't help
+
+
+def test_a_script_the_ai_cannot_read_leaves_the_frames_review_standing(
+    client, db, admin, admin_headers, storage, worker, monkeypatch
+):
+    def busy(llm, **request):
+        raise LLMError("El servicio de IA no respondió. Intenta de nuevo en unos minutos.")
+
+    monkeypatch.setattr(designer, "review_content", busy)
+    module = _produce(client, admin_headers, db, worker,
+                      _module(db, admin, _scenes(title="Reglas [qa:cut_text]")))
+
+    review = _review(client, admin_headers, module.id)
+    assert (review["status"], review["verdict"], review["error"]) == ("done", "problems", None)
+    assert [issue["source"] for issue in review["issues"]] == ["vision"]
+    assert review["checks"]["content_error"] == "El servicio de IA no respondió. Intenta de nuevo en unos minutos."
 
 
 def test_a_model_that_does_not_answer_is_asked_again_and_a_review_can_be_asked_again(
@@ -297,8 +417,10 @@ def _video_asset(db, storage, tmp_path: Path, course_id: int, name: str) -> Medi
 
 
 def test_a_video_made_before_reviews_is_reviewed_from_frames_taken_at_random(
-    client, db, admin, admin_headers, storage, worker, tmp_path
+    client, db, admin, admin_headers, storage, worker, tmp_path, monkeypatch
 ):
+    read = []
+    monkeypatch.setattr(designer, "review_content", lambda llm, **request: read.append(request))
     module = _module(db, admin, _scenes())
     module.video_asset_id = _video_asset(db, storage, tmp_path, module.course_id, "a").id
     db.commit()
@@ -309,7 +431,9 @@ def test_a_video_made_before_reviews_is_reviewed_from_frames_taken_at_random(
     review = _review(client, admin_headers, module.id)  # its render is unknown: when each scene shows too
     assert review["status"] == "done" and 1 < len(review["frames"]) <= video_review.UNTIMED_FRAMES
     assert {(frame["kind"], frame["scene_id"]) for frame in review["frames"]} == {("random", None)}
-    assert review["checks"] == {"lint": None, "black": [], "silence": [], "frozen": None, "presenter_seconds": None}
+    assert review["checks"] == {"lint": None, "black": [], "silence": [], "frozen": None, "presenter_seconds": None,
+                                "content_error": review_job.NO_SCRIPT}
+    assert read == []  # nor the script it was made from: the module's now may be another one
 
     # A review whose video is replaced before it runs is left aside.
     assert client.post(f"/api/v1/modules/{module.id}/review", headers=admin_headers).status_code == 202
