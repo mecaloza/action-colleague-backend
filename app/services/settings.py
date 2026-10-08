@@ -17,9 +17,9 @@ from app.schemas.settings import PlatformSettings
 ROW_ID = 1
 _CACHE = "platform_settings"  # key in the session's `info`: a session lives as long as its request
 
-# What a wrong value gets back, in the admin's words (by section and key).
+# What a wrong value gets back, in the admin's words (by section and key, whatever is wrong with it).
 _MESSAGES = {
-    ("general", "company_name"): "El nombre de la empresa puede tener hasta 200 caracteres.",
+    ("general", "company_name"): "El nombre de la empresa debe ser un texto de hasta 200 caracteres.",
     ("general", "timezone"): "La zona horaria no existe: elige una de la lista (por ejemplo, «America/Bogota»).",
     ("evaluations", "passing_score"): "La nota mínima por defecto debe ser un número entero entre 1 y 100.",
     ("evaluations", "max_attempts"): "Los intentos por defecto deben ser un número entero entre 1 y 10.",
@@ -27,8 +27,8 @@ _MESSAGES = {
     ("certificates", "validity_months"): "La vigencia debe ser un número entero de meses entre 1 y 120, o quedar "
                                          "vacía para que no venzan.",
     ("certificates", "min_score"): "La nota mínima promedio debe ser un número entero entre 0 y 100, o quedar vacía.",
-    ("certificates", "signer_name"): "El nombre del firmante puede tener hasta 200 caracteres.",
-    ("certificates", "signer_title"): "El cargo del firmante puede tener hasta 200 caracteres.",
+    ("certificates", "signer_name"): "El nombre del firmante debe ser un texto de hasta 200 caracteres.",
+    ("certificates", "signer_title"): "El cargo del firmante debe ser un texto de hasta 200 caracteres.",
 }
 _INVALID = "Revisa los parámetros: hay un valor que no es válido."
 
@@ -51,6 +51,11 @@ def parse(values: dict[str, Any] | None) -> PlatformSettings:
             except ValidationError:
                 continue
         return PlatformSettings(**sections)
+
+
+def saved(db: Session) -> bool:
+    """An admin saved the parameters at least once (until then, every one is its default)."""
+    return db.execute(select(AppSettings.id).where(AppSettings.id == ROW_ID)).first() is not None
 
 
 def get_settings(db: Session) -> PlatformSettings:

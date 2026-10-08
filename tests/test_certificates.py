@@ -2,6 +2,7 @@
 registry (issue by hand, revoke, reissue)."""
 
 import copy
+import logging
 import re
 import threading
 import time
@@ -10,7 +11,17 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.core.config import get_settings
-from app.db.models import Activity, Certificate, Course, Enrollment, Evaluation, Job, Module, ModuleProgress
+from app.db.models import (
+    Activity,
+    Certificate,
+    Course,
+    Enrollment,
+    Evaluation,
+    Job,
+    Module,
+    ModuleProgress,
+    PathAssignment,
+)
 from app.schemas.settings import PlatformSettings
 from app.services import certificate_pdf, certificates
 from app.worker import queue
@@ -112,6 +123,7 @@ def test_completing_a_course_issues_its_certificate(client, db, admin, admin_hea
         "courses": [{"title": "Seguridad vial",
                      "completed_at": completed_at.replace(tzinfo=timezone.utc).isoformat()}],
         "company_name": "Acme Logística", "signer_name": "Laura Gómez", "signer_title": "Directora de Formación",
+        "timezone": "America/Mexico_City",
     }
 
     # The learner's views link it.
@@ -361,18 +373,26 @@ def test_the_pdf(client, db, admin, admin_headers):
     assert client.get(f"{API}/public/certificates/RC-0000-0000/pdf").status_code == 404
 
 
-def test_too_many_pdfs_at_once_ask_to_try_again(client, db, admin, admin_headers, monkeypatch):
+def test_too_many_pdfs_at_once_ask_to_try_again_soon(client, db, admin, admin_headers, monkeypatch):
+    """Anyone can ask for a PDF: while every slot is drawing, a request never holds a server thread for long; a PDF
+    drawn lately comes back without a slot."""
     from app.api.routes import certificates as routes
 
-    certificate = _completed_certificate(client, db, admin, admin_headers)
+    drawn = _completed_certificate(client, db, admin, admin_headers)
+    other = _completed_certificate(client, db, admin, admin_headers, "beto@test.dev")
+    assert client.get(f"{API}/public/certificates/{drawn.code}/pdf").status_code == 200
     busy = threading.BoundedSemaphore(1)
     busy.acquire()  # every slot drawing another one
     monkeypatch.setattr(routes, "_PDF_SLOTS", busy)
-    monkeypatch.setattr(routes, "PDF_WAIT_SECONDS", 0.05)
 
-    response = client.get(f"{API}/public/certificates/{certificate.code}/pdf")
+    started = time.perf_counter()
+    response = client.get(f"{API}/public/certificates/{other.code}/pdf")
 
+    assert time.perf_counter() - started < 1
     assert response.status_code == 429 and "intenta de nuevo" in response.json()["detail"]
+    assert response.headers["retry-after"] == "2"
+    again = client.get(f"{API}/public/certificates/{drawn.code}/pdf")
+    assert again.status_code == 200 and again.content.startswith(b"%PDF")
 
 
 def test_the_page_says_what_was_completed_in_spanish():
@@ -392,6 +412,12 @@ def test_the_page_says_what_was_completed_in_spanish():
     assert page.validity == "Vigente hasta el 7 de octubre de 2027"
     assert page.verify_url == f"{APP_URL}/verify/RC-AB12-CD34"
     assert certificate_pdf.course_list([f"Curso con un nombre largo {i}" for i in range(30)]).endswith(" más")
+    # The time zone of the snapshot, whatever the platform's is today (the platform's for one without it, above).
+    madrid = PlatformSettings(general={"timezone": "Europe/Madrid"})
+    certificate.details = {**certificate.details, "timezone": "America/Mexico_City"}
+    assert certificate_pdf.texts(certificate, madrid).facts.startswith("Emitido el 7 de octubre de 2026")
+    certificate.details = {**certificate.details, "timezone": "Europe/Madrid"}
+    assert certificate_pdf.texts(certificate, PlatformSettings()).facts.startswith("Emitido el 8 de octubre de 2026")
     assert certificate_pdf.duration(1) == "1 hora" and certificate_pdf.duration(2.25) == "2,2 horas"
     assert certificate_pdf.duration(0) is None
 
@@ -488,6 +514,19 @@ def test_issuing_by_hand(client, db, admin, admin_headers):
     assert by_path.status_code == 201 and by_path.json()["path_id"] == path["id"]
     assert len(_issued(db)) == 2
 
+    # Expired: renewed, a new one in its place (the expired one, revoked, says which).
+    for certificate in _issued(db):
+        certificate.expires_at = datetime.now(timezone.utc) - timedelta(days=1)
+    db.commit()
+    renewed = {"course_id": issue(course_id=course.id), "path_id": issue(path_id=path["id"])}
+    db.expire_all()
+    for (key, response), old in zip(renewed.items(), (created, by_path)):
+        assert response.status_code == 201 and response.json()["status"] == "valid"
+        expired = db.get(Certificate, old.json()["id"])
+        assert expired.revoked_at is not None and expired.revoked_reason == f"Renovado como {response.json()['code']}"
+        assert issue(**{key: response.json()[key]}).json()["id"] == response.json()["id"]  # valid: it comes back
+    assert len(_issued(db)) == 4
+
 
 def test_revoking_and_reissuing(client, db, admin, admin_headers):
     _settings(client, admin_headers, certificates={"signer_name": "Laura"})
@@ -526,6 +565,37 @@ def test_revoking_and_reissuing(client, db, admin, admin_headers):
     gone = client.post(f"{API}/certificates/{newest['id']}/reissue", headers=admin_headers)
     assert gone.status_code == 409 and gone.json() == {
         "detail": "El curso de este certificado ya no existe: no se puede reemitir."}
+
+
+def test_reissuing_is_for_what_the_person_has_completed(client, db, admin, admin_headers):
+    """As an issue by hand: a course (or path) reopened since then is completed again first, never a new certificate
+    for what the person has not completed."""
+    course = _course(db, admin, "Curso")
+    path = _path(client, admin_headers, [course], title="Ruta")
+    ana = _learner(db)
+    _assign(client, admin_headers, path, ana)
+    learner = auth_headers(client, ana.email)
+    _complete(client, learner, db, course)
+    by_kind = {certificate.kind: certificate for certificate in _issued(db)}
+    client.post(f"{API}/certificates/{by_kind['course'].id}/revoke", headers=admin_headers, json={"reason": "Error"})
+    added = client.post(f"{API}/courses/{course.id}/modules", headers=admin_headers,
+                        json={"title": "Nuevo", "content_text": "x"})
+    assert added.status_code == 201, added.text  # the course and its path reopened
+
+    for kind, what in (("course", "el curso (o ya no está inscrita en él)"), ("path", "la ruta (o ya no la tiene)")):
+        refused = client.post(f"{API}/certificates/{by_kind[kind].id}/reissue", headers=admin_headers)
+        assert refused.status_code == 409
+        assert refused.json() == {"detail": f"La persona aún no completa {what}: no se puede reemitir."}
+
+    # The path in draft meanwhile: its completion is no longer stored, but it is what the person did.
+    client.patch(f"{API}/paths/{path['id']}", headers=admin_headers, json={"status": "draft"})
+    _complete(client, learner, db, course)
+    db.expire_all()
+    assert db.query(PathAssignment).one().completed_at is None
+    for certificate in by_kind.values():  # revoked (the course's) or in force (the path's)
+        reissued = client.post(f"{API}/certificates/{certificate.id}/reissue", headers=admin_headers)
+        assert reissued.status_code == 201 and reissued.json()["status"] == "valid"
+        assert reissued.json()["kind"] == certificate.kind
 
 
 def test_deleting_a_path_keeps_its_certificates(client, db, admin, admin_headers):
@@ -569,6 +639,25 @@ def test_the_maintenance_pass_issues_what_is_missing_once(client, db, admin, adm
     assert len(_issued(db)) == 4
 
 
+def test_the_maintenance_pass_waits_for_the_parameters(client, db, admin, admin_headers, collaborator, caplog):
+    """A first deploy: what was completed before gets its certificates once an admin saved the parameters, with the
+    issuer and signer set there (for good), never with the blanks of the defaults."""
+    course = _course(db, admin, "Curso")
+    db.add(Enrollment(user_id=collaborator.id, course_id=course.id, status="completed",
+                      completed_at=datetime.now(timezone.utc)))
+    db.commit()
+
+    assert certificates.backfill(db) == 0 and _issued(db) == []
+    _settings(client, admin_headers, general={"company_name": "Acme"}, certificates={"signer_name": "Laura Gómez"})
+    with caplog.at_level(logging.INFO, logger="app.services.certificates"):
+        assert certificates.backfill(db) == 1
+
+    (certificate,) = _issued(db)
+    assert (certificate.details["company_name"], certificate.details["signer_name"]) == ("Acme", "Laura Gómez")
+    (logged,) = [record for record in caplog.records if record.getMessage() == "certificates_issued"]
+    assert (logged.count, logged.kinds, logged.user_ids) == (1, ["course"], [collaborator.id])
+
+
 def test_codes_typed_by_hand_are_normalized():
     assert certificates.normalize_code(" rc-7k2m-9qxd ") == "RC-7K2M-9QXD"
     assert certificates.normalize_code("RC7K2M9QXD") == "RC-7K2M-9QXD"
@@ -579,8 +668,9 @@ def test_codes_typed_by_hand_are_normalized():
     assert all(CODE.match(certificates.new_code()) for _ in range(200))
 
 
-def test_each_course_certificate_averages_only_its_own_scores(db, admin, collaborator):
+def test_each_course_certificate_averages_only_its_own_scores(client, db, admin, admin_headers, collaborator):
     """Two courses of one learner: each certificate averages the scores of its own course."""
+    _settings(client, admin_headers)  # saved once: the maintenance pass issues them
     one, two = _course(db, admin, "Uno"), _course(db, admin, "Dos")
     enrollments = [Enrollment(user_id=collaborator.id, course_id=c.id, status="completed",
                               completed_at=datetime.now(timezone.utc)) for c in (one, two)]

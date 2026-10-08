@@ -40,7 +40,7 @@ MONTHS = (
 
 
 def long_date(moment: datetime, zone: str) -> str:
-    """"8 de octubre de 2026", the day it is in the platform's time zone."""
+    """"8 de octubre de 2026", the day it is in that time zone."""
     local = certificates.aware(moment).astimezone(ZoneInfo(zone if is_timezone(zone) else DEFAULT_TIMEZONE))
     return f"{local.day} de {MONTHS[local.month - 1]} de {local.year}"
 
@@ -72,9 +72,9 @@ def duration(hours: float) -> str | None:
     return f"{_number(value)} hora{'' if value == 1 else 's'}"
 
 
-@dataclass
+@dataclass(frozen=True)
 class Texts:
-    """Everything the page says, in order."""
+    """Everything the page says, in order, and the PDF's date: what tells one drawing from another."""
 
     eyebrow: str
     issuer: str
@@ -88,11 +88,14 @@ class Texts:
     signer_title: str
     code: str
     verify_url: str
+    issued_at: datetime  # the PDF's creation date
 
 
 def texts(certificate: Certificate, settings: PlatformSettings) -> Texts:
+    """The dates in the time zone of the snapshot: changing the platform's later never changes them (`settings` only
+    stands in for a snapshot without one)."""
     details = certificates.details_of(certificate)
-    zone = settings.general.timezone
+    zone = details.timezone or settings.general.timezone
     path = certificate.kind == "path"
     facts = [f"Emitido el {long_date(certificate.issued_at, zone)}", duration(details.hours)]
     if details.modules:
@@ -113,6 +116,7 @@ def texts(certificate: Certificate, settings: PlatformSettings) -> Texts:
         signer_title=details.signer_title,
         code=certificate.code,
         verify_url=certificates.verify_url(certificate.code),
+        issued_at=certificates.aware(certificate.issued_at),
     )
 
 
@@ -225,12 +229,16 @@ def page_image(page: Texts) -> Image.Image:
     return image
 
 
-def render(certificate: Certificate, settings: PlatformSettings) -> bytes:
-    page = texts(certificate, settings)
+def draw(page: Texts) -> bytes:
+    """The page as a PDF: tens of milliseconds of CPU."""
     buffer = BytesIO()
     page_image(page).save(
         buffer, "PDF", resolution=float(DPI), quality=92,
         title=f"{page.eyebrow.capitalize()} {page.code}", author=page.issuer, subject=page.title,
-        creator=certificates.DEFAULT_ISSUER, creationDate=certificates.aware(certificate.issued_at).utctimetuple(),
+        creator=certificates.DEFAULT_ISSUER, creationDate=page.issued_at.utctimetuple(),
     )
     return buffer.getvalue()
+
+
+def render(certificate: Certificate, settings: PlatformSettings) -> bytes:
+    return draw(texts(certificate, settings))

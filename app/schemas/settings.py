@@ -1,11 +1,20 @@
 """The platform's parameters: every key has a default, unknown keys are ignored (an older or newer release's)."""
 
 from functools import lru_cache
+from typing import Annotated, Any
 from zoneinfo import available_timezones
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
 DEFAULT_TIMEZONE = "America/Mexico_City"
+
+
+def _none_is_empty(value: Any) -> Any:
+    return "" if value is None else value
+
+
+# A name the admin may leave empty: null empties it too.
+Name = Annotated[str, BeforeValidator(_none_is_empty), Field(max_length=200)]
 
 
 @lru_cache(maxsize=1)
@@ -24,7 +33,7 @@ class _Section(BaseModel):
 
 
 class GeneralSettings(_Section):
-    company_name: str = Field(default="", max_length=200)  # the issuer of the certificates ("" = the platform)
+    company_name: Name = ""  # the issuer of the certificates ("" = the platform)
     timezone: str = DEFAULT_TIMEZONE  # where dates are written (and, later, where "today" starts)
 
     @field_validator("timezone")
@@ -47,8 +56,8 @@ class CertificateSettings(_Section):
     enabled: bool = True  # issued by themselves on completion (a course can opt in or out)
     validity_months: int | None = Field(default=None, ge=1, le=120)  # None: they never expire
     min_score: int | None = Field(default=None, ge=0, le=100)  # average best quiz score a course certificate needs
-    signer_name: str = Field(default="", max_length=200)
-    signer_title: str = Field(default="", max_length=200)
+    signer_name: Name = ""
+    signer_title: Name = ""
 
 
 class PlatformSettings(BaseModel):

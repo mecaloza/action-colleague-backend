@@ -1,5 +1,7 @@
 """The platform's parameters: defaults, partial changes, validation in the admin's words, and evaluation defaults."""
 
+import logging
+
 import pytest
 
 from app.db.models import AppSettings, Course, Evaluation, Module
@@ -31,9 +33,12 @@ def test_every_parameter_has_a_default(client, admin_headers):
     assert client.get(f"{API}/settings", headers=admin_headers).json() == DEFAULTS
 
 
-def test_changes_merge_section_by_section_and_unknown_keys_are_dropped(client, db, admin, admin_headers):
-    first = _patch(client, admin_headers, {"certificates": {"signer_name": "  Laura Gómez ", "validity_months": 24}})
+def test_changes_merge_section_by_section_and_unknown_keys_are_dropped(client, db, admin, admin_headers, caplog):
+    with caplog.at_level(logging.INFO, logger="app.api.routes.settings"):
+        first = _patch(client, admin_headers, {"certificates": {"signer_name": "  Laura Gómez ", "validity_months": 24}})
     assert first.status_code == 200, first.text
+    (logged,) = [record for record in caplog.records if record.getMessage() == "platform_settings_updated"]
+    assert (logged.admin_id, logged.sections) == (admin.id, ["certificates"])  # who changed what reaches everyone
     second = _patch(client, admin_headers, {"general": {"company_name": "Acme", "theme": "x"}, "ranking": {"a": 1}})
 
     expected = {
@@ -47,8 +52,9 @@ def test_changes_merge_section_by_section_and_unknown_keys_are_dropped(client, d
     db.refresh(row)
     assert row.values == expected and row.updated_by == admin.id  # stored whole, without unknown keys
 
-    cleared = _patch(client, admin_headers, {"certificates": {"validity_months": None}})
-    assert cleared.json()["certificates"] == {**expected["certificates"], "validity_months": None}
+    cleared = _patch(client, admin_headers, {"certificates": {"validity_months": None, "signer_name": None}})
+    assert cleared.status_code == 200, cleared.text  # null empties a name too
+    assert cleared.json()["certificates"] == {**expected["certificates"], "validity_months": None, "signer_name": ""}
 
 
 @pytest.mark.parametrize(("changes", "message"), [
@@ -59,7 +65,9 @@ def test_changes_merge_section_by_section_and_unknown_keys_are_dropped(client, d
     ({"certificates": {"validity_months": 0}}, "La vigencia debe ser un número entero de meses entre 1 y 120"),
     ({"certificates": {"min_score": 101}}, "La nota mínima promedio debe ser un número entero entre 0 y 100"),
     ({"certificates": {"min_score": "alta"}}, "La nota mínima promedio debe ser un número entero entre 0 y 100"),
-    ({"certificates": {"signer_name": "x" * 201}}, "El nombre del firmante puede tener hasta 200 caracteres."),
+    ({"certificates": {"signer_name": "x" * 201}}, "El nombre del firmante debe ser un texto de hasta 200"),
+    ({"certificates": {"signer_name": 5}}, "El nombre del firmante debe ser un texto de hasta 200"),
+    ({"general": {"company_name": ["Acme"]}}, "El nombre de la empresa debe ser un texto de hasta 200"),
     ({"certificates": "sí"}, "Revisa los parámetros: hay un valor que no es válido."),
 ])
 def test_wrong_values_are_rejected_in_the_admins_words(client, admin_headers, changes, message):

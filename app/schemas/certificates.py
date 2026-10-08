@@ -32,6 +32,7 @@ class CertificateDetails(BaseModel):
     company_name: str = ""
     signer_name: str = ""
     signer_title: str = ""
+    timezone: str | None = None  # where its dates are written: the platform's then (None: the platform's now)
 
 
 class LearnerCertificate(BaseModel):

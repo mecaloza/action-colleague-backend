@@ -827,3 +827,52 @@ def test_a_path_completed_while_an_admin_changes_it_never_deadlocks(
     assert not errors, errors  # DeadlockDetected, with the path locked FOR UPDATE
     assert _count(db, "SELECT count(*) FROM learner_certificates WHERE kind = 'path'") == 1
     assert _count(db, "SELECT count(*) FROM path_assignments WHERE completed_at IS NOT NULL") == 1
+
+
+def test_a_course_completed_while_an_admin_approves_its_outline_never_deadlocks(
+    client, db, session_factory, admin, collaborator, monkeypatch
+):
+    """The learner's completion holds their progress and enrollment, then writes the course's certificate (a foreign
+    key check on the course's row). Approving the outline holds the course's row, then deletes the modules with their
+    progress. With the course locked FOR UPDATE each waits for the other; NO KEY UPDATE lets the certificate's check
+    through."""
+    from app.api.routes import learn, studio
+    from app.schemas.studio import CourseOutlineIn
+    from app.services import certificates
+
+    admin_headers = auth_headers(client, admin.email)
+    course = client.post("/api/v1/courses", headers=admin_headers, json={"title": "C"}).json()
+    module = {"title": "M", "summary": "", "objectives": [], "key_points": [], "estimated_minutes": 5,
+              "include_quiz": False}
+    outline = {"title": "C", "description": "", "audience": "", "objectives": [], "modules": [module]}
+    assert client.put(f"/api/v1/courses/{course['id']}/outline", headers=admin_headers, json=outline).status_code == 200
+    # Published before its modules were produced: the learner can still mark them seen.
+    db.execute(text("UPDATE courses SET status = 'published' WHERE id = :id"), {"id": course["id"]})
+    db.commit()
+    client.post(f"/api/v1/courses/{course['id']}/participants", headers=admin_headers,
+                json={"user_ids": [collaborator.id]})
+    module_id = _count(db, f"SELECT id FROM modules WHERE course_id = {course['id']}")
+    learner = auth_headers(client, collaborator.email)
+    client.put(f"/api/v1/learn/modules/{module_id}/position", headers=learner, json={"seconds": 1})  # its progress
+    paused, release = threading.Event(), threading.Event()
+    issue = certificates.issue_for_enrollments
+
+    def slow_issue(session, enrollment_ids):
+        enrollment_ids = list(enrollment_ids)
+        if enrollment_ids and not paused.is_set():
+            paused.set()  # the learner holds their progress and enrollment, the course completed
+            release.wait(5)
+        return issue(session, enrollment_ids)
+
+    monkeypatch.setattr(certificates, "issue_for_enrollments", slow_issue)
+
+    def complete(session):
+        learn.complete_module(module_id, db=session, user=session.get(User, collaborator.id))
+
+    def approve(session):
+        studio.apply_outline(course["id"], CourseOutlineIn(**outline), db=session)
+
+    errors = _race(session_factory, complete, approve, paused=paused, release=release)
+
+    assert not errors, errors  # DeadlockDetected, with the course locked FOR UPDATE
+    assert _count(db, "SELECT count(*) FROM learner_certificates WHERE kind = 'course'") == 1

@@ -3,6 +3,7 @@ code and its PDF."""
 
 import logging
 import threading
+from functools import lru_cache
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import or_
@@ -25,10 +26,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/certificates", tags=["certificates"], dependencies=[Depends(require_admin)])
 public_router = APIRouter(prefix="/public/certificates", tags=["certificates"])
 
-# Drawing a PDF is CPU work in the API process, and anyone can ask for one: a few at a time, the rest wait their
-# turn (or are told to try again) instead of piling up on the server's threads.
+# Drawing a PDF is CPU work in the API process, and anyone can ask for one: two at a time. The rest wait half a second
+# at most (each one waiting holds one of the server's threads, which every other request needs too) and are told to
+# try again; a PDF drawn lately comes back without waiting at all.
 _PDF_SLOTS = threading.BoundedSemaphore(2)
-PDF_WAIT_SECONDS = 10
+PDF_WAIT_SECONDS = 0.5
+RETRY_AFTER_SECONDS = 2
+BUSY = "Hay muchos certificados en preparación; intenta de nuevo en un momento."
 NOT_FOUND = "Certificado no encontrado"
 
 
@@ -95,8 +99,8 @@ def issue_certificate(
     admin: User = Depends(require_admin),
 ):
     """By hand, for a course or a path (one of them) the person completed: the platform's rules (automatic issuing, a
-    course that opts out, the minimum score) don't apply. The one they already have in force comes back (200)
-    instead of a second one."""
+    course that opts out, the minimum score) don't apply. Their valid one comes back (200) instead of a second one;
+    one expired is renewed (revoked, with a new one in its place)."""
     if (payload.course_id is None) == (payload.path_id is None):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Indica un curso o una ruta (solo uno de los dos).")
     if db.get(User, payload.user_id) is None:
@@ -168,23 +172,37 @@ def verify_certificate(code: str, db: Session = Depends(get_db)):
     return certificates.public_view(_by_code(db, code), certificates.utcnow())
 
 
+class _Busy(Exception):
+    """Every slot is drawing another PDF."""
+
+
+# The last PDFs drawn (about 0.5 MB each), by everything their page says: a certificate never changes (and one revoked
+# is refused before this), so the same link opened again, by anyone, is not drawn again.
+@lru_cache(maxsize=16)
+def _pdf(page: certificate_pdf.Texts) -> bytes:
+    if not _PDF_SLOTS.acquire(timeout=PDF_WAIT_SECONDS):
+        raise _Busy
+    try:
+        return certificate_pdf.draw(page)
+    finally:
+        _PDF_SLOTS.release()
+
+
 @public_router.get("/{code}/pdf", response_class=Response, responses={200: {"content": {"application/pdf": {}}}})
 def download_certificate(code: str, db: Session = Depends(get_db)):
     """The certificate as a PDF to open, print or keep (410 once revoked)."""
     certificate = _by_code(db, code)
     if certificate.revoked_at is not None:
         raise HTTPException(status.HTTP_410_GONE, "Este certificado fue revocado.")
-    settings = platform.get_settings(db)
+    page = certificate_pdf.texts(certificate, platform.get_settings(db))
     # Everything is read: its connection goes back to the pool before waiting for a slot and drawing (many requests
     # at once, waiting with a connection each, would leave the rest of the API without one).
     db.close()
-    if not _PDF_SLOTS.acquire(timeout=PDF_WAIT_SECONDS):
-        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Hay muchos certificados en preparación; intenta de "
-                                                               "nuevo en un momento.")
     try:
-        pdf = certificate_pdf.render(certificate, settings)
-    finally:
-        _PDF_SLOTS.release()
+        pdf = _pdf(page)
+    except _Busy:
+        retry = {"Retry-After": str(RETRY_AFTER_SECONDS)}
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, BUSY, headers=retry) from None
     headers = {"Content-Disposition": f'inline; filename="certificado-{certificate.code}.pdf"',
                "Cache-Control": "no-store"}
     return Response(pdf, media_type="application/pdf", headers=headers)

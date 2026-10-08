@@ -6,12 +6,14 @@ demand (`certificate_pdf`).
   platform issues them, or the course says so, and the learner's average best quiz score reaches the platform's
   minimum, when there is one), and when a path assignment does (if the platform issues them and the path gives one).
   A course reopened later (a module added) never takes one back, and one revoked is not issued again by itself:
-  admins issue them by hand, revoke and reissue them.
-- A certificate is a snapshot: who, what, hours, score, issuer and signer as they were. Later edits never change it.
+  admins issue them by hand (renewing one expired), revoke and reissue them, always for what the person completed.
+- A certificate is a snapshot: who, what, hours, score, issuer, signer and time zone as they were. Later edits never
+  change it.
 - One read and one insert, whatever the number of people completing at once (an admin's change can complete a course
   for hundreds).
 """
 
+import logging
 import secrets
 from calendar import monthrange
 from collections.abc import Iterable
@@ -47,6 +49,8 @@ from app.schemas.certificates import (
 from app.schemas.paths import PathSettings
 from app.schemas.settings import PlatformSettings
 from app.services import settings as platform
+
+logger = logging.getLogger(__name__)
 
 # Crockford's base 32: no I, L, O or U, so a code read aloud or typed by hand can't be misread.
 CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -265,6 +269,7 @@ def _snapshot(settings: PlatformSettings, courses: list[_CourseFacts]) -> tuple[
         company_name=settings.general.company_name,
         signer_name=settings.certificates.signer_name,
         signer_title=settings.certificates.signer_title,
+        timezone=settings.general.timezone,
     )
     return details.model_dump(mode="json"), average
 
@@ -393,6 +398,11 @@ def _write(db: Session, grants: list[_Grant], settings: PlatformSettings) -> int
     for start in range(0, len(rows), _BATCH):
         result = db.execute(insert(Certificate).values(rows[start:start + _BATCH]).on_conflict_do_nothing())
         written += max(result.rowcount or 0, 0)
+    if written:
+        logger.info("certificates_issued", extra={
+            "count": written, "kinds": sorted({grant.kind for grant in grants}),
+            "user_ids": sorted({grant.user_id for grant in grants})[:50],
+        })
     return written
 
 
@@ -419,7 +429,12 @@ def issue_for_assignments(db: Session, assignment_ids: Iterable[int]) -> int:
 
 def backfill(db: Session) -> int:
     """The certificates missing for what was completed before they existed (or while they were off), by the same
-    rules. Idempotent: whoever has one of that course or path, in force or not, is skipped."""
+    rules. Idempotent: whoever has one of that course or path, in force or not, is skipped. Not before an admin saved
+    the parameters once: these go out at once, and for good, with the issuer and signer set there, never with the
+    blanks of a first deploy (the next deploy's pass issues them)."""
+    if not platform.saved(db):
+        logger.info("certificate_backfill_waits_for_parameters")
+        return 0
     settings = platform.get_settings(db)
     grants = _automatic_course_grants(db, settings)
     rows = _path_rows(db, PathAssignment.completed_at.isnot(None), ~_issued("path"))
@@ -432,16 +447,16 @@ def backfill(db: Session) -> int:
 
 
 def in_force(
-    db: Session, user_id: int, *, course_id: int | None = None, path_id: int | None = None
+    db: Session, user_id: int, *, course_id: int | None = None, path_id: int | None = None, lock: bool = False
 ) -> Certificate | None:
-    """The person's certificate of this course (or path) that is not revoked: valid or expired, at most one."""
+    """The person's certificate of this course (or path) that is not revoked: valid or expired, at most one. Locked
+    to replace it: two admins at once take turns (the second one sees the first one's)."""
     target = Certificate.course_id == course_id if course_id is not None else Certificate.path_id == path_id
     kind = "course" if course_id is not None else "path"
-    return (
-        db.query(Certificate)
-        .filter(Certificate.user_id == user_id, Certificate.kind == kind, target, Certificate.revoked_at.is_(None))
-        .first()
+    query = db.query(Certificate).filter(
+        Certificate.user_id == user_id, Certificate.kind == kind, target, Certificate.revoked_at.is_(None)
     )
+    return (query.with_for_update().populate_existing() if lock else query).first()
 
 
 def _create(db: Session, grant: _Grant, settings: PlatformSettings) -> tuple[Certificate, bool]:
@@ -461,30 +476,45 @@ def _create(db: Session, grant: _Grant, settings: PlatformSettings) -> tuple[Cer
     raise RuntimeError("certificate code space exhausted")  # five codes taken in a row: never in practice
 
 
+def _replace(
+    db: Session, old: Certificate | None, grant: _Grant, settings: PlatformSettings, how: str
+) -> tuple[Certificate, bool]:
+    """A new certificate in place of `old`, if there is one: revoked first, its reason then naming the new one ("{how}
+    como RC-…"), unless it was revoked already."""
+    was_in_force = old is not None and old.revoked_at is None
+    if old is not None:
+        revoke(old)
+        db.flush()  # out of force before the new one takes its place
+    new, created = _create(db, grant, settings)
+    if was_in_force:
+        old.revoked_reason = f"{how} como {new.code}"
+    return new, created
+
+
 def issue_course(db: Session, user_id: int, course_id: int) -> tuple[Certificate, bool]:
-    """By hand, for a course the person completed (the platform's rules don't apply). The one they already have in
-    force comes back instead of a second one; True when it is new."""
-    current = in_force(db, user_id, course_id=course_id)
-    if current is not None:
+    """By hand, for a course the person completed (the platform's rules don't apply). Their valid one comes back
+    instead of a second one; one expired is renewed (a new one in its place). True when it is new."""
+    current = in_force(db, user_id, course_id=course_id, lock=True)
+    if current is not None and status_of(current) == "valid":
         return current, False
     rows = _course_rows(db, Enrollment.user_id == user_id, Enrollment.course_id == course_id,
                         Enrollment.status == "completed")
     if not rows:
         raise CertificateError("La persona aún no completa el curso.")
     settings = platform.get_settings(db)
-    return _create(db, _course_grant(rows[0], settings, by_rules=False), settings)
+    return _replace(db, current, _course_grant(rows[0], settings, by_rules=False), settings, "Renovado")
 
 
 def issue_path(db: Session, assignment: PathAssignment) -> tuple[Certificate, bool]:
     """By hand, for a path assignment the caller checked is completed (as `issue_course`)."""
-    current = in_force(db, assignment.user_id, path_id=assignment.path_id)
-    if current is not None:
+    current = in_force(db, assignment.user_id, path_id=assignment.path_id, lock=True)
+    if current is not None and status_of(current) == "valid":
         return current, False
     settings = platform.get_settings(db)
     grants = _path_grants(_path_rows(db, PathAssignment.id == assignment.id), settings, by_rules=False)
     if not grants:
         raise CertificateError("La ruta no tiene cursos publicados.")
-    return _create(db, grants[0], settings)
+    return _replace(db, current, grants[0], settings, "Renovado")
 
 
 def forget(db: Session, *, course_id: int | None = None, path_id: int | None = None) -> None:
@@ -506,7 +536,8 @@ def revoke(certificate: Certificate, reason: str | None = None) -> None:
 
 def reissue(db: Session, certificate: Certificate) -> Certificate:
     """A new certificate in its place: a new code and a fresh snapshot (today's names, hours, score, issuer, signer
-    and validity). It is revoked, if it was not already."""
+    and validity), for a course or path the person has completed (as one issued by hand: a course reopened since
+    then is completed again first). It is revoked, if it was not already."""
     course_id, path_id = (certificate.course_id, None) if certificate.kind == "course" else (None, certificate.path_id)
     if course_id is None and path_id is None:
         what = "El curso" if certificate.kind == "course" else "La ruta"
@@ -516,19 +547,19 @@ def reissue(db: Session, certificate: Certificate) -> Certificate:
         raise CertificateError(f"Esta persona ya tiene otro certificado vigente ({current.code}): reemite ese.")
     settings = platform.get_settings(db)
     if course_id is not None:
-        rows = _course_rows(db, Enrollment.user_id == certificate.user_id, Enrollment.course_id == course_id)
+        rows = _course_rows(db, Enrollment.user_id == certificate.user_id, Enrollment.course_id == course_id,
+                            Enrollment.status == "completed")
         grants = [_course_grant(row, settings, by_rules=False) for row in rows]
-        missing = "La persona ya no está inscrita en el curso: no se puede reemitir."
+        missing = "La persona aún no completa el curso (o ya no está inscrita en él): no se puede reemitir."
     else:
-        rows = _path_rows(db, PathAssignment.user_id == certificate.user_id, PathAssignment.path_id == path_id)
+        from app.services import paths  # here, not at the top: paths -> this module
+
+        completed = or_(PathAssignment.completed_at.isnot(None), paths.completed_clause())
+        rows = _path_rows(db, PathAssignment.user_id == certificate.user_id, PathAssignment.path_id == path_id,
+                          completed)
         grants = _path_grants(rows, settings, by_rules=False)
-        missing = "La persona ya no tiene la ruta (o no tiene cursos publicados): no se puede reemitir."
+        missing = "La persona aún no completa la ruta (o ya no la tiene): no se puede reemitir."
     if not grants:
         raise CertificateError(missing)
-    was_in_force = certificate.revoked_at is None
-    revoke(certificate)
-    db.flush()  # out of force before the new one takes its place
-    new, _ = _create(db, grants[0], settings)
-    if was_in_force:
-        certificate.revoked_reason = f"Reemitido como {new.code}"
+    new, _ = _replace(db, certificate, grants[0], settings, "Reemitido")
     return new
