@@ -200,14 +200,15 @@ def frame_name(index: int) -> str:
 
 def _extract(video: Path, frame: Frame, folder: Path) -> Path:
     path = folder / frame_name(frame.index)
+    failed = f"No pudimos tomar el fotograma del segundo {frame.at:.1f} del video."
     try:  # seeking on the input: only the stretch before the frame is decoded
         compose.run([*compose.FFMPEG, "-ss", f"{frame.at:.3f}", "-i", str(video), "-frames:v", "1",
                      "-vf", f"scale={FRAME_WIDTH}:-2", "-q:v", str(JPEG_QUALITY), "-threads", "1", str(path)],
                     timeout=FRAME_TIMEOUT_SECONDS)
     except compose.ComposeError as exc:
-        raise ReviewError(f"No pudimos tomar el fotograma del segundo {frame.at:.1f} del video.") from exc
+        raise ReviewError(failed) from exc
     if not path.exists() or not path.stat().st_size:
-        raise ReviewError(f"No pudimos tomar el fotograma del segundo {frame.at:.1f} del video.")
+        raise ReviewError(failed)
     return path
 
 
@@ -346,6 +347,10 @@ class Video:
             return None
         return str(self.scenes[index].get("id", "")) or None
 
+    def places(self) -> dict[str | None, int]:
+        """Each scene's place in the video, by its id."""
+        return {self.scene_id(index): index for index in range(len(self.scenes))}
+
     def hero(self) -> list[bool]:
         """The scenes where the presenter is large."""
         total = len(self.scenes)
@@ -360,16 +365,18 @@ class Video:
 
     def context(self, frame: Frame) -> dict:
         """What the frame should show, for the model that looks at it."""
-        entry: dict = {"frame_index": frame.index, "at_seconds": round(frame.at, 2)}
         index = frame.scene
+        entry: dict = {
+            "frame_index": frame.index, "at_seconds": round(frame.at, 2), "scene_id": self.scene_id(index) or "",
+        }
         slide = _slide(self.scenes[index]) if index is not None and 0 <= index < len(self.scenes) else None
         if slide is None:
-            return {**entry, "scene_id": self.scene_id(index) or "", "texts": []}
-        scene, picture = self.scenes[index], index in self.pictures
-        visual = scene.get("visual") or {}
+            return {**entry, "texts": []}
+        picture = index in self.pictures
+        visual = self.scenes[index].get("visual") or {}
         infographic = picture and visual.get("kind") == "infographic"
         entry.update(
-            scene_id=self.scene_id(index) or "", scene_number=index + 1, layout=slide.layout,
+            scene_number=index + 1, layout=slide.layout,
             presenter="large" if self.hero()[index] else "bubble" if self.presenter else "none",
             texts=[] if infographic and slide.layout == "visual" else slide_texts(slide),
         )

@@ -39,10 +39,6 @@ LINT_SEVERITIES = {"error": "major", "warning": "minor"}
 MAX_TEXT_CHARS = 600  # of a finding the model words (description, suggested observation)
 
 
-def dedupe_key(module_id: int, video_asset_id: str | None) -> str:
-    return f"review:{module_id}:{video_asset_id}"
-
-
 # ── Asking for one ────────────────────────────────────────────────────
 
 
@@ -52,7 +48,7 @@ def request(
 ) -> tuple[VideoReview, Job]:
     """Have the module's video reviewed: a new review with its job, or the one still waiting for this very video.
     `frames` and `checks`: what its render already took from it. The caller holds the module and commits."""
-    key = dedupe_key(module.id, module.video_asset_id)
+    key = f"review:{module.id}:{module.video_asset_id}"
     active = queue.active_with_key(db, key)
     waiting = db.get(VideoReview, (active.payload or {}).get("review_id")) if active is not None else None
     if active is not None and waiting is not None:
@@ -200,7 +196,7 @@ def frame_entries(video: Video, frames: list[Frame]) -> list[dict]:
 
 def frames_of(video: Video, entries: list[dict]) -> list[Frame]:
     """The frames a review keeps, back as frames of the video."""
-    places = {video.scene_id(index): index for index in range(len(video.scenes))}
+    places = video.places()
     return [Frame(entry["index"], float(entry["at_seconds"]), places.get(entry.get("scene_id")), entry.get("kind", ""))
             for entry in entries]
 
@@ -229,7 +225,7 @@ def check_issues(video: Video, frames: list[dict], checks: dict | None) -> list[
     black screens, long silences and the presenter standing still or ending before the narration."""
     checks = checks or {}
     settled = {frame.get("scene_id"): frame for frame in frames if frame.get("kind") == "settled"}
-    numbers = {video.scene_id(index): index + 1 for index in range(len(video.scenes))}
+    numbers = {scene_id: index + 1 for scene_id, index in video.places().items()}
     found = []
     for warning in (checks.get("lint") or {}).get("warnings") or []:
         scene_id, message = warning.get("scene_id"), warning.get("message", "")
@@ -281,7 +277,7 @@ def _box(box: list[int]) -> list[float] | None:
 def vision_issues(answer: designer.FrameReview, frames: list[dict], video: Video) -> list[dict]:
     """What the model saw in the frames, each where it saw it (the frame tells the scene, whatever the model says)."""
     by_index = {frame["index"]: frame for frame in frames}
-    known = {video.scene_id(index) for index in range(len(video.scenes))}
+    known = video.places()
     found = []
     for issue in answer.issues:
         frame = by_index.get(issue.frame_index)
@@ -296,7 +292,7 @@ def vision_issues(answer: designer.FrameReview, frames: list[dict], video: Video
 
 def content_issues(answer: designer.ContentReview, video: Video) -> list[dict]:
     """What the model read wrong in the script, each at its scene (none: about the quiz or the whole module)."""
-    places = {video.scene_id(index): index for index in range(len(video.scenes))}
+    places = video.places()
     found = []
     for issue in answer.issues:
         index = places.get(issue.scene_id) if issue.scene_id else None

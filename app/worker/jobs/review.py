@@ -85,8 +85,9 @@ def _read(db: Session, review: VideoReview, module: Module, asset: MediaAsset) -
 def _sample(ctx: JobContext, ask: _Ask, work: Path) -> dict[int, Path]:
     """Take the frames and the checks from the published video (it is downloaded) and keep them on the review.
     Returns each frame's local file, by its index."""
+    storage = get_storage()
     local = work / "video.mp4"
-    get_storage().download_file(ask.video_path, local)
+    storage.download_file(ask.video_path, local)
     duration = ask.video.duration or compose.clip_seconds(local)
     frames = video_review.sample(ask.video.timeline, duration, seed=ctx.job_id)
     if not frames:
@@ -101,7 +102,6 @@ def _sample(ctx: JobContext, ask: _Ask, work: Path) -> dict[int, Path]:
         if not video_reviews.keep_frames_with_video(db, ask.video_asset_id, [entry["path"] for entry in entries]):
             raise _Replaced()
         db.commit()
-    storage = get_storage()
     for entry, file in zip(entries, files):
         storage.upload_file(entry["path"], file, "image/jpeg")
     with open_session() as db:
@@ -164,7 +164,7 @@ def _usage(*calls: dict) -> dict | None:
     return total or None
 
 
-@handler("video.review", on_failure=_review_failed)
+@handler(video_reviews.JOB_TYPE, on_failure=_review_failed)
 def review_video(ctx: JobContext) -> dict:
     review_id = ctx.payload["review_id"]
     with open_session() as db:
