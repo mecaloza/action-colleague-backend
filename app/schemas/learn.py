@@ -178,6 +178,11 @@ class ActivityMoveOut(BaseModel):
     result: dict[str, Any]
     done: bool
     narration: dict[str, str]
+    # The move that ends the game also finishes the play: what `finish` tells, told now (null for any other move,
+    # and in an admin's preview, which never counts).
+    module_completed: bool | None = None
+    next_module_id: int | None = None
+    course_completed: bool | None = None
 
 
 class ActivityFinishOut(BaseModel):

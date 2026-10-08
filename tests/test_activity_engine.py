@@ -193,10 +193,15 @@ def test_a_quick_challenge_after_its_deadline_is_over():
 
 
 def test_an_open_play_goes_on_only_on_its_version_before_it_ends_and_within_its_time():
-    activity, attempt = play("quick", QUICK_MATCH)  # 45 s from NOW
-    grace = timedelta(seconds=45 + engine.QUICK_GRACE_SECONDS)
-    assert engine.resumable(activity, attempt, now=NOW + grace)  # a late move would still count
-    assert not engine.resumable(activity, attempt, now=NOW + grace + timedelta(seconds=1))
+    activity, attempt = play("quick", QUICK_MATCH)
+    deadline = NOW + timedelta(seconds=45)
+    assert engine.resumable(activity, attempt, now=deadline)
+    with pytest.raises(GameError, match="todavía no termina"):  # still on for `finish` too
+        engine.finish(activity, attempt, now=deadline)
+    # A second later the time is up, as `finish` sees it. Within the grace a late move still gets, the game would
+    # come back already lost.
+    later = deadline + timedelta(seconds=1)
+    assert engine.QUICK_GRACE_SECONDS > 1 and not engine.resumable(activity, attempt, now=later)
     untimed_activity, untimed = play("quick", QUICK_MATCH, untimed=True)
     assert engine.resumable(untimed_activity, untimed, now=NOW + timedelta(days=2))
 

@@ -103,12 +103,10 @@ def _activity_summaries(state: ModuleState, resumable: set[int]) -> list[Learner
 
 def _resumable_activities(db: Session, enrollment: Enrollment, states: list[ModuleState]) -> set[int]:
     """The activities (of unlocked modules) with an open play the learner can go on with: one read for the course."""
-    activities = {activity.id: activity for state in states if state.unlocked for activity in state.activities}
+    activities = [activity for state in states if state.unlocked for activity in state.activities]
     if not activities:
         return set()
-    plays = activity_engine.open_plays(db, enrollment.id, list(activities))
-    now = activity_engine.utcnow()
-    return {play.activity_id for play in plays if activity_engine.resumable(activities[play.activity_id], play, now)}
+    return {play.activity_id for play in activity_engine.resumable_plays(db, enrollment.id, activities)}
 
 
 def _learner_enrollment(enrollment: Enrollment) -> LearnerEnrollment:

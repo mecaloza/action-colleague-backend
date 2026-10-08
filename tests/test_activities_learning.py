@@ -108,11 +108,12 @@ def _published_quick(db, course) -> Activity:
     return quick
 
 
-def _run_out_the_clock(db, attempt_id):
-    """The learner closed the game and came back a minute after its time was up."""
+def _run_out_the_clock(db, attempt_id, seconds_ago: int = 60):
+    """The learner closed the game and came back once its time was up (a minute ago, by default)."""
     attempt = db.get(ActivityAttempt, attempt_id)
     db.refresh(attempt)
-    attempt.state = {**attempt.state, "deadline": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()}
+    deadline = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+    attempt.state = {**attempt.state, "deadline": deadline.isoformat()}
     db.commit()
 
 
@@ -180,7 +181,7 @@ def test_a_reload_resumes_the_open_play_and_an_edit_restarts_it(client, db, cour
     assert [(play.version, play.finished_at) for play in _plays(db, activity.id)] == [(activity.version, None)]
 
 
-def test_a_play_left_on_an_older_version_counts_with_its_score(client, db, course, learner):
+def test_a_half_played_game_on_an_older_version_never_counts(client, db, course, learner):
     activity = _activity(db, _modules(course)[0], "decision")
     first = _start(client, learner, activity.id)
     assert _choose(client, learner, first, "¿Qué ruta").json()["result"]["points"] == 6
@@ -188,39 +189,77 @@ def test_a_play_left_on_an_older_version_counts_with_its_score(client, db, cours
     db.commit()
 
     fresh = _start(client, learner, activity.id)
-    assert not fresh["resumed"] and fresh["attempt_id"] != first["attempt_id"]
-    old = _plays(db, activity.id)[0]
-    assert old.id == first["attempt_id"] and old.finished_at is not None and old.score == 6
-    summary = _summary(client, learner, course, activity.id)
-    assert summary == {**summary, "finished": True, "best_score": 6, "resumable": True}
+    assert not fresh["resumed"] and fresh["attempt_id"] != first["attempt_id"] and fresh["view"]["step"] == 1
+    # The half-played game stays as it was: an edit never turns it into a finished play.
+    old, new = _plays(db, activity.id)
+    assert (old.id, old.finished_at, old.score) == (first["attempt_id"], None, 6) and new.finished_at is None
+    modules = client.get(f"{API}/courses/{course.id}", headers=learner).json()["modules"]
+    assert modules[0]["activities"][0] == {**modules[0]["activities"][0], "finished": False, "best_score": None,
+                                           "resumable": True}  # the new game
+    assert not modules[0]["completed"] and not modules[1]["unlocked"]
+    again = _start(client, learner, activity.id)
+    assert again["resumed"] and again["attempt_id"] == fresh["attempt_id"]
+    assert _plays(db, activity.id)[0].finished_at is None  # still not counted
 
 
-def test_a_play_that_ended_but_was_never_finished_counts_and_a_new_one_starts(client, db, course, learner):
-    plain = _modules(course)[0]
+def test_the_last_move_records_the_play_and_tells_what_it_completed(client, db, course, learner):
+    plain, quizzed, _ = _modules(course)
     activity = _activity(db, plain, "decision")
-    first = _start(client, learner, activity.id)
-    last = _choose(client, learner, first, "Le doy").json()  # it ends the conversation
-    assert last["done"] and not _summary(client, learner, course, activity.id)["resumable"]
+    play = _start(client, learner, activity.id)
+    last = _choose(client, learner, play, "Le doy").json()  # it ends the conversation
+    assert last["done"] and last["result"]["score"] == 2
+    assert (last["module_completed"], last["next_module_id"], last["course_completed"]) == (True, quizzed.id, False)
 
-    # The learner closed the game instead of "Ver resultado": the next start counts that play and opens a new one.
-    fresh = _start(client, learner, activity.id)
-    assert not fresh["resumed"] and fresh["view"]["step"] == 1 and fresh["view"]["score"] == 0
-    assert _plays(db, activity.id)[0].score == 2
+    # The learner closed the game instead of "Ver resultado": the play counts all the same.
+    (recorded,) = _plays(db, activity.id)
+    finished_at = recorded.finished_at
+    assert finished_at is not None and recorded.score == 2
     player = client.get(f"{API}/courses/{course.id}", headers=learner).json()
     modules = player["modules"]
-    assert modules[0]["activities"][0] == {**modules[0]["activities"][0], "finished": True, "best_score": 2}
+    assert modules[0]["activities"][0] == {**modules[0]["activities"][0], "finished": True, "best_score": 2,
+                                           "resumable": False}
     assert modules[0]["completed"] and modules[1]["unlocked"]  # it was all the module waited for
     assert player["enrollment"]["progress_pct"] == 33.3  # and the course's progress follows
 
+    # "Ver resultado" afterwards, or a retry of it: the result as it was recorded, never an error.
+    for _ in range(2):
+        finished = client.post(f"{API}/activity-attempts/{play['attempt_id']}/finish", headers=learner)
+        assert finished.status_code == 200
+        assert finished.json() == {"score": 2, "max_score": 10, "module_completed": True,
+                                   "next_module_id": quizzed.id, "course_completed": False}
+    assert _plays(db, activity.id)[0].finished_at == finished_at  # finished once
+    fresh = _start(client, learner, activity.id)
+    assert not fresh["resumed"] and fresh["view"]["step"] == 1 and fresh["view"]["score"] == 0
 
-def test_a_timed_game_whose_time_ran_out_is_kept_with_its_score_and_a_new_one_starts(client, db, course, learner):
+
+def test_a_move_after_the_clock_ran_out_records_the_play_with_its_score(client, db, course, learner):
+    quick = _published_quick(db, course)
+    play = _start(client, learner, quick.id)
+    token = {card["text"]: card["token"] for card in play["view"]["cards"]}
+    steps = [token[step] for step in QUICK_ORDER["items"]]
+    moves = f"{API}/activity-attempts/{play['attempt_id']}/moves"
+    client.post(moves, headers=learner, json={"move": {"card": steps[0]}})
+    _run_out_the_clock(db, play["attempt_id"])
+
+    late = client.post(moves, headers=learner, json={"move": {"card": steps[1]}}).json()
+    assert late["done"] and late["result"]["timeout"] and late["result"]["score"] == 10
+    # Recorded, with what it completed: nothing yet, the module still waits for its conversation.
+    assert (late["module_completed"], late["next_module_id"], late["course_completed"]) == (False, None, False)
+    (recorded,) = _plays(db, quick.id)
+    assert recorded.finished_at is not None and recorded.score == 10
+    summary = _summary(client, learner, course, quick.id)
+    assert summary == {**summary, "finished": True, "best_score": 10, "resumable": False}
+
+
+@pytest.mark.parametrize("late", [1, 60])  # seconds since the time was up: within a late move's grace, or well after
+def test_a_timed_game_whose_time_ran_out_is_kept_with_its_score_and_a_new_one_starts(client, db, course, learner, late):
     quick = _published_quick(db, course)
     first = _start(client, learner, quick.id)
     token = {card["text"]: card["token"] for card in first["view"]["cards"]}
     right = client.post(f"{API}/activity-attempts/{first['attempt_id']}/moves", headers=learner,
                         json={"move": {"card": token[QUICK_ORDER["items"][0]]}})
     assert right.json()["result"]["score"] == 10
-    _run_out_the_clock(db, first["attempt_id"])
+    _run_out_the_clock(db, first["attempt_id"], seconds_ago=late)
     assert not _summary(client, learner, course, quick.id)["resumable"]
 
     fresh = _start(client, learner, quick.id)
@@ -258,26 +297,30 @@ def test_a_timed_game_still_on_the_clock_is_resumed_as_it_was(client, db, course
 
 def test_a_move_is_authorized_by_the_play_alone(client, db, engine, course, learner):
     """
-    A move checks only the play: it is the learner's own and still open, on the current version of a published
-    activity. That's 4 statements (the user, the locked play, its activity, the update), whatever the course's size.
-    It used to recompute the learner's whole course on every tap (the module, the enrollment, the course, its modules,
-    the progress, the evaluations, the activities and the best scores): 12 statements, with a timed game running.
+    A move checks only the play: it is the learner's own and still open, on the current version of an activity and a
+    course still published. That's 4 statements (the user, the locked play, its activity joined to its course, the
+    update), whatever the course's size. It used to recompute the learner's whole course on every tap (the module, the
+    enrollment, the course, its modules, the progress, the evaluations, the activities and the best scores):
+    12 statements, with a timed game running. Only the move that ends the game reads the course, to record the play.
     """
     activity = _activity(db, _modules(course)[0], "decision")
     play = _start(client, learner, activity.id)
     with QueryCounter(engine) as counter:
         step = _choose(client, learner, play, "¿Qué ruta")
     assert step.status_code == 200 and counter.count <= 4, counter.count
-    assert step.json()["result"]["best_points"] == 6
+    assert step.json()["result"]["best_points"] == 6 and step.json()["module_completed"] is None  # not over yet
     route = step.json()["result"]["next"]  # the situation it led to
 
     activity.status = "draft"  # unpublished mid-game
     db.commit()
     assert _choose(client, learner, play, "Le muestro", node=route).status_code == 404
-    activity.status = "ready"
+    activity.status, course.status = "ready", "draft"  # now the whole course
     db.commit()
-    assert _choose(client, learner, play, "Le muestro", node=route).json()["done"]
-    assert client.post(f"{API}/activity-attempts/{play['attempt_id']}/finish", headers=learner).status_code == 200
+    assert _choose(client, learner, play, "Le muestro", node=route).status_code == 404
+    course.status = "published"
+    db.commit()
+    last = _choose(client, learner, play, "Le muestro", node=route).json()
+    assert last["done"] and last["module_completed"]
     over = _choose(client, learner, play, "Le hablo", node=route)
     assert over.status_code == 409 and "ya terminó" in over.json()["detail"]
 

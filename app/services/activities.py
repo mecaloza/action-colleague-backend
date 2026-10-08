@@ -410,11 +410,12 @@ def close(attempt: ActivityAttempt, now: datetime | None = None) -> None:
 
 def resumable(activity: Activity, attempt: ActivityAttempt, now: datetime | None = None) -> bool:
     """Whether an open play can go on: started on the current version, not over yet and, a quick challenge with a
-    clock, still within its time (plus the grace a late move gets). Any other open play is stale."""
+    clock, still on it. The deadline is the one `finish` goes by, without the grace a late move gets: a game whose
+    time is up never comes back already lost. Any other open play is stale."""
     if attempt.finished_at is not None or attempt.version != activity.version or attempt.state["done"]:
         return False
     deadline = _deadline(attempt.state)
-    return deadline is None or (now or utcnow()) <= deadline + timedelta(seconds=QUICK_GRACE_SECONDS)
+    return deadline is None or (now or utcnow()) <= deadline
 
 
 def open_plays(db: Session, enrollment_id: int, activity_ids: list[int], lock: bool = False) -> list[ActivityAttempt]:
@@ -428,9 +429,15 @@ def open_plays(db: Session, enrollment_id: int, activity_ids: list[int], lock: b
     return (query.with_for_update() if lock else query).all()
 
 
+def resumable_plays(db: Session, enrollment_id: int, activities: list[Activity]) -> list[ActivityAttempt]:
+    """The open plays of an enrollment in these activities that can go on, newest first: one read."""
+    by_id, now = {activity.id: activity for activity in activities}, utcnow()
+    plays = open_plays(db, enrollment_id, list(by_id))
+    return [play for play in plays if resumable(by_id[play.activity_id], play, now)]
+
+
 def played(attempt: ActivityAttempt) -> bool:
-    """Whether a play had at least one move (or it is over). A stale play with a move is closed with its score
-    (it counts, as when the clock runs out); one without, deleted."""
+    """Whether a play had at least one move (or it is over). A stale play without one is deleted: it never counts."""
     state = attempt.state
     return bool(state["done"] or state.get("path") or state.get("decided") or state.get("tries")
                 or state.get("solved") or state.get("mistakes"))
