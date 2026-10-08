@@ -217,6 +217,11 @@ class _CourseFacts:
     score_total: float  # the person's best quiz scores in it, added up
     score_count: int
 
+    @classmethod
+    def from_row(cls, title, seconds, modules, completed_at, total, count) -> "_CourseFacts":
+        """From the aggregates of a row (null when there is nothing to add up)."""
+        return cls(title, float(seconds or 0), int(modules or 0), completed_at, float(total or 0), int(count or 0))
+
 
 @dataclass
 class _Grant:
@@ -283,8 +288,7 @@ def _course_rows(db: Session, *conditions):
 def _course_grant(row, settings: PlatformSettings, *, by_rules: bool) -> _Grant | None:
     """The certificate of an enrollment's row; by the rules (issued by itself): None unless it qualifies."""
     user_id, course_id, completed_at, name, title, course_settings, seconds, modules, total, count = row
-    facts = _CourseFacts(title, float(seconds or 0), int(modules or 0), completed_at, float(total or 0),
-                         int(count or 0))
+    facts = _CourseFacts.from_row(title, seconds, modules, completed_at, total, count)
     details, average = _snapshot(settings, [facts])
     if by_rules:
         # The course's own choice (True or False) wins over the platform's; None follows it.
@@ -295,6 +299,12 @@ def _course_grant(row, settings: PlatformSettings, *, by_rules: bool) -> _Grant 
         if rules.min_score is not None and average is not None and average < rules.min_score:
             return None
     return _Grant("course", user_id, course_id, None, name, title, details, average)
+
+
+def _automatic_course_grants(db: Session, settings: PlatformSettings, *conditions) -> list[_Grant]:
+    """The certificates the rules give to the completed enrollments meeting `conditions` that have none yet."""
+    rows = _course_rows(db, *conditions, Enrollment.status == "completed", ~_issued("course"))
+    return [grant for row in rows if (grant := _course_grant(row, settings, by_rules=True))]
 
 
 def _path_rows(db: Session, *conditions):
@@ -333,11 +343,7 @@ def _path_grants(rows, settings: PlatformSettings, *, by_rules: bool) -> list[_G
         _, user_id, path_id, name, title, path_settings = path_rows[0][:6]
         if by_rules and not (settings.certificates.enabled and _gives_certificate(path_settings)):
             continue
-        courses = [
-            _CourseFacts(course_title, float(seconds or 0), int(modules or 0), completed_at, float(total or 0),
-                         int(count or 0))
-            for *_, course_title, seconds, modules, completed_at, total, count in path_rows
-        ]
+        courses = [_CourseFacts.from_row(*row[6:]) for row in path_rows]
         details, average = _snapshot(settings, courses)
         grants.append(_Grant("path", user_id, None, path_id, name, title, details, average))
     return grants
@@ -397,8 +403,7 @@ def issue_for_enrollments(db: Session, enrollment_ids: Iterable[int]) -> int:
         return 0
     settings = platform.get_settings(db)
     db.flush()  # their completion is read below
-    rows = _course_rows(db, Enrollment.id.in_(enrollment_ids), Enrollment.status == "completed", ~_issued("course"))
-    return _write(db, [grant for row in rows if (grant := _course_grant(row, settings, by_rules=True))], settings)
+    return _write(db, _automatic_course_grants(db, settings, Enrollment.id.in_(enrollment_ids)), settings)
 
 
 def issue_for_assignments(db: Session, assignment_ids: Iterable[int]) -> int:
@@ -416,8 +421,7 @@ def backfill(db: Session) -> int:
     """The certificates missing for what was completed before they existed (or while they were off), by the same
     rules. Idempotent: whoever has one of that course or path, in force or not, is skipped."""
     settings = platform.get_settings(db)
-    rows = _course_rows(db, Enrollment.status == "completed", ~_issued("course"))
-    grants = [grant for row in rows if (grant := _course_grant(row, settings, by_rules=True))]
+    grants = _automatic_course_grants(db, settings)
     rows = _path_rows(db, PathAssignment.completed_at.isnot(None), ~_issued("path"))
     written = _write(db, grants + _path_grants(rows, settings, by_rules=True), settings)
     db.commit()
@@ -486,9 +490,9 @@ def issue_path(db: Session, assignment: PathAssignment) -> tuple[Certificate, bo
 def forget(db: Session, *, course_id: int | None = None, path_id: int | None = None) -> None:
     """A course (or path) is being deleted: its certificates stay, with their snapshot, linked to nothing. The
     database's foreign key does the same; SQLite (development) doesn't enforce it, and could give its id to another."""
-    column = Certificate.course_id if course_id is not None else Certificate.path_id
+    column, value = (Certificate.course_id, course_id) if course_id is not None else (Certificate.path_id, path_id)
     db.execute(
-        update(Certificate).where(column == (course_id if course_id is not None else path_id)).values({column: None}),
+        update(Certificate).where(column == value).values({column: None}),
         execution_options={"synchronize_session": False},
     )
 
