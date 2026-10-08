@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
 from app.core.config import get_settings
-from app.db.models import Activity, ActivityAttempt, Course, Enrollment, EvaluationAttempt, Module, User
+from app.db.models import Activity, ActivityAttempt, Course, Enrollment, EvaluationAttempt, Module, ModuleProgress, User
 from app.schemas.learn import (
     ActivityFinishOut,
     ActivityMoveIn,
@@ -242,10 +242,22 @@ def _activity_secret() -> str:
     return engine.activity_secret(get_settings().jwt_secret)
 
 
-def _playable_activity(db: Session, user: User, activity_id: int):
-    activity = db.get(Activity, activity_id)
-    if activity is None or activity.status != "ready":
+def _ready_activity(db: Session, activity_id: int) -> Activity:
+    """A published activity of a published course, in one read (a move checks it on every tap)."""
+    activity = (
+        db.query(Activity)
+        .join(Module, Module.id == Activity.module_id)
+        .join(Course, Course.id == Module.course_id)
+        .filter(Activity.id == activity_id, Activity.status == "ready", Course.status == "published")
+        .first()
+    )
+    if activity is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, NO_ACCESS)
+    return activity
+
+
+def _playable_activity(db: Session, user: User, activity_id: int):
+    activity = _ready_activity(db, activity_id)
     enrollment, state, states = _unlocked_module(db, user, activity.module_id)
     return activity, enrollment, state, states
 
@@ -258,19 +270,79 @@ def _own_attempt(db: Session, user: User, attempt_id: int) -> ActivityAttempt:
     return attempt
 
 
+def _count_finished_play(db: Session, enrollment: Enrollment, state: progress.ModuleState) -> ModuleProgress:
+    """A play of this module just finished: the module completes if nothing else is left, and the course follows."""
+    db.flush()  # the finished play first: counted below
+    record = progress.get_or_create_progress(db, enrollment, state.module, lock=True)
+    # Read after the lock: another activity (or the quiz) finished at the same time counts too.
+    state.best_scores = progress.activity_best_scores(db, enrollment)
+    progress.complete_if_done(state, record, has_quiz=bool(quiz.evaluation_questions(state.evaluation)))
+    progress.refresh_enrollment(db, enrollment)
+    return record
+
+
+def _completion(enrollment: Enrollment, states: list[progress.ModuleState], state: progress.ModuleState,
+                module_completed: bool) -> dict:
+    """What a finished play left done: its module (and then the next one to go to) and the course."""
+    return {
+        "module_completed": module_completed,
+        "next_module_id": _next_module_id(states, state.module.id) if module_completed else None,
+        "course_completed": enrollment.status == "completed",
+    }
+
+
+def _finish_play(db: Session, activity: Activity, attempt: ActivityAttempt, enrollment: Enrollment,
+                 state: progress.ModuleState, states: list[progress.ModuleState]) -> dict:
+    """Close a play that is over and count it: on its last move, or through `finish`."""
+    try:
+        engine.finish(activity, attempt)
+    except engine.GameError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+    record = _count_finished_play(db, enrollment, state)
+    return _completion(enrollment, states, state, bool(record.completed))
+
+
 @router.post("/activities/{activity_id}/attempts", response_model=ActivityPlay)
 def start_activity(
     activity_id: int, payload: ActivityStart, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
-    """Start a play, or resume the one left open on the same version (a reload doesn't restart the game)."""
-    activity, enrollment, _, _ = _playable_activity(db, user, activity_id)
-    attempt = (
-        db.query(ActivityAttempt)
-        .filter(ActivityAttempt.activity_id == activity.id, ActivityAttempt.enrollment_id == enrollment.id,
-                ActivityAttempt.version == activity.version, ActivityAttempt.finished_at.is_(None))
-        .order_by(ActivityAttempt.id.desc())
-        .first()
-    )
+    """
+    Resume the play left open while it can go on (a reload doesn't restart the game), or start a new one.
+
+    An open play that can't go on is dealt with first. Untouched, it is deleted. With a move made, one whose clock ran
+    out ended for real: it is closed with its score and counts, as `finish` does on a timeout. One left on an older
+    version of the activity is never resumed nor counted (an edit must not turn a half-played game into a finished
+    one): it stays as it is. A game whose time is up never comes back already lost, and the new one honors the untimed
+    choice (it is for new plays only).
+    """
+    activity, enrollment, state, _ = _playable_activity(db, user, activity_id)
+    # Locked in this order: the activity, shared (an admin deleting it waits for this start instead of deadlocking:
+    # the delete's cascade needs the plays locked below, and the new play needs the activity), then the order of every
+    # learner request: the plays, the module's progress, the enrollment. A move or a finish in flight, or a second tap
+    # on "Empezar", waits for the open plays and then finds no stale play left to close.
+    db.refresh(activity, with_for_update={"read": True, "key_share": True})
+    open_plays = engine.open_plays(db, enrollment.id, [activity.id], lock=True)
+    now = engine.utcnow()  # once the locks are held: a wait for them can't make an expired play look alive
+    resumable = [play for play in open_plays if engine.resumable(activity, play, now)]
+    closed_any = False
+    for play in open_plays:
+        if play in resumable:
+            continue
+        if not engine.played(play):
+            db.delete(play)
+        elif play.version == activity.version:  # its clock ran out (or it ended before last moves recorded plays)
+            engine.close(play, now)
+            closed_any = True
+    if closed_any:
+        _count_finished_play(db, enrollment, state)
+    if not resumable:
+        # A play is opened with the enrollment locked, last as in every learner request: a second tap on "Empezar"
+        # (which found no play to resume either) waits here, then picks up the play this one opens.
+        db.flush()  # the stale plays dealt with above, out of the read below
+        db.query(Enrollment.id).filter(Enrollment.id == enrollment.id).with_for_update().one()
+        resumable = engine.resumable_plays(db, enrollment.id, [activity])
+    attempt = resumable[0] if resumable else None  # the newest
+    resumed = attempt is not None
     try:
         if attempt is None:
             attempt = ActivityAttempt(activity_id=activity.id, user_id=user.id, enrollment_id=enrollment.id,
@@ -285,42 +357,44 @@ def start_activity(
     keys = ["intro", *engine.revealed_lines(view)]
     return ActivityPlay(attempt_id=attempt.id, activity_id=activity.id, view=view,
                         narration=engine.narration_urls(db, activity, keys),
-                        image_url=engine.image_url(db, activity))
+                        image_url=engine.image_url(db, activity), resumed=resumed)
 
 
 @router.post("/activity-attempts/{attempt_id}/moves", response_model=ActivityMoveOut)
 def play_move(
     attempt_id: int, payload: ActivityMoveIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
+    """
+    One move. It is authorized by the play itself (a tap must be fast: a timed game is on): the learner's own play,
+    started on an unlocked module, still open on the current version (the engine refuses it otherwise), of an activity
+    and a course still published. The move that ends the game also finishes the play and counts it, as `finish` does:
+    a learner who closes the game without "Ver resultado" keeps it.
+    """
     attempt = _own_attempt(db, user, attempt_id)
-    activity, _, _, _ = _playable_activity(db, user, attempt.activity_id)
+    activity = _ready_activity(db, attempt.activity_id)
     try:
         outcome = engine.move(activity, attempt, payload.move, _activity_secret())
     except engine.GameError as exc:
         raise HTTPException(exc.status, str(exc)) from exc
+    completion = {}
+    if outcome.done:  # only now the learner's course is read: what finishing the play completes
+        enrollment, state, states = _unlocked_module(db, user, activity.module_id)
+        completion = _finish_play(db, activity, attempt, enrollment, state, states)
     db.commit()
     return ActivityMoveOut(result=outcome.result, done=outcome.done,
-                           narration=engine.narration_urls(db, activity, engine.revealed_lines(outcome.result)))
+                           narration=engine.narration_urls(db, activity, engine.revealed_lines(outcome.result)),
+                           **completion)
 
 
 @router.post("/activity-attempts/{attempt_id}/finish", response_model=ActivityFinishOut)
 def finish_activity(attempt_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Close a play that is over and count it. A play already finished (by its last move, or by this same call
+    retried) answers with its result as it was recorded."""
     attempt = _own_attempt(db, user, attempt_id)
     activity, enrollment, state, states = _playable_activity(db, user, attempt.activity_id)
-    try:
-        result = engine.finish(activity, attempt)
-    except engine.GameError as exc:
-        raise HTTPException(exc.status, str(exc)) from exc
-    db.flush()  # this play, finished: counted below
-    record = progress.get_or_create_progress(db, enrollment, state.module, lock=True)
-    # Read after the lock: another activity (or the quiz) finished at the same time counts too.
-    state.best_scores = progress.activity_best_scores(db, enrollment)
-    progress.complete_if_done(state, record, has_quiz=bool(quiz.evaluation_questions(state.evaluation)))
-    progress.refresh_enrollment(db, enrollment)
-    db.commit()
-    return ActivityFinishOut(
-        **result,
-        module_completed=bool(record.completed),
-        next_module_id=_next_module_id(states, state.module.id) if record.completed else None,
-        course_completed=enrollment.status == "completed",
-    )
+    if attempt.finished_at is not None:
+        completion = _completion(enrollment, states, state, state.completed)
+    else:
+        completion = _finish_play(db, activity, attempt, enrollment, state, states)
+        db.commit()
+    return ActivityFinishOut(score=attempt.score, max_score=attempt.max_score, **completion)

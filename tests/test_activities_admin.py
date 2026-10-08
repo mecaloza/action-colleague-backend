@@ -83,6 +83,7 @@ def test_an_admin_tries_an_activity_without_counting_for_anyone(client, db, modu
     step = client.post(f"/api/v1/activity-previews/{play['attempt_id']}/moves", headers=headers,
                        json={"move": {"choice": choice}}).json()
     assert step["done"] and step["result"]["points"] == 2
+    assert step["module_completed"] is None  # the game is over, but a preview never counts
 
 
 def test_a_module_holds_at_most_six_activities_and_deleting_one_frees_a_place(client, module, headers):

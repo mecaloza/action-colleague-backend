@@ -8,8 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from sqlalchemy import text
 
-from app.db.models import Enrollment, Evaluation, EvaluationAttempt, ModuleProgress, User
+from app.db.models import ActivityAttempt, Enrollment, Evaluation, EvaluationAttempt, ModuleProgress, User
 from tests.conftest import QueryCounter, auth_headers
+from tests.test_activity_spec import DECISION, QUICK_ORDER
 
 QUESTION = {"id": "q1", "type": "true_false", "prompt": "El casco es obligatorio", "correct": True, "explanation": ""}
 
@@ -318,6 +319,187 @@ def test_deleting_a_module_waits_for_a_submission_in_flight(client, db, session_
     assert not errors, errors  # foreign key violation on evaluations, before
     db.expire_all()
     assert db.query(EvaluationAttempt).count() == 0 and db.query(Evaluation).count() == 0
+
+
+def _activity_course(client, admin_headers, collaborator, kind: str = "decision") -> dict:
+    """A published one-module course whose only activity is of this kind, with the collaborator enrolled."""
+    _, (module_id,) = _course(client, admin_headers, collaborator, quiz=False)
+    spec = {"decision": DECISION, "quick": QUICK_ORDER}[kind]
+    return client.post(f"/api/v1/modules/{module_id}/activities", headers=admin_headers,
+                       json={"type": kind, "title": "Actividad", "spec": spec, "status": "ready"}).json()
+
+
+def _open_plays(db) -> list[int]:
+    db.expire_all()
+    return [play_id for (play_id,) in db.query(ActivityAttempt.id).filter(ActivityAttempt.finished_at.is_(None))]
+
+
+@pytest.mark.parametrize("stale", ["edited", "timed_out"])
+def test_two_taps_on_start_close_a_stale_play_once(
+    client, db, session_factory, admin, collaborator, monkeypatch, stale
+):
+    """
+    A play that can't go on: both requests find it and want to deal with it (an untouched one on an older version is
+    deleted, one with a move whose clock ran out is counted). The second waits for the first one's lock, finds
+    nothing left to close, then picks up the new play the first one opened instead of opening another.
+    """
+    from app.api.routes import learn
+    from app.schemas.learn import ActivityStart
+    from app.services import activities
+
+    admin_headers = auth_headers(client, admin.email)
+    activity = _activity_course(client, admin_headers, collaborator, "decision" if stale == "edited" else "quick")
+    learner = auth_headers(client, collaborator.email)
+    play = client.post(f"/api/v1/learn/activities/{activity['id']}/attempts", headers=learner, json={}).json()
+    if stale == "edited":
+        client.put(f"/api/v1/activities/{activity['id']}", headers=admin_headers, json={"title": "Otra"})
+    else:
+        first_step = next(card["token"] for card in play["view"]["cards"] if card["text"] == QUICK_ORDER["items"][0])
+        client.post(f"/api/v1/learn/activity-attempts/{play['attempt_id']}/moves", headers=learner,
+                    json={"move": {"card": first_step}})
+        attempt = db.get(ActivityAttempt, play["attempt_id"])
+        db.refresh(attempt)
+        attempt.state = {**attempt.state, "deadline": "2020-01-01T00:00:00+00:00"}
+        db.commit()
+    paused, release = threading.Event(), threading.Event()
+    played, closing, starts = activities.played, [], []
+
+    def slow_played(attempt):
+        closing.append(attempt.id)
+        if not paused.is_set():  # the first request holds the stale play's lock
+            paused.set()
+            release.wait(5)
+        return played(attempt)
+
+    monkeypatch.setattr(activities, "played", slow_played)
+
+    def start(session):
+        user = session.get(User, collaborator.id)
+        starts.append(learn.start_activity(activity["id"], ActivityStart(), db=session, user=user))
+
+    errors = _race(session_factory, start, start, paused=paused, release=release)
+
+    assert not errors, errors
+    assert closing == [play["attempt_id"]]  # without the lock, both close it: deleted (or counted) twice
+    assert [s.resumed for s in starts] == [False, True] and starts[0].attempt_id == starts[1].attempt_id
+    assert _open_plays(db) == [starts[0].attempt_id]
+    old = db.get(ActivityAttempt, play["attempt_id"])
+    if stale == "edited":
+        assert old is None
+    else:
+        assert (old.score, old.finished_at is not None) == (10, True)
+        assert db.query(Enrollment).one().status == "completed"  # the course's only activity, played
+
+
+def test_two_taps_on_start_open_one_play(client, db, session_factory, admin, collaborator, monkeypatch):
+    """Nothing open yet, so the open plays lock nothing: both requests find no play to resume. The enrollment, locked
+    before a play is opened, makes the second wait, then pick up the play the first one opened."""
+    from app.api.routes import learn
+    from app.schemas.learn import ActivityStart
+    from app.services import activities
+
+    activity = _activity_course(client, auth_headers(client, admin.email), collaborator)
+    paused, release = threading.Event(), threading.Event()
+    new_state, starts = activities.start, []
+
+    def slow_start(*args, **kwargs):
+        if not paused.is_set():  # the first request holds the enrollment, about to open its play
+            paused.set()
+            release.wait(5)
+        return new_state(*args, **kwargs)
+
+    monkeypatch.setattr(activities, "start", slow_start)
+
+    def start(session):
+        user = session.get(User, collaborator.id)
+        starts.append(learn.start_activity(activity["id"], ActivityStart(), db=session, user=user))
+
+    errors = _race(session_factory, start, start, paused=paused, release=release)
+
+    assert not errors, errors
+    assert [s.resumed for s in starts] == [False, True] and starts[0].attempt_id == starts[1].attempt_id
+    assert _open_plays(db) == [starts[0].attempt_id]  # two, before
+
+
+def test_a_start_waits_for_the_last_move_in_flight(client, db, session_factory, admin, collaborator, monkeypatch):
+    """
+    The last move holds its play and the module's progress, and records the play with the enrollment last. A start of
+    the same activity waits for that play before it locks the enrollment, then opens a new one. Locking the enrollment
+    first, the start would hold what the move needs while waiting for the play the move holds: a deadlock.
+    """
+    from app.api.routes import learn
+    from app.schemas.learn import ActivityMoveIn, ActivityStart
+    from app.services import progress
+
+    activity = _activity_course(client, auth_headers(client, admin.email), collaborator)
+    learner = auth_headers(client, collaborator.email)
+    # The video watched first: the move locks the existing progress row (inserting it, it would also hold the
+    # enrollment through the foreign key, and the start would wait for it before anything else).
+    client.put(f"/api/v1/learn/modules/{activity['module_id']}/position", headers=learner, json={"seconds": 5})
+    play = client.post(f"/api/v1/learn/activities/{activity['id']}/attempts", headers=learner, json={}).json()
+    price = next(c["token"] for c in play["view"]["node"]["choices"] if c["text"].startswith("Le doy"))  # it ends it
+    paused, release = threading.Event(), threading.Event()
+    complete_if_done, starts = progress.complete_if_done, []
+
+    def slow_complete_if_done(*args, **kwargs):
+        paused.set()  # the move holds its play and the module's progress
+        release.wait(5)
+        return complete_if_done(*args, **kwargs)
+
+    monkeypatch.setattr(progress, "complete_if_done", slow_complete_if_done)
+
+    def last_move(session):
+        learn.play_move(play["attempt_id"], ActivityMoveIn(move={"choice": price}), db=session,
+                        user=session.get(User, collaborator.id))
+
+    def start(session):
+        user = session.get(User, collaborator.id)
+        starts.append(learn.start_activity(activity["id"], ActivityStart(), db=session, user=user))
+
+    errors = _race(session_factory, last_move, start, paused=paused, release=release)
+
+    assert not errors, errors  # DeadlockDetected, with the enrollment locked first
+    (fresh,) = starts
+    assert not fresh.resumed and _open_plays(db) == [fresh.attempt_id]
+    assert db.get(ActivityAttempt, play["attempt_id"]).score == 2 and db.query(Enrollment).one().status == "completed"
+
+
+def test_deleting_an_activity_waits_for_a_start_closing_its_stale_play(
+    client, db, session_factory, admin, collaborator, monkeypatch
+):
+    """The start holds the stale play and its new play needs the activity (a foreign key); the delete holds the
+    activity and its cascade needs that play. Both lock the activity first, so the delete waits: no deadlock."""
+    from app.api.routes import activities as admin_activities
+    from app.api.routes import learn
+    from app.schemas.learn import ActivityStart
+    from app.services import activities
+
+    admin_headers = auth_headers(client, admin.email)
+    activity = _activity_course(client, admin_headers, collaborator)
+    client.post(f"/api/v1/learn/activities/{activity['id']}/attempts", headers=auth_headers(client, collaborator.email),
+                json={})
+    client.put(f"/api/v1/activities/{activity['id']}", headers=admin_headers, json={"title": "Otra"})
+    paused, release = threading.Event(), threading.Event()
+    played = activities.played
+
+    def slow_played(attempt):
+        paused.set()  # the start holds the stale play
+        release.wait(5)
+        return played(attempt)
+
+    monkeypatch.setattr(activities, "played", slow_played)
+
+    errors = _race(
+        session_factory,
+        lambda s: learn.start_activity(activity["id"], ActivityStart(), db=s, user=s.get(User, collaborator.id)),
+        lambda s: admin_activities.delete_activity(activity["id"], db=s),
+        paused=paused,
+        release=release,
+    )
+
+    assert not errors, errors  # DeadlockDetected, before
+    db.expire_all()
+    assert db.query(ActivityAttempt).count() == 0  # the new play went with the activity
 
 
 def test_modules_added_at_once_by_two_admins_both_count(client, db, session_factory, admin, collaborator, monkeypatch):

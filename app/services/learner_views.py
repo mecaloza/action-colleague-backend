@@ -55,7 +55,7 @@ def quiz_summary(state: ModuleState) -> QuizSummary | None:
     )
 
 
-def _learner_module(state: ModuleState, media: MediaResolver) -> LearnerModule:
+def _learner_module(state: ModuleState, media: MediaResolver, resumable: set[int]) -> LearnerModule:
     module, unlocked = state.module, state.unlocked
     return LearnerModule(
         id=module.id,
@@ -74,7 +74,7 @@ def _learner_module(state: ModuleState, media: MediaResolver) -> LearnerModule:
         content_text=(module.content_text or "") if unlocked else None,
         last_position_seconds=(state.progress.last_position_seconds or 0) if state.progress else 0,
         quiz=quiz_summary(state),
-        activities=_activity_summaries(state) if unlocked else [],
+        activities=_activity_summaries(state, resumable) if unlocked else [],
     )
 
 
@@ -85,7 +85,7 @@ def _max_score(activity) -> int:
         return 0
 
 
-def _activity_summaries(state: ModuleState) -> list[LearnerActivitySummary]:
+def _activity_summaries(state: ModuleState, resumable: set[int]) -> list[LearnerActivitySummary]:
     return [
         LearnerActivitySummary(
             id=activity.id,
@@ -95,9 +95,18 @@ def _activity_summaries(state: ModuleState) -> list[LearnerActivitySummary]:
             finished=activity.id in state.best_scores,
             best_score=state.best_scores.get(activity.id),
             max_score=_max_score(activity),
+            resumable=activity.id in resumable,
         )
         for activity in state.activities
     ]
+
+
+def _resumable_activities(db: Session, enrollment: Enrollment, states: list[ModuleState]) -> set[int]:
+    """The activities (of unlocked modules) with an open play the learner can go on with: one read for the course."""
+    activities = [activity for state in states if state.unlocked for activity in state.activities]
+    if not activities:
+        return set()
+    return {play.activity_id for play in activity_engine.resumable_plays(db, enrollment.id, activities)}
 
 
 def _learner_enrollment(enrollment: Enrollment) -> LearnerEnrollment:
@@ -113,10 +122,11 @@ def course_player_detail(
     db: Session, course: Course, states: list[ModuleState], enrollment: Enrollment | None
 ) -> LearnerCourseDetail:
     media = MediaResolver(db).prepare(modules=[state.module for state in states])
+    resumable = _resumable_activities(db, enrollment, states) if enrollment else set()
     return LearnerCourseDetail(
         course=LearnerCourseInfo(
             id=course.id, title=course.title, description=course.description or "", language=course.language or "es"
         ),
         enrollment=_learner_enrollment(enrollment) if enrollment else None,
-        modules=[_learner_module(state, media) for state in states],
+        modules=[_learner_module(state, media, resumable) for state in states],
     )
